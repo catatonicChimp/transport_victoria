@@ -53,6 +53,17 @@ FEED_TRIP_UPDATES = "trip-updates"
 FEED_SERVICE_ALERTS = "service-alerts"
 FEED_VEHICLE_POSITIONS = "vehicle-positions"
 
+# Modes that have a published Service Alerts feed.
+#
+# The open data portal's GTFS Realtime dataset only publishes service-alerts
+# for Metro Train and Yarra Trams:
+#   https://opendata.transport.vic.gov.au/dataset/gtfs-realtime
+# Requesting the feed for other modes fails on every poll:
+# - 403 for bus (route exists but no subscription grants it),
+# - 404 for regional-bus
+# The coordinator skips the fetch entirely for modes not listed here.
+SERVICE_ALERTS_MODES: frozenset[str] = frozenset({MODE_METRO, MODE_TRAM})
+
 # -------------------------------------------------------------------
 # GTFS route_type codes used by PTV
 #

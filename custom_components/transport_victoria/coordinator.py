@@ -2,7 +2,8 @@
 
 One coordinator per config entry (watch). Responsibilities:
   1. Read scheduled departures from SQLite (executor thread).
-  2. Fetch GTFS Realtime trip-updates and service-alerts via PTVRealtimeClient.
+  2. Fetch GTFS Realtime trip-updates via PTVRealtimeClient, plus
+     service-alerts for modes that publish the feed (SERVICE_ALERTS_MODES).
   3. Merge realtime delays/cancellations into the departure list.
   4. Filter alerts to those affecting the configured stop/mode.
   5. Return a CoordinatorData snapshot consumed by sensor entities.
@@ -59,6 +60,7 @@ from .const import (
     FEED_TRIP_UPDATES,
     MODE_BUNDLE_MAP,
     ROUTE_TYPE_MAP,
+    SERVICE_ALERTS_MODES,
 )
 from .gtfs.repository import (
     DepartureRow,
@@ -208,8 +210,9 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
                 _LOGGER.warning("Trip updates network error: %s", exc)
 
         # --- Service alerts ---
+        # Only fetched for modes with a published feed (SERVICE_ALERTS_MODES)
         raw_alerts: list[Alert] = []
-        if realtime_enabled:
+        if realtime_enabled and mode in SERVICE_ALERTS_MODES:
             try:
                 await rate_limiter.acquire()
                 alert_feed = await client.fetch_feed(mode, FEED_SERVICE_ALERTS)

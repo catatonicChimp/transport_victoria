@@ -13,7 +13,7 @@ Schedule data is stored locally in SQLite after download; realtime feeds require
 ## Features
 
 - **Departure sensors** — next departures with scheduled time, delay, route, headsign, platform, and trip id where available.
-- **Disruption sensor** — binary sensor when service alerts apply to your watch.
+- **Disruption sensor** — binary sensor when service alerts apply to your watch. (Metro Trains and Trams only: there's no published service alerts feed for the other modes.)
 - **Config flow** — pick mode, find a stop by name, distance from home, or map location; optional specific destination routing.
 - **Rate limiting** — shared async limiter so multiple watches stay within the [open data API](https://opendata.transport.vic.gov.au/) limits (24 requests / 60 seconds across all realtime endpoints).
 
@@ -71,10 +71,10 @@ On first use the integration downloads and imports the relevant GTFS bundle(s); 
 
 Per **watch** (each config entry), you typically get:
 
-| Entity | Description |
-|--------|-------------|
-| Departure sensors | Minutes to next departures (multiple slots: next, next_2, …) |
-| Disruption binary sensor | On when an active service alert matches the watch |
+| Entity                   | Description                                                  |
+| ------------------------ | ------------------------------------------------------------ |
+| Departure sensors        | Minutes to next departures (multiple slots: next, next_2, …) |
+| Disruption binary sensor | On when an active service alert matches the watch            |
 
 Vehicle / route tracking entries (if enabled in your build) expose additional entities such as device trackers.
 
@@ -86,11 +86,11 @@ Exact entity ids follow Home Assistant’s naming; see **Developer tools → Sta
 
 All datasets are published by Transport Victoria on the **[open data portal](https://opendata.transport.vic.gov.au/)**.
 
-| Data | Source |
-|------|--------|
-| Static timetables | [GTFS Schedule](https://opendata.transport.vic.gov.au/dataset/gtfs-schedule) (ZIP, updated regularly) |
-| Delays & cancellations | GTFS Realtime trip updates |
-| Disruptions | GTFS Realtime service alerts |
+| Data                   | Source                                                                                                |
+| ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| Static timetables      | [GTFS Schedule](https://opendata.transport.vic.gov.au/dataset/gtfs-schedule) (ZIP, updated regularly) |
+| Delays & cancellations | GTFS Realtime trip updates                                                                            |
+| Disruptions            | GTFS Realtime service alerts (published for Metro Train and Yarra Trams only)                         |
 
 Dataset terms: **CC BY 4.0** where applicable — see the portal’s [Public Transport organisation](https://opendata.transport.vic.gov.au/organization/public-transport) for current licence text.
 
