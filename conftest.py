@@ -120,6 +120,7 @@ _http.StaticPathConfig = _Stub  # type: ignore[attr-defined]
 _dt = sys.modules["homeassistant.util"]
 _dt.dt = types.SimpleNamespace(  # type: ignore[attr-defined]
     as_local=lambda x: x,
+    now=lambda: __import__("datetime").datetime.now().astimezone(),
     utcnow=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
 )
 
