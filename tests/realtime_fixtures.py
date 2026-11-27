@@ -168,9 +168,10 @@ def alert_service() -> rt.FeedMessage:
     description.text = "Buses replace trains between Caulfield and Frankston."
     description.language = "en-AU"
 
-    # cause is left at the protobuf default (0/UNKNOWN_CAUSE): the production
-    # _CAUSE_MAP numbering predates the current bindings — see the module
-    # report note, not asserted here.
+    # cause is left at the protobuf default (0): an unset cause reads 0, which
+    # is not a valid enum value and maps to "UNKNOWN_CAUSE" (the maps are now
+    # derived from the bound enum — see T13).  The cause/effect mapping is
+    # asserted in test_realtime_decode.py::TestCauseEffectMaps.
     alert.effect = rt.Alert.SIGNIFICANT_DELAYS
     return feed
 

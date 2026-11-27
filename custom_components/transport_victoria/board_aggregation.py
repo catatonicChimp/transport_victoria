@@ -114,6 +114,7 @@ REALTIME_PENDING = "pending"
 FEED_OK = "ok"
 FEED_STALE = "stale"
 FEED_FAILED = "failed"
+FEED_UNAVAILABLE = "unavailable"   # portal does not publish this feed (404)
 
 # ``delay_seconds`` sentinel for a row with no realtime prediction at all.
 DELAY_UNKNOWN = -1
@@ -188,8 +189,8 @@ def route_type_to_mode(route_type: int) -> str | None:
 class FeedHealth:
     """Health of one realtime feed ``(mode, feed_type)``."""
 
-    state: str                       # "ok" | "stale" | "failed"
-    age: timedelta | None = None     # data age when classifiable; None for failed
+    state: str                       # "ok" | "stale" | "failed" | "unavailable"
+    age: timedelta | None = None     # data age when classifiable (also after failures)
 
 
 @dataclass(slots=True)
@@ -396,7 +397,7 @@ def _parse_fetched(
             key = (mode, feed_type)
             result = fetched[key]
             if isinstance(result, BaseException):
-                feed_health[key] = FeedHealth(FEED_FAILED)
+                feed_health[key] = _failed_health(result, now)
                 continue
 
             # One malformed feed (bad tuple shape, bad metadata, or a parser
@@ -465,6 +466,24 @@ def _classify_freshness(
             return FEED_STALE, age
         return FEED_OK, age
     return FEED_OK, None  # no signal → assume fresh (documented policy)
+
+
+def _failed_health(exc: BaseException, now: datetime) -> FeedHealth:
+    """Build the :class:`FeedHealth` for a failed feed.
+
+    The realtime client raises :class:`~.realtime.client.FeedError` carrying
+    ``last_success``/``last_failure``/``unavailable``; this surfaces a data age
+    even after a failure (T13) so a stale-but-last-good feed is distinguishable
+    from a feed that has never fetched.  A feed the portal does not publish is
+    ``FEED_UNAVAILABLE`` (not a retryable failure).
+    """
+    if getattr(exc, "unavailable", False):
+        return FeedHealth(FEED_UNAVAILABLE)
+    ref = getattr(exc, "last_success", None)
+    if ref is None:
+        ref = getattr(exc, "last_failure", None)
+    age = (now - ref) if ref is not None else None
+    return FeedHealth(FEED_FAILED, age)
 
 
 def _distinct_modes(pins: list[PinData]) -> list[str]:
@@ -672,6 +691,7 @@ def _collect_departures(
                 platform_filter=pin.platform_filter,
                 lookback_seconds=int(lookback.total_seconds()),
                 resolved_db=pinned,
+                trips_direction_filter=pin.trips_direction_filter,
             )
             if not page:
                 break

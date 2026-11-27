@@ -15,7 +15,11 @@ import pytest
 from google.transit import gtfs_realtime_pb2 as rt
 
 from custom_components.transport_victoria.realtime.client import _decode_feed
-from custom_components.transport_victoria.realtime.service_alerts import parse_alerts
+from custom_components.transport_victoria.realtime.service_alerts import (
+    _cause_map,
+    _effect_map,
+    parse_alerts,
+)
 from custom_components.transport_victoria.realtime.trip_updates import (
     parse_trip_updates,
 )
@@ -221,3 +225,45 @@ class TestHeaderTimestamp:
         assert first.header.timestamp == BASE_TIMESTAMP
         assert second.header.timestamp == BASE_TIMESTAMP + 60
         assert len(first.entity) == 0 and len(second.entity) == 0
+
+
+# ---------------------------------------------------------------------------
+# Cause/Effect enum maps (T13): derived from the bound enum, no off-by-one
+# ---------------------------------------------------------------------------
+
+
+class TestCauseEffectMaps:
+    def test_cause_map_matches_proto_enum(self):
+        expected = {value: name for name, value in rt.Alert.Cause.items()}
+        assert _cause_map() == expected
+
+    def test_effect_map_matches_proto_enum(self):
+        expected = {value: name for name, value in rt.Alert.Effect.items()}
+        assert _effect_map() == expected
+
+    def test_cause_3_is_technical_problem_effect_3_is_significant_delays(self):
+        # A feed with cause=3 / effect=3 must decode to the enum's own names
+        # (cause is NOT SIGNIFICANT_DELAYS — that is an *effect*).
+        feed = rt.FeedMessage()
+        feed.header.timestamp = BASE_TIMESTAMP
+        entity = feed.entity.add()
+        entity.id = "alert-cause-3"
+        alert = entity.alert
+        alert.cause = rt.Alert.Cause.Value("TECHNICAL_PROBLEM")  # == 3
+        alert.effect = rt.Alert.Effect.Value("SIGNIFICANT_DELAYS")  # == 3
+        alert.informed_entity.add().route_id = ROUTE_FRANKSTON
+        period = alert.active_period.add()
+        period.start = ALERT_START
+        period.end = ALERT_END
+        header = alert.header_text.translation.add()
+        header.text = "Cause/effect mapping"
+        header.language = "en"
+
+        alerts = parse_alerts(feed)
+        assert len(alerts) == 1
+        assert alerts[0].cause == "TECHNICAL_PROBLEM"
+        assert alerts[0].effect == "SIGNIFICANT_DELAYS"
+
+    def test_unset_cause_0_decodes_to_unknown(self):
+        # An unset cause reads 0 (not a valid enum value) → "UNKNOWN_CAUSE".
+        assert _cause_map().get(0, "UNKNOWN_CAUSE") == "UNKNOWN_CAUSE"

@@ -119,6 +119,11 @@ class PinData:
     platform_filter: str | None = None
     colour_override: str | None = None
     include: bool = True
+    # Direction filter (T13): when set, the schedule query additionally binds
+    # ``trips.direction_id`` to this value.  Only the Opposite-direction runtime
+    # transform sets it (its ``destination_stop_id`` is disabled, so the flipped
+    # ``direction_id`` must select the direction explicitly).  None = off.
+    trips_direction_filter: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the subentry ``data`` mapping (CONF_* keys)."""
@@ -440,9 +445,12 @@ def opposite_direction_pin(db_path: Path, pin: PinData) -> PinData:
         all_destinations=False,
         # Destination filter OFF: no destination_stop_id, so the aggregation
         # queries every service at the boarding stop (no terminal EXISTS clause).
+        # Direction filter ON: the flipped direction_id now selects the
+        # direction explicitly (T13) instead of returning every service.
         destination_stop_id=None,
         destination_stop_name=opposite.terminal_stop_name,
         direction_id=opposite.direction_id,
+        trips_direction_filter=opposite.direction_id,
         via_hint=None,
         label_from=pin.label_from,
         label_to=destination_label(opposite),

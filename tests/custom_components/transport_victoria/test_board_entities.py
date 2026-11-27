@@ -389,9 +389,11 @@ class TestOppositeDirection:
         flipped = opposite_direction_pin(vline_db, _vline_pin(0))
         assert flipped.direction_id == 1
         assert flipped.destination_stop_id is None  # destination filter off
+        assert flipped.trips_direction_filter == 1   # direction filter on (T13)
         assert flipped.label_to == "Southern Cross"
         # Original pin is unchanged (transform returns a copy).
         assert _vline_pin(0).direction_id == 0
+        assert _vline_pin(0).trips_direction_filter is None
 
     def test_flip_back_is_symmetric(self, vline_db: Path):
         flipped = opposite_direction_pin(vline_db, _vline_pin(0))

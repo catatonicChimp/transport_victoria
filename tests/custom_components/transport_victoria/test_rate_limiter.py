@@ -6,7 +6,10 @@ import asyncio
 
 import pytest
 
-from custom_components.transport_victoria.rate_limiter import AsyncRateLimiter
+from custom_components.transport_victoria.rate_limiter import (
+    AsyncRateLimiter,
+    PerFeedRateLimiter,
+)
 
 
 @pytest.mark.asyncio
@@ -46,3 +49,44 @@ class TestAsyncRateLimiter:
         limiter = AsyncRateLimiter(capacity=10.0, refill_rate=100.0)
         results = await asyncio.gather(*[limiter.acquire() for _ in range(5)])
         assert results == [None] * 5
+
+
+def _per_feed(
+    per_key_capacity=5.0,
+    per_key_refill=100.0,
+    global_capacity=20.0,
+    global_refill=100.0,
+) -> PerFeedRateLimiter:
+    return PerFeedRateLimiter(
+        per_key_capacity=per_key_capacity,
+        per_key_refill=per_key_refill,
+        global_capacity=global_capacity,
+        global_refill=global_refill,
+    )
+
+
+@pytest.mark.asyncio
+class TestPerFeedRateLimiter:
+    async def test_per_key_buckets_are_independent(self):
+        """Draining one key's bucket does not block a different key."""
+        limiter = _per_feed(per_key_capacity=1.0, per_key_refill=100.0)
+        await limiter.acquire("a")  # drains key "a"
+        # Key "b" still has a full bucket and acquires immediately.
+        await asyncio.wait_for(limiter.acquire("b"), timeout=0.5)
+
+    async def test_same_key_shares_a_bucket(self):
+        """The same key shares one bucket (acquire drains it)."""
+        limiter = _per_feed(per_key_capacity=1.0, per_key_refill=0.01)
+        await limiter.acquire("a")
+        # Same key now empty → blocks (refill is near-zero).
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(limiter.acquire("a"), timeout=0.05)
+
+    async def test_global_ceiling_is_shared_across_keys(self):
+        """The global ceiling spans keys: exhausting it blocks any key."""
+        limiter = _per_feed(per_key_capacity=100.0, global_capacity=2.0, global_refill=0.01)
+        await limiter.acquire("a")
+        await limiter.acquire("b")
+        # Global ceiling (2) is now exhausted; a third acquire (any key) blocks.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(limiter.acquire("c"), timeout=0.05)

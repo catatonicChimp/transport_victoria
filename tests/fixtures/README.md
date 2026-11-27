@@ -98,8 +98,8 @@ recorded in [`realtime/README.md`](realtime/README.md).
   from a *platform* stop to its siblings, not from a parent `location_type=1`
   station downward. The tram fixture covers both levels; config/entity code
   must select a platform (or add downward expansion).
-* **Production parity note:** `realtime/service_alerts.py::_CAUSE_MAP` numbers
-  causes from 0 while the GTFS-RT spec/bindings start at 1, so
-  `TECHNICAL_PROBLEM` (3) is reported as `"STRIKE"`. Alerts in this catalogue
-  leave `cause` at the default and assert only `effect`, so the suite does not
-  encode the mismatch. Flagged for T13.
+* **T13 — cause/effect maps fixed:** `realtime/service_alerts.py` now derives
+  `_CAUSE_MAP` / `_EFFECT_MAP` from the bound `gtfs_realtime_pb2` enums (the
+  previous hand-maintained dicts numbered from 0 while GTFS-RT is 1-based, so
+  e.g. `TECHNICAL_PROBLEM` (3) was mislabelled `"STRIKE"`). The mapping is
+  asserted against the proto enum in `test_realtime_decode.py`.
