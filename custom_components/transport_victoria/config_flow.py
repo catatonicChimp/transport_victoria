@@ -1576,9 +1576,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         ]
         default = default_route_id or (routes[0].route_id if routes else "")
         return vol.Schema({
-            vol.Optional("route_search", default=""): selector.TextSelector(
-                selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
-            ),
             vol.Required("route_id_select", default=default): _select_selector(options),
         })
 
@@ -1662,9 +1659,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         options = _stops_to_selector_options(stops, show_distance=True)
         default = stops[0].stop_id if stops else ""
         return vol.Schema({
-            vol.Optional("ref_stop_search", default=""): selector.TextSelector(
-                selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
-            ),
             vol.Required("ref_stop_id", default=default): _select_selector(options),
             vol.Optional("ref_stop_name", default=stops[0].stop_name if stops else ""): selector.TextSelector(),
         })

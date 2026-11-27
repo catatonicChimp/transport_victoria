@@ -96,7 +96,6 @@
         "title": "Route Tracker — Select Route",
         "description": "Choose the line or route to track. All vehicles currently running on this route will be shown.",
         "data": {
-          "route_search": "Search routes",
           "route_id_select": "Select route"
         }
       },
@@ -111,7 +110,6 @@
         "title": "Route Tracker — Reference Stop",
         "description": "Choose a stop to use as the centre of your proximity filter.",
         "data": {
-          "ref_stop_search": "Search stops",
           "ref_stop_id": "Select stop",
           "ref_stop_name": "Stop name"
         }

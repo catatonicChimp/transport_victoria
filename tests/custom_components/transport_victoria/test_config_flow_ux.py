@@ -495,3 +495,44 @@ async def test_watch_options_track_vehicles_round_trip(monkeypatch):
     })
 
     assert created["data"][CONF_TRACK_VEHICLES] is True
+
+
+# ---------------------------------------------------------------------------
+# Vestigial search-field removal (route tracker flow)
+# ---------------------------------------------------------------------------
+
+
+def test_route_tracker_schemas_have_no_vestigial_search(monkeypatch):
+    """The dropdowns are the interface; no dead server-side-ignored search box."""
+    optional_fields: list[str] = []
+    required_fields: list[str] = []
+
+    def _record_optional(name, *args, **kwargs):
+        optional_fields.append(name)
+        return object()
+
+    def _record_required(name, *args, **kwargs):
+        required_fields.append(name)
+        return object()
+
+    monkeypatch.setattr(cf.vol, "Optional", _record_optional)
+    monkeypatch.setattr(cf.vol, "Required", _record_required)
+
+    flow = cf.PTVConfigFlow()
+
+    routes = [
+        SimpleNamespace(route_id="R1", route_short_name="1", route_long_name="Alamein"),
+        SimpleNamespace(route_id="R2", route_short_name="2", route_long_name="Werribee"),
+    ]
+    flow._route_tracker_route_schema(routes, "")
+    assert "route_search" not in optional_fields
+    assert "route_id_select" in required_fields
+
+    stops = [
+        SimpleNamespace(stop_id="S1", stop_name="Stop One", distance_m=100.0),
+        SimpleNamespace(stop_id="S2", stop_name="Stop Two", distance_m=200.0),
+    ]
+    flow._route_tracker_stop_schema(stops)
+    assert "ref_stop_search" not in optional_fields
+    assert "ref_stop_id" in required_fields
+    assert "ref_stop_name" in optional_fields
