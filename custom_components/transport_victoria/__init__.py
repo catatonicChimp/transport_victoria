@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import sqlite3
-from datetime import timedelta
+from collections.abc import Callable
+from contextlib import suppress
+from datetime import date
 from pathlib import Path
 
 from homeassistant.components.http import StaticPathConfig
@@ -12,6 +14,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_DEPARTURE_COUNT,
@@ -22,6 +25,9 @@ from .const import (
     DOMAIN,
     ENTRY_TYPE_ROUTE_TRACKER,
     ENTRY_TYPE_VEHICLE_TRACKER,
+    GTFS_REFRESH_CHECK_INTERVAL,
+    GTFS_REFRESH_MARGIN_DAYS,
+    GTFS_REFRESH_RETRY_SECONDS,
     GTFS_SCHEDULE_URL,
     MODE_BUNDLE_MAP,
     PICTOGRAM_URL_BASE,
@@ -29,8 +35,14 @@ from .const import (
 from .coordinator import PTVDataUpdateCoordinator
 from .device_tracker import RouteVehicleCoordinator, VehicleTrackerCoordinator
 from .gtfs.downloader import check_for_remote_changes, download_zip
-from .gtfs.importer import get_imported_bundles, get_stored_zip_meta, import_mode_bundles
-from .gtfs.repository import is_mode_ready
+from .gtfs.horizon import refresh_due
+from .gtfs.importer import (
+    get_imported_bundles,
+    get_stored_zip_meta,
+    import_bundles_to_generation,
+)
+from .gtfs.repository import schedule_state
+from .gtfs.time_utils import service_day_for_time
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,11 +58,49 @@ _TRACKER_PLATFORMS: list[str] = ["device_tracker"]
 # Legacy alias (used by async_unload_platforms when entry_type not available)
 PLATFORMS: list[str] = ["sensor", "binary_sensor"]
 
-# How often to check for a new GTFS schedule ZIP
-_GTFS_REFRESH_INTERVAL = timedelta(days=7)
-
 # Subdirectory under hass.config.path() for all PTV data files
 _DATA_DIR_NAME = "transport_victoria_data"
+
+# Key under hass.data[DOMAIN] for the shared schedule manager
+_SCHEDULE_MANAGER_KEY = "schedule_manager"
+
+
+# ---------------------------------------------------------------------------
+# Process-global refresh guard (keyed by canonical DB path)
+#
+# The lock and in-flight task live at module scope (NOT per ScheduleManager
+# instance) so that a config-flow refresh, a manager refresh, and a manager
+# recreated after an unload all coordinate against the SAME guard. A cancelled
+# waiter is prevented from dropping the lock mid-import by running the critical
+# section in a shielded task (see async_trigger_gtfs_refresh).
+# ---------------------------------------------------------------------------
+
+class _RefreshGuard:
+    """One per DB path: a serialization lock + the current in-flight task.
+
+    ``bundles`` records the bundle set the in-flight task is (or was) building,
+    so a joiner can detect when the in-flight work does not cover its own
+    requirements and trigger a follow-up refresh instead of a false success.
+    """
+
+    __slots__ = ("lock", "task", "bundles")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.task: asyncio.Task[bool] | None = None
+        self.bundles: frozenset[str] | None = None
+
+
+_GUARDS: dict[str, _RefreshGuard] = {}
+
+
+def _guard_for_db(db_path: Path) -> _RefreshGuard:
+    """Return (and create if needed) the process-global guard for a DB path."""
+    key = str(db_path)
+    guard = _GUARDS.get(key)
+    if guard is None:
+        guard = _GUARDS[key] = _RefreshGuard()
+    return guard
 
 
 def _data_dir(hass: HomeAssistant) -> Path:
@@ -65,130 +115,226 @@ def _db_path(hass: HomeAssistant) -> Path:
     return _data_dir(hass) / "gtfs.db"
 
 
+def _service_today(hass: HomeAssistant) -> date:
+    """Return the GTFS service-local date (HA timezone), accounting for the
+    00:00–03:00 service-day cutover so horizon/expiry checks match the
+    coordinator's departure-query service day."""
+    return service_day_for_time(dt_util.now())[0]
+
+
+def _union_bundles(hass: HomeAssistant, requested: list[str] | None) -> list[str]:
+    """Return the union of the requested bundles and every live entry's bundles.
+
+    A rebuild must include every bundle required by live entries — never just
+    the triggering entry's subset — so refreshing one mode cannot discard
+    another mode's schedule.
+    """
+    seen: set[str] = set(requested or [])
+    result: list[str] = list(requested or [])
+    for folder in _bundles_for_all_entries(hass):
+        if folder not in seen:
+            seen.add(folder)
+            result.append(folder)
+    return result
+
+
+def _guard_task_done(guard: _RefreshGuard, task: asyncio.Task[bool]) -> None:
+    if guard.task is task:
+        guard.task = None
+        guard.bundles = None
+
+
 async def async_trigger_gtfs_refresh(
     hass: HomeAssistant,
     bundle_folders: list[str] | None = None,
     *,
     skip_download_if_exists: bool = False,
-) -> None:
-    """Download the GTFS ZIP if changed and import the requested bundles.
+) -> bool:
+    """Refresh the GTFS schedule: download (if needed) + import a new generation.
 
-    Public so config_flow can trigger a refresh during first-time setup,
-    before any config entry exists.
+    Public so config_flow can trigger a refresh during first-time setup, before
+    any config entry exists.
 
-    Change detection uses a two-stage strategy:
-      1. HEAD request comparing ETag + Content-Length — skips 282 MB download
-         if the server reports the file is unchanged.
-      2. SHA-256 comparison after download — final guard against partial changes.
+    Rebuild necessity is derived from DB state (schema version, per-bundle
+    horizon, coverage, import age) INDEPENDENT of the download-unchanged check:
+    a schema-stale DB, an aged 45-day window, or an expired/missing bundle is
+    rebuilt even when the upstream ZIP is byte-for-byte unchanged.  A refresh
+    that cannot make the schedule usable reports False (a failure state), so an
+    expired-but-unchanged upstream feed stays unhealthy rather than pretending
+    success.
 
-    When the ZIP changes, all bundles are re-imported with force=True so stale
-    rows from the previous GTFS export are replaced.
+    The whole download→import→publish sequence runs under a process-global,
+    per-DB guard and is shielded from waiter cancellation, so concurrent
+    callers (config-flow + manager) share one import and exactly one wins
+    publication. A caller whose bundle requirements are NOT covered by the
+    in-flight refresh waits for it to finish, then triggers a follow-up refresh
+    of the larger union.
 
     Args:
         bundle_folders: Folder numbers to import (e.g. ["2"] for metro trains).
-                        If None, imports all bundles needed by existing entries.
-        skip_download_if_exists: Pass True from config-flow steps that know
-                        the ZIP was already downloaded; avoids a redundant
-                        282 MB HTTP request.
+                        If None, imports the union of bundles for existing entries.
+        skip_download_if_exists: Pass True from config-flow steps that know the
+                        ZIP was already downloaded; avoids a redundant download.
+
+    Returns:
+        True if the schedule is now usable (or was already up-to-date);
+        False if the download/import failed or the schedule is still stale.
     """
-    zip_path = _zip_path(hass)
     db_path = _db_path(hass)
+    zip_path = _zip_path(hass)
 
-    if bundle_folders is None:
-        bundle_folders = _bundles_for_all_entries(hass)
-
+    bundle_folders = _union_bundles(hass, bundle_folders)
     if not bundle_folders:
         _LOGGER.debug("No bundles to import")
-        return
+        return True
 
-    # --- Stage 1: decide whether we even need to download ---
+    guard = _guard_for_db(db_path)
+    return await _refresh_or_join(hass, db_path, zip_path, guard, bundle_folders, skip_download_if_exists)
+
+
+async def _refresh_or_join(
+    hass: HomeAssistant,
+    db_path: Path,
+    zip_path: Path,
+    guard: _RefreshGuard,
+    bundle_folders: list[str],
+    skip_download_if_exists: bool,
+) -> bool:
+    """Start a refresh, or join an in-flight one if it covers our requirements.
+
+    If an in-flight refresh does NOT cover this caller's bundle set, await it to
+    completion, then loop to start a follow-up refresh of the enlarged union.
+    """
+    requested = frozenset(bundle_folders)
+    while True:
+        if guard.task is not None and not guard.task.done():
+            in_flight = guard.bundles or frozenset()
+            if requested <= in_flight:
+                _LOGGER.debug(
+                    "GTFS refresh already in flight covering %s — awaiting",
+                    sorted(in_flight),
+                )
+                return await asyncio.shield(guard.task)
+            # In-flight work doesn't cover our needs: wait for it, then re-loop
+            # with the enlarged union (which now includes the newcomer's bundles).
+            _LOGGER.debug(
+                "GTFS refresh in flight for %s, needs %s — awaiting then re-refreshing",
+                sorted(in_flight),
+                sorted(requested),
+            )
+            await asyncio.shield(guard.task)
+            requested = requested | in_flight
+            bundle_folders = list(requested)
+            continue
+
+        # No in-flight task: start one for the current (possibly enlarged) set.
+        guard.bundles = requested
+        task = asyncio.create_task(
+            _refresh_critical(hass, db_path, zip_path, guard, list(requested), skip_download_if_exists)
+        )
+        guard.task = task
+        task.add_done_callback(lambda t: _guard_task_done(guard, t))
+        # Shield so a cancelled waiter doesn't abort the import or drop the lock.
+        return await asyncio.shield(task)
+
+
+async def _refresh_critical(
+    hass: HomeAssistant,
+    db_path: Path,
+    zip_path: Path,
+    guard: _RefreshGuard,
+    bundle_folders: list[str],
+    skip_download_if_exists: bool,
+) -> bool:
+    """Hold the per-DB lock across the whole download→import→publish sequence."""
+    async with guard.lock:
+        return await _refresh_impl(
+            hass, db_path, zip_path, bundle_folders, skip_download_if_exists
+        )
+
+
+async def _refresh_impl(
+    hass: HomeAssistant,
+    db_path: Path,
+    zip_path: Path,
+    bundle_folders: list[str],
+    skip_download_if_exists: bool,
+) -> bool:
+    """Download (if needed) and import a fresh generation. Returns success."""
+    today = _service_today(hass)
+
+    # Rebuild necessity from DB state alone (independent of download checks).
+    must_rebuild = await hass.async_add_executor_job(
+        refresh_due, db_path, bundle_folders, today, GTFS_REFRESH_MARGIN_DAYS
+    )
+
     stored_meta = await hass.async_add_executor_job(get_stored_zip_meta, db_path)
-    stored_sha256 = stored_meta.get("zip_sha256")
+    stored_sha = stored_meta.get("zip_sha256")
     stored_etag = stored_meta.get("zip_etag")
     stored_size = stored_meta.get("zip_size")
 
-    already_imported = await hass.async_add_executor_job(get_imported_bundles, db_path)
-    all_bundles_present = all(b in already_imported for b in bundle_folders)
-
+    remote_changed = True
     if not skip_download_if_exists:
-        # HEAD check: if ETag + size match and all bundles are imported, skip everything
         remote_changed = await check_for_remote_changes(
             hass, GTFS_SCHEDULE_URL, stored_etag, stored_size
         )
-        if not remote_changed and all_bundles_present:
-            _LOGGER.debug("GTFS schedule unchanged (HEAD check) — skipping download and import")
-            return
 
-    # --- Stage 2: download (or skip if file already on disk from this session) ---
-    _LOGGER.debug("Downloading GTFS schedule")
+    # Healthy DB + unchanged upstream → genuinely up to date.
+    if not must_rebuild and not remote_changed:
+        _LOGGER.debug("GTFS schedule healthy and unchanged — no refresh needed")
+        return True
+
+    # Reuse the cached ZIP when we only need a local rebuild of unchanged data
+    # (e.g. an aged 45-day window); otherwise fetch fresh bytes.
+    reuse_cached = skip_download_if_exists or (must_rebuild and not remote_changed)
     try:
-        changed, sha256, etag, content_length = await download_zip(
+        _, sha256, etag, content_length = await download_zip(
             hass,
             GTFS_SCHEDULE_URL,
             zip_path,
-            skip_if_exists=skip_download_if_exists,
+            skip_if_exists=reuse_cached,
         )
     except Exception as exc:
         _LOGGER.error("Failed to download GTFS schedule: %s", exc)
-        return
+        return False
 
-    # If SHA-256 unchanged and all bundles are already imported, skip import
-    if not changed and stored_sha256 == sha256 and all_bundles_present:
-        _LOGGER.debug("GTFS schedule unchanged (SHA-256) and all bundles imported — skipping")
-        if etag and (etag != stored_etag or content_length != stored_size):
-            try:
-                await hass.async_add_executor_job(
-                    _update_zip_meta, db_path, etag, content_length
-                )
-            except Exception:
-                pass
-        return
+    # Healthy DB + identical content → up to date (HEAD may have been
+    # inconclusive, e.g. missing ETag).
+    if not must_rebuild and sha256 == stored_sha:
+        _LOGGER.debug("GTFS schedule healthy and SHA-256 unchanged — no import needed")
+        return True
 
-    # ZIP has changed or bundles are missing — determine whether to force re-import
-    zip_changed = changed and stored_sha256 != sha256
-    _LOGGER.info(
-        "Importing GTFS bundles %s (SHA-256: %s, force=%s)",
-        bundle_folders,
-        sha256,
-        zip_changed,
-    )
+    _LOGGER.info("Importing GTFS bundles %s (SHA-256: %s)", bundle_folders, sha256)
 
     def _run_import() -> None:
-        import_mode_bundles(
-            zip_path,
+        import_bundles_to_generation(
             db_path,
+            zip_path,
             sha256,
             bundle_folders,
-            force=zip_changed,
-            zip_etag=etag,
-            zip_size=content_length,
+            zip_etag=etag or stored_etag,
+            zip_size=content_length or stored_size,
+            today=today,
         )
 
     try:
         await hass.async_add_executor_job(_run_import)
     except Exception as exc:
         _LOGGER.error("Failed to import GTFS bundles %s: %s", bundle_folders, exc)
+        return False
 
-
-def _update_zip_meta(db_path: Path, etag: str | None, size: str | None) -> None:
-    """Store ETag and Content-Length in import_meta without touching other rows."""
-    if not db_path.exists():
-        return
-    rows: list[tuple[str, str]] = []
-    if etag:
-        rows.append(("zip_etag", etag))
-    if size:
-        rows.append(("zip_size", size))
-    if not rows:
-        return
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executemany(
-            "INSERT OR REPLACE INTO import_meta (key, value) VALUES (?, ?)", rows
+    # Honest result: a successful import must leave the schedule usable.
+    state = await hass.async_add_executor_job(
+        schedule_state, db_path, bundle_folders, today
+    )
+    if state != "ready":
+        _LOGGER.warning(
+            "GTFS refresh completed but schedule is still %s — upstream feed may be stale",
+            state,
         )
-        conn.commit()
-    finally:
-        conn.close()
+        return False
+
+    return True
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -224,6 +370,196 @@ def _bundles_for_all_entries(hass: HomeAssistant) -> list[str]:
                 seen.add(folder)
                 result.append(folder)
     return result
+
+
+class ScheduleManager:
+    """Owns the GTFS schedule lifecycle: horizon check + self-healing refresh.
+
+    One instance is shared across all watch config entries (created lazily on
+    the first watch setup). The concurrency guard (lock + in-flight task) lives
+    at module scope in :data:`_GUARDS` keyed by DB path — NOT per instance —
+    so a config-flow refresh, a manager refresh, and a manager recreated after
+    an unload all coordinate against the same guard.
+
+    Responsibilities:
+      * a scheduled tick (async_track_time_interval) checks the horizon and
+        triggers a refresh BEFORE the calendar expires;
+      * a failed refresh schedules a retry (constant backoff), which is
+        cancelled on shutdown;
+      * tracks LOADED consumers (watch entries that called setup) so it can
+        stop rescheduling and cancel retries when the last one unloads.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        db_path: Path,
+        zip_path: Path,
+        *,
+        retry_seconds: int = GTFS_REFRESH_RETRY_SECONDS,
+    ) -> None:
+        self._hass = hass
+        self._db_path = db_path
+        self._zip_path = zip_path
+        self._retry_seconds = retry_seconds
+        # {frozenset(bundle_folders): asyncio.Task} — scheduled retries
+        self._retry_tasks: dict[frozenset[str], asyncio.Task[None]] = {}
+        self._cancel_check: Callable[[], None] | None = None
+        # Loaded consumer entry_ids (idempotent — a setup retry re-registers the
+        # same entry_id without double-counting).
+        self._consumers: set[str] = set()
+        self._stopping = False
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopping
+
+    # ------------------------------------------------------------------
+    # Consumer tracking (loaded watch entries)
+    # ------------------------------------------------------------------
+
+    def register_consumer(self, entry_id: str) -> None:
+        """Record a loaded watch entry; start the tick on the first one.
+
+        Idempotent by entry_id, so a setup retry (which re-enters
+        ``_async_setup_watch`` after a failed first refresh) does not inflate the
+        consumer count.
+        """
+        if entry_id in self._consumers:
+            return
+        self._consumers.add(entry_id)
+        if len(self._consumers) == 1:
+            self.start()
+
+    async def consumer_unloaded(self, entry_id: str) -> None:
+        """Record a watch entry unload/rollback; shut down on the last one.
+
+        Also used to roll back a registration when setup fails before the entry
+        is fully established.
+        """
+        self._consumers.discard(entry_id)
+        if not self._consumers:
+            await self.shutdown()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Begin the periodic horizon check (idempotent)."""
+        if self._cancel_check is not None or self._stopping:
+            return
+        self._cancel_check = async_track_time_interval(
+            self._hass,
+            lambda _now: self._hass.async_create_task(self.tick()),
+            GTFS_REFRESH_CHECK_INTERVAL,
+        )
+
+    def stop_tick(self) -> None:
+        if self._cancel_check is not None:
+            self._cancel_check()
+            self._cancel_check = None
+
+    async def shutdown(self) -> None:
+        """Stop rescheduling and cancel pending retries.
+
+        After shutdown, no NEW refresh may start (the tick is cancelled and
+        ``refresh``/``_schedule_retry`` become no-ops). An import already running
+        in an executor thread is allowed to finish and publish — it is shielded
+        and publishes atomically, and the module-scope guard is retained so a
+        fresh manager reuses it without clashing.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        self.stop_tick()
+        for task in list(self._retry_tasks.values()):
+            task.cancel()
+        for task in list(self._retry_tasks.values()):
+            with suppress(asyncio.CancelledError):
+                await task
+        self._retry_tasks.clear()
+
+    # ------------------------------------------------------------------
+    # Refresh orchestration
+    # ------------------------------------------------------------------
+
+    async def tick(self) -> None:
+        """Periodic horizon check; triggers a refresh when the schedule is due."""
+        if self._stopping:
+            return
+        bundles = _bundles_for_all_entries(self._hass)
+        if not bundles:
+            return
+        try:
+            await self.ensure_fresh(bundles)
+        except Exception as exc:  # keep the loop alive regardless
+            _LOGGER.warning("GTFS schedule refresh tick failed: %s", exc)
+
+    async def ensure_fresh(
+        self,
+        bundle_folders: list[str],
+        today: date | None = None,
+    ) -> bool:
+        """Check the horizon and refresh if the schedule is due.
+
+        Returns True if a refresh was triggered (or was already in flight),
+        False if the schedule was already fresh and nothing happened.
+        """
+        due = await self._hass.async_add_executor_job(
+            refresh_due,
+            self._db_path,
+            bundle_folders,
+            today or _service_today(self._hass),
+            GTFS_REFRESH_MARGIN_DAYS,
+        )
+        if not due:
+            _LOGGER.debug("GTFS schedule horizon is healthy — no refresh needed")
+            return False
+        await self.refresh(bundle_folders)
+        return True
+
+    async def refresh(self, bundle_folders: list[str]) -> bool:
+        """Refresh the schedule; schedule a retry on failure.
+
+        Concurrency is handled by the module-scope guard inside
+        async_trigger_gtfs_refresh, so concurrent callers share one import.
+        """
+        if self._stopping:
+            return False
+        ok = await async_trigger_gtfs_refresh(self._hass, bundle_folders)
+        if not ok:
+            self._schedule_retry(bundle_folders)
+        return ok
+
+    def _schedule_retry(self, bundle_folders: list[str]) -> None:
+        """Schedule a single retry after the backoff interval (deduplicated)."""
+        if self._stopping:
+            return
+        key = frozenset(bundle_folders)
+        existing = self._retry_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        self._retry_tasks[key] = self._hass.async_create_task(
+            self._retry_after(key, bundle_folders)
+        )
+
+    async def _retry_after(
+        self, key: frozenset[str], bundle_folders: list[str]
+    ) -> None:
+        """Wait the backoff interval, then re-attempt the refresh."""
+        await asyncio.sleep(self._retry_seconds)
+        self._retry_tasks.pop(key, None)
+        await self.refresh(bundle_folders)
+
+
+def _get_or_create_schedule_manager(hass: HomeAssistant) -> ScheduleManager:
+    """Return the shared schedule manager for this hass (fresh if stopped)."""
+    manager = hass.data[DOMAIN].get(_SCHEDULE_MANAGER_KEY)
+    if manager is None or manager.stopped:
+        manager = ScheduleManager(hass, _db_path(hass), _zip_path(hass))
+        hass.data[DOMAIN][_SCHEDULE_MANAGER_KEY] = manager
+    return manager
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignore[type-arg]
@@ -285,48 +621,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_setup_watch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a departure watch config entry."""
-    # Ensure the data directory exists
-    _data_dir(hass).mkdir(parents=True, exist_ok=True)
-
-    # Kick off a GTFS refresh if this mode's bundles aren't ready yet.
-    mode = entry.data.get(CONF_MODE, "")
-    bundles = MODE_BUNDLE_MAP.get(mode, [])
-    if bundles and not is_mode_ready(_db_path(hass), bundles):
-        hass.async_create_task(async_trigger_gtfs_refresh(hass, bundles))
-
-    # Schedule weekly refreshes
-    cancel_refresh = async_track_time_interval(
-        hass,
-        lambda _now: hass.async_create_task(async_trigger_gtfs_refresh(hass)),
-        _GTFS_REFRESH_INTERVAL,
+    # Ensure the data directory exists (blocking I/O → executor).
+    await hass.async_add_executor_job(
+        lambda: _data_dir(hass).mkdir(parents=True, exist_ok=True)
     )
 
-    # Determine this entry's index for stagger calculation
-    all_entries = hass.config_entries.async_entries(DOMAIN)
-    entry_index = next(
-        (i for i, e in enumerate(all_entries) if e.entry_id == entry.entry_id),
-        0,
-    )
+    # Start the shared schedule manager and register this entry as a consumer.
+    manager = _get_or_create_schedule_manager(hass)
+    manager.register_consumer(entry.entry_id)
 
-    coordinator = PTVDataUpdateCoordinator(
-        hass,
-        entry,
-        entry_index=entry_index,
-        db_path=_db_path(hass),
-    )
+    try:
+        mode = entry.data.get(CONF_MODE, "")
+        bundles = MODE_BUNDLE_MAP.get(mode, [])
+        if bundles:
+            hass.async_create_task(manager.ensure_fresh(bundles))
 
-    await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = coordinator
+        # Determine this entry's index for stagger calculation
+        all_entries = hass.config_entries.async_entries(DOMAIN)
+        entry_index = next(
+            (i for i, e in enumerate(all_entries) if e.entry_id == entry.entry_id),
+            0,
+        )
 
-    cancel_options = entry.add_update_listener(_async_options_updated)
+        coordinator = PTVDataUpdateCoordinator(
+            hass,
+            entry,
+            entry_index=entry_index,
+            db_path=_db_path(hass),
+        )
 
-    hass.data[DOMAIN][entry.entry_id] = {
-        "cancel_refresh": cancel_refresh,
-        "cancel_options": cancel_options,
-        "departure_count": int(entry.options.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT)),
-    }
+        await coordinator.async_config_entry_first_refresh()
+        entry.runtime_data = coordinator
 
-    await hass.config_entries.async_forward_entry_setups(entry, _WATCH_PLATFORMS)
+        cancel_options = entry.add_update_listener(_async_options_updated)
+
+        hass.data[DOMAIN][entry.entry_id] = {
+            "cancel_options": cancel_options,
+            "departure_count": int(
+                entry.options.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT)
+            ),
+        }
+
+        await hass.config_entries.async_forward_entry_setups(entry, _WATCH_PLATFORMS)
+    except BaseException:
+        # Roll back the consumer registration on ANY failure or cancellation
+        # (first refresh, options listener, platform forwarding). CancelledError
+        # is a BaseException on Py3.8+, so this also covers mid-setup
+        # cancellation; we roll back then re-raise. A HA setup retry re-registers
+        # cleanly (the consumer set is idempotent by entry_id).
+        await manager.consumer_unloaded(entry.entry_id)
+        raise
     return True
 
 
@@ -389,11 +733,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug("Unloading PTV entry: %s", entry.entry_id)
 
     entry_type = entry.data.get(CONF_ENTRY_TYPE, "watch")
-    platforms = (
-        _TRACKER_PLATFORMS
-        if entry_type in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER)
-        else _WATCH_PLATFORMS
-    )
+    is_tracker = entry_type in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER)
+    platforms = _TRACKER_PLATFORMS if is_tracker else _WATCH_PLATFORMS
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
@@ -403,6 +744,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             cancel = entry_data.get(key)
             if cancel:
                 cancel()
+
+        # A watch entry is a loaded schedule consumer — release it (and shut the
+        # manager down when the last one leaves).
+        if not is_tracker:
+            manager = hass.data[DOMAIN].get(_SCHEDULE_MANAGER_KEY)
+            if manager is not None:
+                await manager.consumer_unloaded(entry.entry_id)
 
     if not hass.config_entries.async_entries(DOMAIN):
         hass.data.pop(DOMAIN, None)

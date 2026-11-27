@@ -87,9 +87,19 @@ class _DataUpdateCoordinator:
     def __init__(self, *a, **kw): pass
     def __class_getitem__(cls, item): return cls
 
+    async def async_config_entry_first_refresh(self):
+        return None
+
 _coord = sys.modules["homeassistant.helpers.update_coordinator"]
 _coord.DataUpdateCoordinator = _DataUpdateCoordinator  # type: ignore[attr-defined]
-_coord.UpdateFailed = Exception  # type: ignore[attr-defined]
+
+
+class _UpdateFailed(Exception):
+    """Distinct exception type (not an alias of Exception) so tests can assert
+    `pytest.raises(UpdateFailed)` and verify the exact type."""
+
+
+_coord.UpdateFailed = _UpdateFailed  # type: ignore[attr-defined]
 class _CoordinatorEntityBase:
     """Distinct base for CoordinatorEntity (must not alias TrackerEntity)."""
 
@@ -121,6 +131,8 @@ _dt = sys.modules["homeassistant.util"]
 _dt.dt = types.SimpleNamespace(  # type: ignore[attr-defined]
     as_local=lambda x: x,
     utcnow=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    # now() returns a naive local datetime (as HA's dt_util.now() does).
+    now=lambda: __import__("datetime").datetime.now(),
 )
 
 _bs = sys.modules["homeassistant.components.binary_sensor"]

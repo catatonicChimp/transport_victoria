@@ -139,3 +139,27 @@ CREATE TABLE IF NOT EXISTS import_meta (
 --   'bundle_N'      — ISO8601 timestamp for each imported bundle folder
 -- shapes.txt is intentionally NOT imported — it contains 11M geometry rows
 -- needed only for map rendering, which adds no value for departure sensors.
+
+-- ---------------------------------------------------------------------------
+-- Schema versioning
+-- ---------------------------------------------------------------------------
+-- PRAGMA user_version marks the schema revision. The importer (importer.py)
+-- re-asserts GTFS_SCHEMA_VERSION after every import so a staged DB is always
+-- stamped with the current revision. At open time, a live DB whose
+-- user_version is below the required version is treated as stale and
+-- force-refreshed. This baseline (1) exists so fresh databases created from
+-- this script are never seen as "version 0".
+PRAGMA user_version = 1;
+
+-- ---------------------------------------------------------------------------
+-- Per-bundle provenance
+-- ---------------------------------------------------------------------------
+-- Records, per bundle folder, the maximum service date observed from THAT
+-- folder's calendar.txt/calendar_dates.txt rows at import time. Unlike the
+-- route-type inference that preceded it, this is exact provenance (the importer
+-- knows which folder each row came from), so a bundle's health is scoped to its
+-- own data and a healthy bundle cannot mask an expired one (or vice versa).
+CREATE TABLE IF NOT EXISTS _bundle_horizons (
+    bundle_folder TEXT PRIMARY KEY,
+    horizon_date  TEXT NOT NULL   -- YYYYMMDD
+);

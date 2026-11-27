@@ -1,9 +1,10 @@
-"""Unit tests for gtfs/importer.py."""
+"""Unit tests for gtfs/importer.py (generation model)."""
 
 from __future__ import annotations
 
 import csv
 import io
+import os
 import sqlite3
 import zipfile
 from datetime import date, timedelta
@@ -11,11 +12,13 @@ from pathlib import Path
 
 import pytest
 
+from custom_components.transport_victoria.gtfs import store
 from custom_components.transport_victoria.gtfs.importer import (
     _compute_valid_trip_ids,
     _import_stop_times,
     get_imported_bundles,
     get_stored_zip_meta,
+    import_bundles_to_generation,
     import_mode_bundles,
 )
 
@@ -29,17 +32,15 @@ def _make_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _make_gtfs_zip(tmp_path: Path, folder: str = "2") -> Path:
+def _make_gtfs_zip(tmp_path: Path, folder: str = "2", horizon_days: int = 30) -> Path:
     """Build a minimal nested PTV GTFS ZIP at tmp_path/gtfs.zip."""
     today = date.today()
     yesterday = (today - timedelta(days=1)).strftime("%Y%m%d")
-    tomorrow = (today + timedelta(days=30)).strftime("%Y%m%d")
-    dow = today.strftime("%A").lower()
+    tomorrow = (today + timedelta(days=horizon_days)).strftime("%Y%m%d")
 
     cal_row = {"service_id": "SVC1", "start_date": yesterday, "end_date": tomorrow,
-               "monday": "0", "tuesday": "0", "wednesday": "0", "thursday": "0",
-               "friday": "0", "saturday": "0", "sunday": "0"}
-    cal_row[dow] = "1"
+               "monday": "1", "tuesday": "1", "wednesday": "1", "thursday": "1",
+               "friday": "1", "saturday": "1", "sunday": "1"}
 
     def _csv(rows: list[dict]) -> bytes:
         buf = io.StringIO()
@@ -47,8 +48,6 @@ def _make_gtfs_zip(tmp_path: Path, folder: str = "2") -> Path:
         writer.writeheader()
         writer.writerows(rows)
         return buf.getvalue().encode("utf-8")
-
-    now_secs = 9 * 3600  # 09:00
 
     inner_buf = io.BytesIO()
     with zipfile.ZipFile(inner_buf, "w") as inner:
@@ -62,9 +61,6 @@ def _make_gtfs_zip(tmp_path: Path, folder: str = "2") -> Path:
              "route_color": "0099CC", "route_text_color": "FFFFFF"},
         ]))
         inner.writestr("calendar.txt", _csv([cal_row]))
-        inner.writestr("calendar_dates.txt", _csv([
-            {"service_id": "SVC1", "date": today.strftime("%Y%m%d"), "exception_type": "1"},
-        ]))
         inner.writestr("trips.txt", _csv([
             {"trip_id": "T1", "route_id": "R1", "service_id": "SVC1",
              "shape_id": "", "trip_headsign": "Flinders Street", "direction_id": "0", "block_id": ""},
@@ -87,6 +83,10 @@ def _make_gtfs_zip(tmp_path: Path, folder: str = "2") -> Path:
     return outer_path
 
 
+def _open_generation(db_path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(str(store.resolve_db(db_path)))
+
+
 # ---------------------------------------------------------------------------
 # _compute_valid_trip_ids
 # ---------------------------------------------------------------------------
@@ -95,10 +95,8 @@ class TestComputeValidTripIds:
     def test_includes_active_trips(self, tmp_path: Path):
         conn = _make_db(tmp_path / "db.db")
         today = date.today()
-        dow = today.strftime("%A").lower()
-        cal = {"monday": 0, "tuesday": 0, "wednesday": 0, "thursday": 0,
-               "friday": 0, "saturday": 0, "sunday": 0}
-        cal[dow] = 1
+        cal = {"monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+               "friday": 1, "saturday": 1, "sunday": 1}
         conn.execute(
             "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("SVC1", *list(cal.values()),
@@ -108,14 +106,15 @@ class TestComputeValidTripIds:
         conn.execute("INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?)",
                      ("T1", "R1", "SVC1", None, "Test", 0, None))
         conn.commit()
-        result = _compute_valid_trip_ids(conn, window_days=45)
+        result = _compute_valid_trip_ids(conn, window_days=45, today=today)
         assert "T1" in result
         conn.close()
 
     def test_excludes_expired_trips(self, tmp_path: Path):
         conn = _make_db(tmp_path / "db.db")
-        past = (date.today() - timedelta(100)).strftime("%Y%m%d")
-        past_end = (date.today() - timedelta(60)).strftime("%Y%m%d")
+        today = date.today()
+        past = (today - timedelta(100)).strftime("%Y%m%d")
+        past_end = (today - timedelta(60)).strftime("%Y%m%d")
         conn.execute(
             "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("SVC_OLD", 1, 1, 1, 1, 1, 1, 1, past, past_end),
@@ -123,7 +122,7 @@ class TestComputeValidTripIds:
         conn.execute("INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?)",
                      ("T_OLD", "R1", "SVC_OLD", None, "Old", 0, None))
         conn.commit()
-        result = _compute_valid_trip_ids(conn, window_days=45)
+        result = _compute_valid_trip_ids(conn, window_days=45, today=today)
         assert "T_OLD" not in result
         conn.close()
 
@@ -135,44 +134,49 @@ class TestComputeValidTripIds:
 
 
 # ---------------------------------------------------------------------------
-# import_mode_bundles
+# import_bundles_to_generation / import_mode_bundles
 # ---------------------------------------------------------------------------
 
-class TestImportModeBundles:
+class TestImportBundlesToGeneration:
     def test_basic_import(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
+        ptr = import_bundles_to_generation(db_path, zip_path, "abc123", ["2"])
+        assert ptr["generation"].startswith("gtfs-")
+        conn = _open_generation(db_path)
+        row = conn.execute("SELECT COUNT(*) FROM stops").fetchone()
+        conn.close()
+        assert row[0] > 0
+        assert store.pointer_path(db_path).exists()
+
+    def test_legacy_wrapper_order(self, tmp_path: Path):
+        zip_path = _make_gtfs_zip(tmp_path)
+        db_path = tmp_path / "gtfs.db"
+        # Legacy signature: (zip_path, db_path, sha, bundles).
         import_mode_bundles(zip_path, db_path, "abc123", ["2"])
-        conn = sqlite3.connect(str(db_path))
+        conn = _open_generation(db_path)
         row = conn.execute("SELECT COUNT(*) FROM stops").fetchone()
         conn.close()
         assert row[0] > 0
 
-    def test_skips_already_imported(self, tmp_path: Path):
+    def test_two_imports_two_generations(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
-        import_mode_bundles(zip_path, db_path, "abc123", ["2"])
-        # Second call with same bundle should be skipped (no error, no duplicate)
-        import_mode_bundles(zip_path, db_path, "abc123", ["2"])
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT COUNT(*) FROM stops").fetchone()
-        conn.close()
-        assert row[0] == 1  # only one stop in our fixture
-
-    def test_force_reimports(self, tmp_path: Path):
-        zip_path = _make_gtfs_zip(tmp_path)
-        db_path = tmp_path / "gtfs.db"
-        import_mode_bundles(zip_path, db_path, "sha1", ["2"])
-        import_mode_bundles(zip_path, db_path, "sha2", ["2"], force=True)
-        bundles = get_imported_bundles(db_path)
-        assert "2" in bundles
+        import_bundles_to_generation(db_path, zip_path, "sha1", ["2"])
+        first = store.resolve_db(db_path)
+        import_bundles_to_generation(db_path, zip_path, "sha2", ["2"])
+        second = store.resolve_db(db_path)
+        # A fresh generation each time; pointer now names the newest.
+        assert first != second
+        assert second.exists()
+        assert "2" in get_imported_bundles(db_path)
 
     def test_stores_etag_and_size(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
-        import_mode_bundles(
-            zip_path, db_path, "abc", ["2"],
-            zip_etag='"etag123"', zip_size="12345"
+        import_bundles_to_generation(
+            db_path, zip_path, "abc", ["2"],
+            zip_etag='"etag123"', zip_size="12345",
         )
         meta = get_stored_zip_meta(db_path)
         assert meta.get("zip_etag") == '"etag123"'
@@ -182,12 +186,50 @@ class TestImportModeBundles:
     def test_stop_times_filtered_to_active_trips(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
-        import_mode_bundles(zip_path, db_path, "abc", ["2"])
-        conn = sqlite3.connect(str(db_path))
+        import_bundles_to_generation(db_path, zip_path, "abc", ["2"])
+        conn = _open_generation(db_path)
         count = conn.execute("SELECT COUNT(*) FROM stop_times").fetchone()[0]
         conn.close()
-        # Our fixture has 1 trip active today → 1 stop_time row
         assert count == 1
+
+    def test_missing_bundle_folder_raises(self, tmp_path: Path):
+        zip_path = _make_gtfs_zip(tmp_path, folder="2")
+        db_path = tmp_path / "gtfs.db"
+        with pytest.raises(ValueError):
+            import_bundles_to_generation(db_path, zip_path, "abc", ["6"])
+        # No pointer published on failure.
+        assert store.read_pointer(db_path) is None
+
+    def test_expired_schedule_rejected(self, tmp_path: Path):
+        # A zip whose calendar already ends in the past must be rejected.
+        zip_path = _make_gtfs_zip(tmp_path, folder="2", horizon_days=-10)
+        db_path = tmp_path / "gtfs.db"
+        with pytest.raises(ValueError):
+            import_bundles_to_generation(db_path, zip_path, "abc", ["2"])
+        assert store.read_pointer(db_path) is None
+
+    def test_failed_import_preserves_previous_generation(self, tmp_path: Path):
+        zip_path = _make_gtfs_zip(tmp_path)
+        db_path = tmp_path / "gtfs.db"
+        import_bundles_to_generation(db_path, zip_path, "good", ["2"])
+        previous = store.resolve_db(db_path)
+        previous_horizon = _stops_count(previous)
+
+        # Now import a zip missing the requested bundle → fails, previous intact.
+        bad_zip = _make_gtfs_zip(tmp_path, folder="2")
+        bad_zip = _make_gtfs_zip(tmp_path, folder="9")  # no folder 9 in zip? it's folder 9
+        with pytest.raises(ValueError):
+            import_bundles_to_generation(db_path, bad_zip, "bad", ["2"])
+        assert store.resolve_db(db_path) == previous
+        assert _stops_count(previous) == previous_horizon
+
+
+def _stops_count(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM stops").fetchone()[0]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +244,51 @@ class TestMetaHelpers:
     def test_returns_imported_bundles(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
-        import_mode_bundles(zip_path, db_path, "sha", ["2"])
+        import_bundles_to_generation(db_path, zip_path, "sha", ["2"])
         assert "2" in get_imported_bundles(db_path)
 
     def test_sha256_stored(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
-        import_mode_bundles(zip_path, db_path, "deadbeef", ["2"])
+        import_bundles_to_generation(db_path, zip_path, "deadbeef", ["2"])
         meta = get_stored_zip_meta(db_path)
         assert meta["zip_sha256"] == "deadbeef"
+
+
+# ---------------------------------------------------------------------------
+# Build-registry lifecycle (guaranteed unregistration)
+# ---------------------------------------------------------------------------
+
+class TestBuildRegistry:
+    def test_connect_failure_unregisters_build(self, tmp_path: Path, monkeypatch):
+        zip_path = _make_gtfs_zip(tmp_path)
+        db_path = tmp_path / "gtfs.db"
+
+        def failing_connect(*a, **k):
+            raise sqlite3.OperationalError("simulated connect failure")
+
+        monkeypatch.setattr(sqlite3, "connect", failing_connect)
+        with pytest.raises(sqlite3.OperationalError):
+            import_bundles_to_generation(db_path, zip_path, "sha", ["2"])
+
+        # Registration is fully rolled back; no dangling registered build.
+        assert store._active_builds == set()
+
+    def test_rename_failure_unregisters_and_keeps_incumbent(self, tmp_path: Path, monkeypatch):
+        zip_path = _make_gtfs_zip(tmp_path)
+        db_path = tmp_path / "gtfs.db"
+        import_bundles_to_generation(db_path, zip_path, "sha1", ["2"])
+        incumbent = store.resolve_db(db_path)
+        assert incumbent.exists()
+
+        def failing_rename(src, dst):
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr(os, "rename", failing_rename)
+        with pytest.raises(OSError):
+            import_bundles_to_generation(db_path, zip_path, "sha2", ["2"])
+
+        # Registration rolled back and the live generation is untouched.
+        assert store._active_builds == set()
+        assert store.resolve_db(db_path) == incumbent
+        assert incumbent.exists()

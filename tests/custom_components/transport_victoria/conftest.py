@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import sqlite3
 import zipfile
-from datetime import date, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -25,12 +25,22 @@ def _create_db(tmp_path: Path) -> Path:
     conn = sqlite3.connect(str(db_path))
     conn.executescript(schema_sql)
 
-    today = date.today()
-    yesterday = today - timedelta(days=1)
-    tomorrow = today + timedelta(days=30)
-    today_str = today.strftime("%Y%m%d")
-    yesterday_str = yesterday.strftime("%Y%m%d")
-    tomorrow_str = tomorrow.strftime("%Y%m%d")
+    # Anchor the fixture to the GTFS *service day*, which rolls back to
+    # yesterday between 00:00 and 03:00 local. Using the raw wall-clock date
+    # makes these tests time-of-day flaky (departure queries resolve to
+    # yesterday's service date while the calendar only enabled today's weekday).
+    from datetime import datetime
+
+    from custom_components.transport_victoria.gtfs.time_utils import service_day_for_time
+
+    now = datetime.now()
+    service_date, now_seconds = service_day_for_time(now)
+
+    start = service_date - timedelta(days=10)
+    end = service_date + timedelta(days=30)
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    today_str = service_date.strftime("%Y%m%d")
 
     # Agency
     conn.execute(
@@ -44,13 +54,12 @@ def _create_db(tmp_path: Path) -> Path:
         ("R1", "1", "Craigieburn", "Craigieburn Line", 400, "0099CC", "FFFFFF"),
     )
 
-    # Service running today
-    dow = today.strftime("%A").lower()
-    dow_cols = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    cal_vals = [1 if c == dow else 0 for c in dow_cols]
+    # Service active every day of the week, spanning the service date broadly,
+    # so the calendar covers whichever service date the departure query resolves
+    # to (including the 00:00–03:00 cutover where "today" is yesterday).
     conn.execute(
         "INSERT INTO calendar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("SVC1", *cal_vals, yesterday_str, tomorrow_str),
+        ("SVC1", 1, 1, 1, 1, 1, 1, 1, start_str, end_str),
     )
 
     # Trips
@@ -80,12 +89,10 @@ def _create_db(tmp_path: Path) -> Path:
     # Stop times — two trips from PLAT1, then stop at FLST
     from custom_components.transport_victoria.gtfs.time_utils import gtfs_time_to_seconds
 
-    # T1: PLAT1 → FLST, departing ~now + 10 min
-    from datetime import datetime
-    now = datetime.now()
-    now_secs = now.hour * 3600 + now.minute * 60 + now.second
-    dep1 = now_secs + 600   # +10 min
-    dep2 = now_secs + 1800  # +30 min
+    # Departures anchored to the service day (see above) so they are always in
+    # the future relative to the departure query, at any wall-clock time.
+    dep1 = now_seconds + 600   # +10 min
+    dep2 = now_seconds + 1800  # +30 min
 
     conn.executemany(
         "INSERT INTO stop_times VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

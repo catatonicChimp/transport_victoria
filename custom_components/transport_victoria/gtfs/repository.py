@@ -17,6 +17,14 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
+from ..const import GTFS_SCHEMA_VERSION
+from . import store
+from .horizon import (
+    compute_horizon,
+    compute_horizon_for_bundle,
+    get_schema_version,
+    imported_bundles,
+)
 from .time_utils import (
     day_of_week_column,
     departure_seconds_to_datetime,
@@ -25,6 +33,11 @@ from .time_utils import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _resolve(db_path: Path) -> Path:
+    """Resolve a logical DB path (anchor) to the current generation file."""
+    return store.resolve_db(db_path)
 
 
 @dataclass(slots=True)
@@ -207,7 +220,7 @@ def _query_branch(
     if platform_filter:
         params["platform_filter"] = platform_filter
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(sql, params)
@@ -258,7 +271,7 @@ def _filter_by_destination(
         WHERE stop_id = ? AND trip_id IN ({placeholders})
     """
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         qualifying: set[str] = set()
         for db_row in conn.execute(sql, [destination_stop_id] + trip_ids):
@@ -323,7 +336,7 @@ def search_stops_by_name(
     like_query = _escape_like(query) + "%"
     params = [like_query] + route_types + [limit]
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         conn.row_factory = sqlite3.Row
         results = []
@@ -404,7 +417,7 @@ def search_stops_by_distance(
         lon - lon_margin, lon + lon_margin,
     ] + route_types
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         conn.row_factory = sqlite3.Row
         candidates = []
@@ -494,7 +507,7 @@ def get_routes_for_stop(
     """
     params: list[object] = [stop_id, stop_id] + list(route_types)
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         conn.row_factory = sqlite3.Row
         results = []
@@ -532,7 +545,7 @@ def get_platforms_for_stop(db_path: Path, stop_id: str) -> list[str]:
           )
         ORDER BY s.platform_code
     """
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         platforms = []
         for row in conn.execute(sql, [stop_id, stop_id]):
@@ -618,7 +631,7 @@ def get_service_type_baselines(
                                AND gb.terminal_stop_id = tt.terminal_stop_id
     """
     params = trip_ids + trip_ids
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         result: dict[str, tuple[int, int]] = {}
         for row in conn.execute(sql, params):
@@ -646,7 +659,7 @@ def get_arrival_at_stop(
         WHERE trip_id = ? AND stop_id = ?
         LIMIT 1
     """
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         row = conn.execute(sql, [trip_id, stop_id]).fetchone()
         if row is None:
@@ -660,11 +673,12 @@ def get_arrival_at_stop(
 
 
 def is_db_ready(db_path: Path) -> bool:
-    """Return True if the database exists and has data in the stops table."""
-    if not db_path.exists():
+    """Return True if a generation exists and has data in the stops table."""
+    resolved = store.resolve_db(db_path)
+    if not resolved.exists():
         return False
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(resolved))
         try:
             row = conn.execute("SELECT COUNT(*) FROM stops").fetchone()
             return (row[0] or 0) > 0
@@ -676,10 +690,11 @@ def is_db_ready(db_path: Path) -> bool:
 
 def is_mode_ready(db_path: Path, bundle_folders: list[str]) -> bool:
     """Return True if all requested bundle folders have been imported."""
-    if not db_path.exists():
+    resolved = store.resolve_db(db_path)
+    if not resolved.exists():
         return False
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(str(resolved))
         try:
             placeholders = ", ".join("?" * len(bundle_folders))
             keys = [f"bundle_{f}" for f in bundle_folders]
@@ -692,6 +707,52 @@ def is_mode_ready(db_path: Path, bundle_folders: list[str]) -> bool:
             conn.close()
     except sqlite3.Error:
         return False
+
+
+def schedule_state(
+    db_path: Path,
+    bundle_folders: list[str] | None = None,
+    today: date | None = None,
+) -> str:
+    """Return a coarse schedule-health state for the coordinator.
+
+    One of (worst-first):
+      * "missing" — no generation, a required bundle not imported, or no
+        calendar coverage at all;
+      * "stale"   — generation present but below the required schema version;
+      * "expired" — a bundle (or the whole schedule, when no bundles given)
+        has data but its horizon is in the past;
+      * "ready"   — usable.
+
+    When ``bundle_folders`` is given, each bundle is evaluated independently
+    (horizon scoped to that bundle's route_types, plus a missing-bundle check)
+    and the WORST state wins, so a healthy bundle cannot mask an expired one.
+    """
+    today = today or date.today()
+    resolved = store.resolve_db(db_path)
+    if not resolved.exists():
+        return "missing"
+    if get_schema_version(db_path) < GTFS_SCHEMA_VERSION:
+        return "stale"
+
+    if bundle_folders:
+        present = imported_bundles(db_path)
+        for folder in bundle_folders:
+            if folder not in present:
+                return "missing"
+            horizon = compute_horizon_for_bundle(db_path, folder)
+            if horizon is None:
+                return "missing"
+            if horizon < today:
+                return "expired"
+        return "ready"
+
+    horizon = compute_horizon(db_path)
+    if horizon is None:
+        return "missing"
+    if horizon < today:
+        return "expired"
+    return "ready"
 
 
 def get_all_routes(
@@ -722,7 +783,7 @@ def get_all_routes(
     """
     params: list[int | str] = [*route_types, limit]
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         conn.row_factory = sqlite3.Row
         results = []
@@ -775,7 +836,7 @@ def search_routes_by_name(
     """
     params: list[int | str] = [like_query, like_query, *route_types, limit]
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         conn.row_factory = sqlite3.Row
         results = []
@@ -806,7 +867,7 @@ def get_stop_lat_lon(
     coordinates in the config entry (avoids a DB lookup on every poll).
     """
     sql = "SELECT stop_lat, stop_lon FROM stops WHERE stop_id = ? LIMIT 1"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_resolve(db_path)))
     try:
         row = conn.execute(sql, [stop_id]).fetchone()
         if row is None or row[0] is None or row[1] is None:
