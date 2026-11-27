@@ -117,6 +117,12 @@ async def _add_all_destinations_pin(hass, entry_id: str) -> str:
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"], {CONF_LABEL_FROM: "A", CONF_LABEL_TO: "All", CONF_INCLUDE: True}
     )
+    # Options now advances to the "Add another line?" menu, not straight to create.
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "add_another"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     entry = hass.config_entries.async_get_entry(entry_id)
     return next(iter(entry.subentries.keys()))
@@ -146,6 +152,11 @@ async def _add_city_pin(hass, entry_id: str) -> str:
     assert result["step_id"] == "options"
     result = await hass.config_entries.subentries.async_configure(
         result["flow_id"], {CONF_LABEL_FROM: "B", CONF_LABEL_TO: "City", CONF_INCLUDE: True}
+    )
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "add_another"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     entry = hass.config_entries.async_get_entry(entry_id)
@@ -177,6 +188,11 @@ async def test_add_pin_all_destinations_creates_subentry(hass, board_entry):
             CONF_LABEL_TO: "All destinations",
             CONF_INCLUDE: True,
         },
+    )
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "add_another"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
@@ -231,6 +247,11 @@ async def test_add_pin_specific_destination_derives_direction(hass, board_entry)
             CONF_INCLUDE: True,
         },
     )
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "add_another"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"], {"next_step_id": "finish"}
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
     entry = hass.config_entries.async_get_entry(board_entry.entry_id)
@@ -281,16 +302,24 @@ async def test_board_options_reorder_writes_order(hass, board_entry):
     assert first != second
 
     result = await hass.config_entries.options.async_init(board_entry.entry_id)
-    assert result["type"] is FlowResultType.MENU
+    # Single-screen board options (a form with a dropdown, not a two-hop menu).
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "board_menu"
 
     result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"next_step_id": "board_reorder"}
+        result["flow_id"], {"board_action": "reorder"}
     )
     assert result["step_id"] == "board_reorder"
 
-    # Move the first pin down → order flips to [second, first].
+    # Move the first pin down → applied immediately, reorder step re-renders.
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"pin_select": first, "reorder_action": "down"}
+    )
+    assert result["step_id"] == "board_reorder"
+
+    # Done → order flips to [second, first].
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"pin_select": first, "reorder_action": "done"}
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
@@ -304,7 +333,7 @@ async def test_board_options_remove_deletes_subentry(hass, board_entry):
 
     result = await hass.config_entries.options.async_init(board_entry.entry_id)
     result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"next_step_id": "board_remove"}
+        result["flow_id"], {"board_action": "remove"}
     )
     assert result["step_id"] == "board_remove"
 

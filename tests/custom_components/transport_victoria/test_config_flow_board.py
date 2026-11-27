@@ -52,7 +52,11 @@ async def test_board_name_creates_entry(monkeypatch):
 
     monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
 
-    await flow.async_step_board_name({CONF_BOARD_NAME: "My Board"})
+    # The board name is now collected on the same screen as the entry-type
+    # choice — no separate board_name step.
+    await flow.async_step_entry_type(
+        {"entry_type": ENTRY_TYPE_BOARD, CONF_BOARD_NAME: "My Board"}
+    )
 
     assert captured["title"] == "My Board"
     assert captured["data"][CONF_ENTRY_TYPE] == ENTRY_TYPE_BOARD
@@ -68,11 +72,13 @@ async def test_board_name_requires_name(monkeypatch):
 
     def fake_show_form(**kwargs):
         captured.update(kwargs)
-        return {"type": "form", "step_id": "board_name"}
+        return {"type": "form", "step_id": "entry_type"}
 
     monkeypatch.setattr(flow, "async_show_form", fake_show_form)
 
-    await flow.async_step_board_name({CONF_BOARD_NAME: "   "})
+    await flow.async_step_entry_type(
+        {"entry_type": ENTRY_TYPE_BOARD, CONF_BOARD_NAME: "   "}
+    )
     assert captured["errors"] == {CONF_BOARD_NAME: "required"}
 
 

@@ -66,7 +66,8 @@
       "entry_type": {
         "title": "What would you like to add?",
         "data": {
-          "entry_type": "Type"
+          "entry_type": "Type",
+          "board_name": "Board name"
         }
       },
       "vehicle_tracker": {
@@ -223,6 +224,13 @@
             "colour_override": "Colour override (optional)"
           }
         },
+        "add_another": {
+          "title": "Add Another Line?",
+          "menu_options": {
+            "add_another_line": "Add another line",
+            "finish": "Done"
+          }
+        },
         "reconfigure": {
           "title": "Edit Pin",
           "description": "Edit this pin's labels and options.",
@@ -250,6 +258,13 @@
           "max_vehicles": "Number of vehicles to track"
         }
       },
+      "board_menu": {
+        "title": "Manage Board",
+        "description": "Choose what to adjust for this board.",
+        "data": {
+          "board_action": "Manage"
+        }
+      },
       "board_settings": {
         "title": "Board Settings",
         "description": "Adjust settings for this board.",
@@ -263,10 +278,10 @@
       },
       "board_reorder": {
         "title": "Reorder Pins",
-        "description": "Move a pin up or down in the board.",
+        "description": "Move a pin up, down, to first, or to last. Each move is applied immediately — choose \"Done\" when finished.",
         "data": {
           "pin_select": "Pin",
-          "reorder_action": "Action"
+          "reorder_action": "Move"
         }
       },
       "board_remove": {

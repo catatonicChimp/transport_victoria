@@ -14,6 +14,7 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
+    ConfigSubentry,
     ConfigSubentryFlow,
     OptionsFlow,
 )
@@ -84,7 +85,6 @@ from .const import (
 from .board import (
     PinData,
     line_value,
-    move_subentry,
     normalize_order,
     pin_from_line,
     pin_from_route_all,
@@ -133,6 +133,71 @@ _IMPORT_OPTION = "import"
 # Upper bound on the post-download import wait (5 s per poll → 15 minutes).
 # Without a bound a failed/cancelled refresh leaves the spinner up forever.
 _MAX_IMPORT_POLLS = 180
+
+# How many select options before a flat radio list renders as a searchable
+# dropdown instead of a radio wall.  Lists at or below this stay radio buttons.
+_DROPDOWN_OPTION_THRESHOLD = 6
+
+# Upper bound on the number of destination candidates rendered in the
+# destination dropdown (bounds render size; the free-text search fallback
+# remains for the no-candidate case).
+_DEST_CANDIDATE_CAP = 100
+
+
+def _select_selector_mode(option_count: int) -> str:
+    """Return the select mode name for a list of ``option_count`` options.
+
+    Kept as a plain-string decision (mapped to the HA enum at render time) so
+    the light-env tests can assert the dropdown/list choice without importing
+    the real ``homeassistant.helpers.selector`` enums.
+    """
+    return "dropdown" if option_count > _DROPDOWN_OPTION_THRESHOLD else "list"
+
+
+def _select_selector(
+    options: list[selector.SelectOptionDict],
+    *,
+    multiple: bool = False,
+) -> selector.SelectSelector:
+    """Build a single/multi select selector; dropdown when the list is long."""
+    if _select_selector_mode(len(options)) == "dropdown":
+        mode = selector.SelectSelectorMode.DROPDOWN
+    else:
+        mode = selector.SelectSelectorMode.LIST
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=options,
+            multiple=multiple,
+            mode=mode,
+        )
+    )
+
+
+def _reorder_subentry(
+    ordered: list[str], subentry_id: str, action: str
+) -> list[str]:
+    """Return a copy of ``ordered`` with ``subentry_id`` moved per ``action``.
+
+    ``action`` is ``"up"``, ``"down"``, ``"first"`` or ``"last"``; a no-op at
+    the boundaries.  Kept local to the config flow so the reorder UX (up/down/
+    first/last) does not touch ``board.move_subentry`` (which only moves ±1).
+    """
+    result = list(ordered)
+    if subentry_id not in result or len(result) < 2:
+        return result
+    idx = result.index(subentry_id)
+    if action == "first":
+        result.insert(0, result.pop(idx))
+        return result
+    if action == "last":
+        result.append(result.pop(idx))
+        return result
+    direction = -1 if action == "up" else 1
+    new_idx = idx + direction
+    if new_idx < 0 or new_idx >= len(result):
+        return result
+    result[idx], result[new_idx] = result[new_idx], result[idx]
+    return result
 
 
 def _task_succeeded(task: asyncio.Task[Any]) -> bool:
@@ -269,7 +334,9 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
-                vol.Required(CONF_API_KEY): selector.TextSelector(
+                vol.Required(
+                    CONF_API_KEY, default=self._get_existing_api_key() or ""
+                ): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
                 ),
             }),
@@ -586,13 +653,10 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             )
 
         if self._stop_search_results:
-            schema_fields[vol.Optional(CONF_STOP_ID)] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=_stops_to_selector_options(
-                        self._stop_search_results,
-                        show_distance=self._stop_method in ("distance", "map"),
-                    ),
-                    mode=selector.SelectSelectorMode.LIST,
+            schema_fields[vol.Optional(CONF_STOP_ID)] = _select_selector(
+                _stops_to_selector_options(
+                    self._stop_search_results,
+                    show_distance=self._stop_method in ("distance", "map"),
                 )
             )
 
@@ -644,12 +708,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return self.async_show_form(
             step_id="route",
             data_schema=vol.Schema({
-                vol.Required("route_choice", default="__all__"): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=options,
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
+                vol.Required("route_choice", default="__all__"): _select_selector(options),
             }),
             description_placeholders={"stop_name": self._config.get(CONF_STOP_NAME, "")},
         )
@@ -690,12 +749,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return self.async_show_form(
             step_id="platform",
             data_schema=vol.Schema({
-                vol.Required("platform_choice", default="__all__"): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=options,
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
+                vol.Required("platform_choice", default="__all__"): _select_selector(options),
             }),
             description_placeholders={"stop_name": self._config.get(CONF_STOP_NAME, "")},
         )
@@ -824,7 +878,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 value=_ALL_DESTINATIONS_KEY, label="All destinations"
             )
         ]
-        for c in self._dest_candidates:
+        for c in self._dest_candidates[:_DEST_CANDIDATE_CAP]:
             options.append(
                 selector.SelectOptionDict(
                     value=destination_value(c), label=destination_label(c)
@@ -843,12 +897,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         schema_fields: dict[Any, Any] = {
             vol.Required(
                 "destination_choice", default=_ALL_DESTINATIONS_KEY
-            ): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=options,
-                    mode=selector.SelectSelectorMode.LIST,
-                )
-            ),
+            ): _select_selector(options),
         }
 
         if user_input and user_input.get("destination_choice") == "specific":
@@ -858,11 +907,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             if self._dest_search_results:
                 schema_fields[
                     vol.Optional(CONF_DESTINATION_STOP_ID)
-                ] = selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=_stops_to_selector_options(self._dest_search_results),
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
+                ] = _select_selector(
+                    _stops_to_selector_options(self._dest_search_results)
                 )
 
         return self.async_show_form(
@@ -942,11 +988,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             ),
         }
         if self._transfer_search_results:
-            schema_fields[vol.Optional(CONF_TRANSFER_STOP_ID)] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=_stops_to_selector_options(self._transfer_search_results),
-                    mode=selector.SelectSelectorMode.LIST,
-                )
+            schema_fields[vol.Optional(CONF_TRANSFER_STOP_ID)] = _select_selector(
+                _stops_to_selector_options(self._transfer_search_results)
             )
 
         return self.async_show_form(
@@ -1018,11 +1061,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             ),
         }
         if self._journey_dest_search_results:
-            schema_fields[vol.Optional(CONF_JOURNEY_DESTINATION_STOP_ID)] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=_stops_to_selector_options(self._journey_dest_search_results),
-                    mode=selector.SelectSelectorMode.LIST,
-                )
+            schema_fields[vol.Optional(CONF_JOURNEY_DESTINATION_STOP_ID)] = _select_selector(
+                _stops_to_selector_options(self._journey_dest_search_results)
             )
 
         return self.async_show_form(
@@ -1134,7 +1174,12 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     async def async_step_entry_type(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose between a Departure Watch, Vehicle Tracker, Route Tracker, or Board."""
+        """Choose between a Departure Watch, Vehicle Tracker, Route Tracker, or Board.
+
+        The board name is collected on this same screen (no separate naming
+        step): picking "Trip-Group Board" and submitting creates the board with
+        the name entered here.
+        """
         if user_input is not None:
             entry_type = user_input.get("entry_type", ENTRY_TYPE_WATCH)
             if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
@@ -1142,7 +1187,9 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
                 return await self.async_step_route_tracker_mode()
             if entry_type == ENTRY_TYPE_BOARD:
-                return await self.async_step_board_name()
+                return await self._create_board_entry(
+                    user_input.get(CONF_BOARD_NAME, "")
+                )
             if entry_type == _IMPORT_OPTION:
                 return await self.async_step_import()
             # Default: departure watch — continue with mode selection
@@ -1150,78 +1197,71 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
 
         return self.async_show_form(
             step_id="entry_type",
-            data_schema=vol.Schema({
-                vol.Required("entry_type", default=ENTRY_TYPE_WATCH): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=[
-                            selector.SelectOptionDict(
-                                value=ENTRY_TYPE_WATCH,
-                                label="Station Departures",
-                            ),
-                            selector.SelectOptionDict(
-                                value=ENTRY_TYPE_VEHICLE_TRACKER,
-                                label="Vehicle Tracker (linked to Station)",
-                            ),
-                            selector.SelectOptionDict(
-                                value=ENTRY_TYPE_ROUTE_TRACKER,
-                                label="Route Tracker (all vehicles on a line)",
-                            ),
-                            selector.SelectOptionDict(
-                                value=ENTRY_TYPE_BOARD,
-                                label="Trip-Group Board (multiple lines at a stop)",
-                            ),
-                            selector.SelectOptionDict(
-                                value=_IMPORT_OPTION,
-                                label="Trip-Group Board — import from existing watches",
-                            ),
-                        ],
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
-            }),
+            data_schema=self._entry_type_schema(),
         )
 
-    async def async_step_board_name(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Name the board and create the parent config entry.
+    def _entry_type_schema(self) -> vol.Schema:
+        """Build the "what to add" form (type selector + board name)."""
+        return vol.Schema({
+            vol.Required("entry_type", default=ENTRY_TYPE_WATCH): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(
+                            value=ENTRY_TYPE_WATCH,
+                            label="Station Departures",
+                        ),
+                        selector.SelectOptionDict(
+                            value=ENTRY_TYPE_VEHICLE_TRACKER,
+                            label="Vehicle Tracker (linked to Station)",
+                        ),
+                        selector.SelectOptionDict(
+                            value=ENTRY_TYPE_ROUTE_TRACKER,
+                            label="Route Tracker (all vehicles on a line)",
+                        ),
+                        selector.SelectOptionDict(
+                            value=ENTRY_TYPE_BOARD,
+                            label="Trip-Group Board (multiple lines at a stop)",
+                        ),
+                        selector.SelectOptionDict(
+                            value=_IMPORT_OPTION,
+                            label="Trip-Group Board — import from existing watches",
+                        ),
+                    ],
+                    mode=selector.SelectSelectorMode.LIST,
+                )
+            ),
+            vol.Optional(CONF_BOARD_NAME, default="Departure Board"): selector.TextSelector(),
+        })
+
+    async def _create_board_entry(self, board_name: str) -> ConfigFlowResult:
+        """Create the board parent config entry from the merged first screen.
 
         Pins are added afterwards as subentries (see PTVBoardSubentryFlow).  A
         fresh board triggers a full GTFS refresh (all bundles) in the background
         so the subsequent pin flow has schedule data to resolve against.
         """
-        if user_input is not None:
-            board_name = user_input.get(CONF_BOARD_NAME, "").strip()
-            if not board_name:
-                return self.async_show_form(
-                    step_id="board_name",
-                    errors={CONF_BOARD_NAME: "required"},
-                    data_schema=vol.Schema({
-                        vol.Required(CONF_BOARD_NAME, default=""): selector.TextSelector(),
-                    }),
-                )
-            self.hass.async_create_task(async_trigger_gtfs_refresh(self.hass))
-            return self.async_create_entry(
-                title=board_name,
-                data={
-                    CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
-                    CONF_BOARD_NAME: board_name,
-                    CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
-                },
-                options={
-                    CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
-                    CONF_REALTIME_ENABLED: True,
-                    CONF_SUBENTRY_ORDER: [],
-                    CONF_SHOW_RUN_NUMBERS: DEFAULT_SHOW_RUN_NUMBERS,
-                    CONF_SHOW_VEHICLE_TYPE: DEFAULT_SHOW_VEHICLE_TYPE,
-                },
+        board_name = board_name.strip()
+        if not board_name:
+            return self.async_show_form(
+                step_id="entry_type",
+                errors={CONF_BOARD_NAME: "required"},
+                data_schema=self._entry_type_schema(),
             )
-
-        return self.async_show_form(
-            step_id="board_name",
-            data_schema=vol.Schema({
-                vol.Required(CONF_BOARD_NAME, default="Departure Board"): selector.TextSelector(),
-            }),
+        self.hass.async_create_task(async_trigger_gtfs_refresh(self.hass))
+        return self.async_create_entry(
+            title=board_name,
+            data={
+                CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
+                CONF_BOARD_NAME: board_name,
+                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
+            },
+            options={
+                CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
+                CONF_REALTIME_ENABLED: True,
+                CONF_SUBENTRY_ORDER: [],
+                CONF_SHOW_RUN_NUMBERS: DEFAULT_SHOW_RUN_NUMBERS,
+                CONF_SHOW_VEHICLE_TYPE: DEFAULT_SHOW_VEHICLE_TYPE,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -1478,12 +1518,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return self.async_show_form(
             step_id="vehicle_tracker",
             data_schema=vol.Schema({
-                vol.Required("parent_entry_id", default=existing_watches[0].entry_id): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=watch_options,
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
+                vol.Required("parent_entry_id", default=existing_watches[0].entry_id): _select_selector(watch_options),
             }),
             errors=errors,
         )
@@ -1611,12 +1646,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             vol.Optional("route_search", default=""): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
             ),
-            vol.Required("route_id_select", default=default): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=options,
-                    mode=selector.SelectSelectorMode.LIST,
-                )
-            ),
+            vol.Required("route_id_select", default=default): _select_selector(options),
         })
 
     async def async_step_route_tracker_filter(
@@ -1702,12 +1732,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             vol.Optional("ref_stop_search", default=""): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
             ),
-            vol.Required("ref_stop_id", default=default): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=options,
-                    mode=selector.SelectSelectorMode.LIST,
-                )
-            ),
+            vol.Required("ref_stop_id", default=default): _select_selector(options),
             vol.Optional("ref_stop_name", default=stops[0].stop_name if stops else ""): selector.TextSelector(),
         })
 
@@ -1847,9 +1872,43 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
         self._line_choices: list[LineCandidate] = []
         self._selected_route: RouteResult | None = None
         self._selected_line: LineCandidate | None = None
+        # Pin drafted by ``options``, committed by the "add another?" menu.
+        self._pending_pin: PinData | None = None
 
     def _db(self) -> Path:
         return _db_path(self.hass.config.config_dir)
+
+    def _reset_pin_add_state(self) -> None:
+        """Clear add-flow scratch state so the next pin starts fresh."""
+        self._stop_search_results = []
+        self._dest_search_results = []
+        self._all_destinations = True
+        self._destination_stop_id = None
+        self._destination_stop_name = None
+        self._boarding_stop_id = ""
+        self._boarding_stop_name = ""
+        self._route_choices = []
+        self._line_choices = []
+        self._selected_route = None
+        self._selected_line = None
+        self._pending_pin = None
+
+    def _commit_pending_pin(self) -> None:
+        """Add the pending pin directly to the board's subentries.
+
+        Used by the "Add another line" branch so the flow can continue for a
+        second pin without ending (``async_create_entry`` finalises the flow,
+        and a subentry flow creates exactly one subentry per run).
+        """
+        assert self._pending_pin is not None
+        pin = self._pending_pin
+        subentry = ConfigSubentry(
+            data=pin.to_dict(),
+            subentry_type=SUBENTRY_TYPE_PIN,
+            title=pin.title,
+            unique_id=pin.pin_key,
+        )
+        self.hass.config_entries.async_add_subentry(self._get_entry(), subentry)
 
     # -- add flow -------------------------------------------------------
 
@@ -1892,11 +1951,8 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
             ),
         }
         if self._stop_search_results:
-            schema_fields[vol.Optional(CONF_STOP_ID)] = selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=_stops_to_selector_options(self._stop_search_results),
-                    mode=selector.SelectSelectorMode.LIST,
-                )
+            schema_fields[vol.Optional(CONF_STOP_ID)] = _select_selector(
+                _stops_to_selector_options(self._stop_search_results)
             )
 
         return self.async_show_form(
@@ -1963,11 +2019,8 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
             if self._dest_search_results:
                 schema_fields[
                     vol.Optional(CONF_DESTINATION_STOP_ID)
-                ] = selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=_stops_to_selector_options(self._dest_search_results),
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
+                ] = _select_selector(
+                    _stops_to_selector_options(self._dest_search_results)
                 )
 
         return self.async_show_form(
@@ -2015,12 +2068,7 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
                 data_schema=vol.Schema({
                     vol.Required(
                         "route_id_select", default=self._route_choices[0].route_id
-                    ): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=options,
-                            mode=selector.SelectSelectorMode.LIST,
-                        )
-                    ),
+                    ): _select_selector(options),
                 }),
                 description_placeholders={"stop_name": self._boarding_stop_name},
             )
@@ -2058,12 +2106,7 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
             data_schema=vol.Schema({
                 vol.Required(
                     "line_select", default=line_value(self._line_choices[0])
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=options,
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
+                ): _select_selector(options),
             }),
             description_placeholders={
                 "stop_name": self._boarding_stop_name,
@@ -2110,11 +2153,8 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
                 colour_override=user_input.get(CONF_COLOUR_OVERRIDE) or None,
                 include=bool(user_input.get(CONF_INCLUDE, True)),
             )
-            return self.async_create_entry(
-                title=pin.title,
-                data=pin.to_dict(),
-                unique_id=pin.pin_key,
-            )
+            self._pending_pin = pin
+            return await self.async_step_add_another()
 
         return self.async_show_form(
             step_id="options",
@@ -2125,6 +2165,37 @@ class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
                 vol.Optional(CONF_PLATFORM_FILTER, default=""): selector.TextSelector(),
                 vol.Optional(CONF_COLOUR_OVERRIDE, default=""): selector.TextSelector(),
             }),
+        )
+
+    # -- "Add another line?" menu ---------------------------------------
+
+    async def async_step_add_another(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Offer to add another line or finish after drafting a pin."""
+        return self.async_show_menu(
+            step_id="add_another",
+            menu_options=["add_another_line", "finish"],
+        )
+
+    async def async_step_add_another_line(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Commit the pending pin and restart the add flow for the same board."""
+        self._commit_pending_pin()
+        self._reset_pin_add_state()
+        return await self.async_step_origin(None)
+
+    async def async_step_finish(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Create the pending pin and end the add flow."""
+        assert self._pending_pin is not None
+        pin = self._pending_pin
+        return self.async_create_entry(
+            title=pin.title,
+            data=pin.to_dict(),
+            unique_id=pin.pin_key,
         )
 
     # -- reconfigure (edit) flow ----------------------------------------
@@ -2202,14 +2273,33 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
     async def _step_board_menu(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Top-level menu for a board entry's options."""
-        return self.async_show_menu(
-            step_id="init",
-            menu_options={
-                "board_settings": "Board settings",
-                "board_reorder": "Reorder pins",
-                "board_remove": "Remove a pin",
-            },
+        """Single-screen board options: one dropdown routes to the sub-step.
+
+        Replaces the old two-hop menu (menu → substep) with a single selection
+        that routes directly to settings / reorder / remove.
+        """
+        if user_input is not None:
+            action = user_input.get("board_action", "settings")
+            if action == "reorder":
+                return await self.async_step_board_reorder()
+            if action == "remove":
+                return await self.async_step_board_remove()
+            return await self.async_step_board_settings()
+
+        return self.async_show_form(
+            step_id="board_menu",
+            data_schema=vol.Schema({
+                vol.Required("board_action", default="settings"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(value="settings", label="Board settings"),
+                            selector.SelectOptionDict(value="reorder", label="Reorder pins"),
+                            selector.SelectOptionDict(value="remove", label="Remove a pin"),
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }),
         )
 
     async def async_step_board_settings(
@@ -2265,22 +2355,35 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
     async def async_step_board_reorder(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Move a pin up/down one position."""
+        """Move a pin (up/down/first/last); re-renders for rapid adjustments.
+
+        Applying a move persists the new order immediately and re-renders this
+        step so the user can make repeated adjustments without re-navigating.
+        Choosing "Done" finalises the options flow.
+        """
         subentries = self._board_subentries()
         if not subentries:
             return self.async_abort(reason="no_pins")
 
         if user_input is not None:
             sid = user_input.get("pin_select")
-            action = user_input.get("reorder_action", "down")
+            action = user_input.get("reorder_action", "done")
+
+            if action == "done":
+                options = dict(self.config_entry.options)
+                return self.async_create_entry(data=options)
+
             order = normalize_order(
                 self.config_entry.options.get(CONF_SUBENTRY_ORDER, []),
                 list(self.config_entry.subentries.keys()),
             )
-            direction = -1 if action == "up" else 1
-            new_order = move_subentry(order, sid, direction)
+            new_order = _reorder_subentry(order, sid, action)
             options = {**self.config_entry.options, CONF_SUBENTRY_ORDER: new_order}
-            return self.async_create_entry(data=options)
+            # Persist immediately, then re-render for the next adjustment.
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, options=options
+            )
+            return await self.async_step_board_reorder(None)
 
         pin_options = [
             selector.SelectOptionDict(
@@ -2293,17 +2396,15 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
             data_schema=vol.Schema({
                 vol.Required(
                     "pin_select", default=subentries[0][0]
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=pin_options,
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
+                ): _select_selector(pin_options),
                 vol.Required("reorder_action", default="down"): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=[
                             selector.SelectOptionDict(value="up", label="Move up"),
                             selector.SelectOptionDict(value="down", label="Move down"),
+                            selector.SelectOptionDict(value="first", label="Move to first"),
+                            selector.SelectOptionDict(value="last", label="Move to last"),
+                            selector.SelectOptionDict(value="done", label="Done"),
                         ],
                         mode=selector.SelectSelectorMode.LIST,
                     )
@@ -2340,12 +2441,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
             data_schema=vol.Schema({
                 vol.Required(
                     "pin_select", default=subentries[0][0]
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=pin_options,
-                        mode=selector.SelectSelectorMode.LIST,
-                    )
-                ),
+                ): _select_selector(pin_options),
             }),
         )
 
