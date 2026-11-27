@@ -1,5 +1,7 @@
 """Constants for the Transport Victoria integration."""
 
+from datetime import timedelta
+
 DOMAIN = "transport_victoria"
 
 # -------------------------------------------------------------------
@@ -183,6 +185,54 @@ ALERTS_POLL_INTERVAL_SECONDS = 300  # 5 minutes
 
 # TTL for the module-level realtime feed cache
 REALTIME_CACHE_TTL_SECONDS = 30
+
+# -------------------------------------------------------------------
+# GTFS schedule refresh (self-healing lifecycle)
+#
+# The schedule is re-downloaded and re-imported *before* the local
+# calendar expires, so departure sensors never silently fall to unknown.
+# -------------------------------------------------------------------
+
+# Refresh when the service horizon is within this many days of today.
+# 7 days gives the weekly refresh a full cycle of slack to recover from
+# a failed download/import before the calendar actually expires.
+GTFS_REFRESH_MARGIN_DAYS = 7
+
+# Minimum cadence: force a refresh attempt (change-detection gated) if the
+# schedule on disk is older than this many days, even when the horizon is
+# still comfortably in the future.
+GTFS_REFRESH_MAX_AGE_DAYS = 7
+
+# Retry interval after a failed refresh (live DB is retained in the meantime).
+GTFS_REFRESH_RETRY_SECONDS = 3600  # 1 hour
+
+# How often to check whether the schedule needs refreshing.
+GTFS_REFRESH_CHECK_INTERVAL = timedelta(days=1)
+
+# PRAGMA user_version written into freshly imported databases. At open time a
+# live DB with a lower version is treated as stale and force-refreshed.
+# Forward-compat contract: a DB whose user_version is *higher* than this is
+# accepted as-is (we assume a newer schema is a superset; see
+# gtfs/horizon.refresh_due and gtfs/repository.schedule_state).
+GTFS_SCHEMA_VERSION = 1
+
+# Immutable generation store (see gtfs/store.py). Each successful import
+# writes a NEW generation file into a subdirectory and publishes an atomic
+# pointer naming the active generation, so the live DB is never overwritten
+# in place (which would let stale WAL sidecars corrupt it).
+GTFS_GENERATIONS_DIR_NAME = "generations"
+GTFS_POINTER_NAME = "current.json"
+
+# GC: keep the most recent N generations regardless of age; delete older ones
+# only after they exceed this age (approximates "no reader still has it open").
+GTFS_GENERATION_KEEP_COUNT = 2
+GTFS_GENERATION_RETENTION_SECONDS = 24 * 3600  # 24 hours
+
+# Build-artifact GC: an in-progress build (under generations/build/) is only
+# swept if it is BOTH not actively registered AND older than this age. Active
+# imports are minutes-scale, so 2h protects unregistered builds from non-guarded
+# callers while still reclaiming genuinely abandoned ones.
+GTFS_BUILD_RETENTION_SECONDS = 2 * 3600  # 2 hours
 
 # -------------------------------------------------------------------
 # Departure sensor slots

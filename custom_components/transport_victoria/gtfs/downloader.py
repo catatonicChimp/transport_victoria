@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from pathlib import Path
 
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -128,7 +129,9 @@ async def download_zip(
 
     _LOGGER.info("Downloading GTFS schedule from %s", url)
 
-    tmp_path = dest_path.parent / (dest_path.name + ".tmp")
+    # Unique tmp path per attempt so concurrent callers can never collide on a
+    # shared scratch file (the final rename to dest_path is atomic).
+    tmp_path = dest_path.parent / (dest_path.name + f".{uuid.uuid4().hex}.tmp")
 
     try:
         # Stream HTTP response into memory, computing SHA-256 as we go

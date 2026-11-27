@@ -65,6 +65,7 @@ from .gtfs.repository import (
     next_departures,
     is_mode_ready,
     get_arrival_at_stop,
+    schedule_state,
 )
 from .gtfs.time_utils import service_day_for_time
 from .models import Alert, CoordinatorData, Departure, WatchConfig
@@ -100,6 +101,9 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
         self.last_trip_fetch_at: datetime | None = None
         self.last_alerts_fetch_at: datetime | None = None
         self.last_http_error: int | None = None
+        # Stale-schedule signal: logged once when the GTFS calendar has expired
+        # so we don't spam the log on every poll while unavailable.
+        self._expired_logged = False
 
         poll_interval = self._resolve_poll_interval(entry, entry_index)
 
@@ -168,6 +172,14 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
             ConfigEntryAuthFailed: On HTTP 401 (invalid/expired API key).
             UpdateFailed: On any other network or parse error.
         """
+        # --- Stale-schedule guard (evaluated BEFORE any rate-limit early return,
+        # so staleness is detected on every poll even during backoff) ---
+        # If the local calendar has expired (and the refresh manager hasn't yet
+        # published a fresh generation), report unavailable rather than confident
+        # empty departures. Logged once; raises UpdateFailed on every poll so HA
+        # marks the entities unavailable until a refresh succeeds.
+        self._apply_schedule_state(await self._fetch_schedule_state())
+
         # Respect active backoff period (from a previous 429)
         if self._backoff_until is not None and datetime.now() < self._backoff_until:
             remaining = (self._backoff_until - datetime.now()).seconds
@@ -450,6 +462,42 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
         else:
             self._backoff_seconds = min(self._backoff_seconds * 2, _BACKOFF_MAX_SECONDS)
         self._backoff_until = datetime.now() + timedelta(seconds=self._backoff_seconds)
+
+    # ------------------------------------------------------------------
+    # Schedule-health helpers
+    # ------------------------------------------------------------------
+
+    async def _fetch_schedule_state(self) -> str:
+        """Return the schedule-health state for this watch (in the executor).
+
+        Uses the GTFS *service day* (which rolls back to "yesterday" between
+        00:00 and 03:00), so an expired calendar does not suppress still-valid
+        previous-service-day post-midnight departures.
+        """
+        service_date, _now_seconds = service_day_for_time(dt_util.now())
+        bundles = MODE_BUNDLE_MAP.get(self._watch_config.mode, [])
+        return await self.hass.async_add_executor_job(
+            schedule_state, self._db_path, bundles, service_date
+        )
+
+    def _apply_schedule_state(self, state: str) -> None:
+        """Update the once-only stale log flag; raise UpdateFailed if not ready.
+
+        Logs once when the schedule first becomes unhealthy, and resets the
+        flag only on recovery so a future expiry is logged again.
+        """
+        if state == "ready":
+            self._expired_logged = False
+            return
+        if not self._expired_logged:
+            _LOGGER.warning(
+                "GTFS schedule for watch '%s' is %s — departure data is "
+                "unavailable until the schedule is refreshed",
+                self._watch_config.watch_name,
+                state,
+            )
+            self._expired_logged = True
+        raise UpdateFailed(f"GTFS schedule {state} — refresh pending")
 
     # ------------------------------------------------------------------
     # Helpers
