@@ -1007,6 +1007,35 @@ def route_ids_for_trips(db_path: Path, trip_ids: list[str]) -> dict[str, str]:
     return result
 
 
+def routes_for_stop(db_path: Path, stop_id: str) -> set[str]:
+    """Return the distinct ``route_id`` values serving ``stop_id`` (T17 fleet scope).
+
+    Used by the vehicle-fleet tracker to derive a watched route scope from a
+    watch's stop when the entry carries no explicit ``route_id_filter``.  Runs
+    against the current generation (like every other query here); an unknown or
+    route-less stop simply yields an empty set.  Callers wrap this in an
+    executor.
+    """
+    if not stop_id:
+        return set()
+    sql = """
+        SELECT DISTINCT t.route_id
+        FROM stop_times st
+        JOIN trips t ON t.trip_id = st.trip_id
+        WHERE st.stop_id = ?
+    """
+    result: set[str] = set()
+    conn = sqlite3.connect(str(_resolve(db_path)))
+    try:
+        for (route_id,) in conn.execute(sql, (stop_id,)):
+            result.add(route_id)
+    except sqlite3.Error as exc:
+        _LOGGER.error("routes_for_stop failed: %s", exc)
+    finally:
+        conn.close()
+    return result
+
+
 def load_trip_shapes(
     db_path: Path,
     *,

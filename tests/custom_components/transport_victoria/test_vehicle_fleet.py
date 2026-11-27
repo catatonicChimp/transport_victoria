@@ -24,6 +24,7 @@ from custom_components.transport_victoria.const import (
     CONF_ENTRY_TYPE,
     CONF_MODE,
     CONF_ROUTE_ID_FILTER,
+    CONF_STOP_ID,
     CONF_TRACK_VEHICLES,
     DOMAIN,
     ENTRY_TYPE_BOARD,
@@ -31,7 +32,10 @@ from custom_components.transport_victoria.const import (
     MODE_METRO,
     MODE_TRAM,
 )
-from custom_components.transport_victoria.gtfs.repository import route_ids_for_trips
+from custom_components.transport_victoria.gtfs.repository import (
+    route_ids_for_trips,
+    routes_for_stop,
+)
 from custom_components.transport_victoria.realtime.client import FeedMeta
 from custom_components.transport_victoria.realtime.vehicle_positions import (
     VehiclePosition,
@@ -122,6 +126,7 @@ def _watch_entry(**kwargs) -> SimpleNamespace:
         CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
         CONF_MODE: MODE_METRO,
         CONF_ROUTE_ID_FILTER: ROUTE_FRANKSTON,
+        CONF_STOP_ID: "RICHMOND",
     }
     options = {CONF_TRACK_VEHICLES: True}
     data.update(kwargs.pop("data", {}))
@@ -291,19 +296,25 @@ class TestStaleness:
 class TestFleetScope:
     def test_watch_with_route_filter(self):
         entry = _watch_entry()
-        assert _fleet_scope(entry) == (frozenset({ROUTE_FRANKSTON}), frozenset({MODE_METRO}))
+        assert _fleet_scope(entry) == (
+            frozenset({ROUTE_FRANKSTON}), frozenset({MODE_METRO}), frozenset(),
+        )
 
-    def test_watch_without_route_filter_has_no_scope(self):
+    def test_watch_without_route_filter_derives_from_stop(self):
         entry = _watch_entry(data={CONF_ROUTE_ID_FILTER: None})
-        assert _fleet_scope(entry) == (frozenset(), frozenset())
+        routes, modes, stops = _fleet_scope(entry)
+        assert routes == frozenset()  # no explicit route: resolved at reconcile
+        assert modes == frozenset({MODE_METRO})
+        assert stops == frozenset({"RICHMOND"})
 
     def test_tram_watch_has_no_modes(self):
         entry = _watch_entry(
             data={CONF_MODE: MODE_TRAM, CONF_ROUTE_ID_FILTER: "R_TRAM_96"}
         )
-        routes, modes = _fleet_scope(entry)
+        routes, modes, stops = _fleet_scope(entry)
         assert routes == frozenset({"R_TRAM_96"})
         assert modes == frozenset()  # tram has no vehicle-positions feed
+        assert stops == frozenset()
 
     def test_board_union_skips_tram(self):
         from custom_components.transport_victoria.board import PinData
@@ -323,9 +334,58 @@ class TestFleetScope:
             data={CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD},
             options={}, subentries=subentries,
         )
-        routes, modes = _fleet_scope(entry)
+        routes, modes, stops = _fleet_scope(entry)
         assert routes == frozenset({"R_METRO_FRANKSTON", "R_TRAM_96"})
         assert modes == frozenset({MODE_METRO})  # tram mode skipped
+        assert stops == frozenset({"S"})
+
+
+# ---------------------------------------------------------------------------
+# Stop-derived fleet scope (unfiltered watch)
+# ---------------------------------------------------------------------------
+
+
+class TestFleetStopFallback:
+    def test_routes_for_stop_returns_serving_routes(self, metro_db: Path):
+        assert routes_for_stop(metro_db, "RICHMOND") == {
+            "R_METRO_FRANKSTON", "R_METRO_WERRIBEE",
+        }
+        assert routes_for_stop(metro_db, "CAULFIELD") == {"R_METRO_FRANKSTON"}
+        assert routes_for_stop(metro_db, "NOPE") == set()
+
+    async def test_unfiltered_watch_resolves_routes_from_stop(
+        self, metro_db: Path, monkeypatch
+    ):
+        monkeypatch.setattr(dt_module.dt_util, "utcnow", lambda: NOW)
+
+        entry = _watch_entry(
+            data={CONF_ROUTE_ID_FILTER: None, CONF_STOP_ID: "RICHMOND"}
+        )
+        coordinator = FleetTrackerCoordinator(FakeHass(metro_db), entry, metro_db)
+        coordinator._client = FakeClient(
+            vehicle_positions_fleet(), FeedMeta(header_timestamp=NOW, fetched_at=NOW)
+        )
+        await coordinator._async_update_data()
+        # RICHMOND serves both Frankston and Werribee, so every fixture vehicle
+        # (V_C on Werribee included) now matches the stop-derived scope.
+        assert set(coordinator._tracked) == {"V_A", "V_B", "V_C", "V_D"}
+
+    async def test_unfiltered_watch_stop_without_routes_has_no_fleet(
+        self, metro_db: Path, monkeypatch
+    ):
+        monkeypatch.setattr(dt_module.dt_util, "utcnow", lambda: NOW)
+
+        entry = _watch_entry(
+            data={CONF_ROUTE_ID_FILTER: None, CONF_STOP_ID: "NOPE"}
+        )
+        coordinator = FleetTrackerCoordinator(FakeHass(metro_db), entry, metro_db)
+        coordinator._client = FakeClient(
+            vehicle_positions_fleet(), FeedMeta(header_timestamp=NOW, fetched_at=NOW)
+        )
+        await coordinator._async_update_data()
+        assert coordinator._tracked == {}
+        # No reconcile happened, so no fleet update (and thus no entities).
+        assert coordinator.last_fleet_update is None
 
 
 # ---------------------------------------------------------------------------

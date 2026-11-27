@@ -62,6 +62,7 @@ from .const import (
     CONF_ROUTE_ID_FILTER,
     CONF_ROUTE_LONG_NAME,
     CONF_ROUTE_SHORT_NAME,
+    CONF_STOP_ID,
     CONF_TRACK_VEHICLES,
     COORDINATOR_STAGGER_SECONDS,
     DEFAULT_MAX_VEHICLES,
@@ -77,7 +78,7 @@ from .const import (
     MODE_TRAM,
     PICTOGRAM_URL_BASE,
 )
-from .gtfs.repository import route_ids_for_trips
+from .gtfs.repository import route_ids_for_trips, routes_for_stop
 from .realtime.client import PTVRealtimeClient
 from .realtime.vehicle_positions import (
     VehiclePosition,
@@ -203,8 +204,10 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
         self._tracked: dict[str, FleetVehicle] = {}
         self._last_update: FleetUpdate | None = None
         self._stale_logged: set[str] = set()
-        # Watched scope, derived once from the entry (see _fleet_scope).
-        self._watched_routes, self._modes = _fleet_scope(entry)
+        # Watched scope: explicit routes + modes are derived from the entry; the
+        # fallback stop ids are used to resolve routes from the stop when the
+        # entry has no explicit route filter (see _resolve_scope).
+        self._watched_routes, self._modes, self._stop_ids = _fleet_scope(entry)
         # Executor offload (injectable for tests).
         self._run_sync = hass.async_add_executor_job
 
@@ -229,6 +232,21 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
     def modes(self) -> frozenset[str]:
         return self._modes
 
+    async def _resolve_scope(self) -> frozenset[str]:
+        """Return the watched route set, deriving from stops when no filter.
+
+        An entry with an explicit route filter (or route-scoped pins) uses that
+        set directly.  An unfiltered watch derives its routes from its stop via
+        :func:`~.gtfs.repository.routes_for_stop`, recomputed each reconcile (the
+        query is small and stays current with the live schedule).
+        """
+        if self._watched_routes:
+            return self._watched_routes
+        routes: set[str] = set()
+        for stop_id in self._stop_ids:
+            routes |= await self._run_sync(routes_for_stop, self._db_path, stop_id)
+        return frozenset(routes)
+
     async def _async_setup(self) -> None:
         """Initialise the realtime client (once HA's session is available)."""
         api_key = self._entry.data.get(CONF_API_KEY, "")
@@ -237,8 +255,13 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
 
     async def _async_update_data(self) -> dict[str, FleetVehicle]:
         """Fetch vehicle positions and reconcile the fleet (executor-offloaded)."""
-        if not self._watched_routes or not self._modes:
-            # No route scope (e.g. an unfiltered watch) or tram-only → no fleet.
+        if not self._modes:
+            # Tram-only (no vehicle-positions feed) → no fleet.
+            return dict(self._tracked)
+
+        watched_routes = await self._resolve_scope()
+        if not watched_routes:
+            # The watched stop serves no (resolvable) routes → no fleet.
             return dict(self._tracked)
 
         client = self._client
@@ -292,7 +315,7 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
         update = update_fleet(
             self._tracked,
             positions,
-            self._watched_routes,
+            watched_routes,
             route_by_trip_id,
             {},  # trip-updates route fallback not fetched here (see docstring)
             now,
@@ -405,20 +428,29 @@ class PTVFleetVehicleTracker(
         }
 
 
-def _fleet_scope(entry: ConfigEntry) -> tuple[frozenset[str], frozenset[str]]:
-    """Derive ``(watched_routes, modes)`` for fleet tracking from the entry.
+def _fleet_scope(
+    entry: ConfigEntry,
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """Derive ``(explicit_routes, modes, stop_ids)`` for fleet tracking.
 
     * A board watches the union of its enabled pins' ``route_id`` and fetches the
       union of their realtime modes (tram, which has no vehicle-positions feed,
-      is skipped silently).
-    * A watch watches its ``route_id_filter`` (a watch without a route filter has
-      no single route scope → no fleet) and fetches its one mode.
+      is skipped silently).  ``stop_ids`` is the union of the pins' boarding
+      stops, used only as a fallback when no pin carries a ``route_id``.
+    * A watch watches its ``route_id_filter``; without one, it derives routes
+      from its stop (``stop_ids``), resolved by ``routes_for_stop`` at reconcile
+      time.  ``modes`` is the watch's single mode (empty for tram).
     """
     entry_type = entry.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH)
 
     if entry_type == ENTRY_TYPE_BOARD:
         pins = [PinData.from_dict(sub.data) for sub in entry.subentries.values()]
         routes = {pin.route_id for pin in pins if pin.include and pin.route_id}
+        stops = {
+            pin.boarding_stop_id
+            for pin in pins
+            if pin.include and pin.boarding_stop_id
+        }
         modes: set[str] = set()
         for pin in pins:
             if not pin.include:
@@ -426,14 +458,17 @@ def _fleet_scope(entry: ConfigEntry) -> tuple[frozenset[str], frozenset[str]]:
             mode = route_type_to_mode(pin.route_type)
             if mode and mode != MODE_TRAM:
                 modes.add(mode)
-        return frozenset(routes), frozenset(modes)
+        return frozenset(routes), frozenset(modes), frozenset(stops)
 
     mode = entry.data.get(CONF_MODE, "")
-    route_filter = entry.data.get(CONF_ROUTE_ID_FILTER)
-    if not route_filter:
-        return frozenset(), frozenset()
     modes = frozenset() if mode == MODE_TRAM else frozenset({mode})
-    return frozenset({route_filter}), modes
+    route_filter = entry.data.get(CONF_ROUTE_ID_FILTER)
+    if route_filter:
+        return frozenset({route_filter}), modes, frozenset()
+
+    stop_id = entry.data.get(CONF_STOP_ID, "")
+    stop_ids = frozenset({stop_id}) if stop_id else frozenset()
+    return frozenset(), modes, stop_ids
 
 
 def _fleet_icon(entry: ConfigEntry) -> str:
