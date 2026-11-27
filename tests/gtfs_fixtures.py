@@ -15,6 +15,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
+from custom_components.transport_victoria.const import ROUTE_TYPE_METRO_TRAIN
+
 from .gtfs_builder import (
     REFERENCE_DATE as REF,
     ROUTE_TYPE_BUS,
@@ -434,6 +436,115 @@ def vline_spec() -> dict[str, Any]:
         "stop_times": stop_times,
         "calendar": [_calendar("SVC_VLINE_DAILY", REF - timedelta(days=30),
                                REF + timedelta(days=60))],
+    }
+
+
+# --- 2d-ii. duplicate destination labels (T7 hotfix) -----------------------
+
+def duplicate_labels_spec() -> dict[str, Any]:
+    """Route whose trip patterns collide on the same final destination label.
+
+    Three distinct intermediate stop signatures all reach ``Upfield Station``
+    with ``Gowrie Station`` as the penultimate stop, so the derived candidates
+    share one ``(direction, terminal, via)`` tuple and hence one label
+    ("Upfield Station via Gowrie Station") — the live-data duplicate that the
+    resolver hotfix must collapse.  The inbound direction keeps two genuinely
+    different labels ("Flinders Street via Southern Cross" vs "... via North
+    Melbourne") to prove distinct labels are NOT collapsed.
+    """
+    stops = [
+        _stop("U_FLINDERS", "Flinders Street", -37.8183, 144.9671),
+        _stop("U_SC", "Southern Cross", -37.8183, 144.9520),
+        _stop("U_NM", "North Melbourne", -37.8060, 144.9430),
+        _stop("U_BRUNSWICK", "Brunswick", -37.7670, 144.9600),
+        _stop("U_COBURG", "Coburg Station", -37.7420, 144.9640),
+        _stop("U_GOWRIE", "Gowrie Station", -37.6990, 144.9650),
+        _stop("U_UPFIELD", "Upfield Station", -37.6910, 144.9620),
+    ]
+    routes = [{
+        "route_id": "R_METRO_UPFIELD", "route_short_name": "Upfield",
+        "route_long_name": "Upfield Line", "route_type": ROUTE_TYPE_METRO_TRAIN,
+        "route_color": "0099CC",
+    }]
+    trips = [
+        # Three City Loop (via Southern Cross) services: the dominant pattern.
+        _trip("T_UPF_LOOP_1", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Upfield Station", 0),
+        _trip("T_UPF_LOOP_2", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Upfield Station", 0),
+        _trip("T_UPF_LOOP_3", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Upfield Station", 0),
+        # Direct from Flinders Street (no City Loop) ...
+        _trip("T_UPF_DIRECT", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Upfield Station", 0),
+        # ... and a loop service running express past Brunswick.
+        _trip("T_UPF_EXPRESS", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Upfield Station", 0),
+        # Inbound: two distinct penultimate stops → two distinct labels.
+        _trip("T_UPF_IN_LOOP", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Flinders Street", 1),
+        _trip("T_UPF_IN_DIRECT", "R_METRO_UPFIELD", "SVC_UPF_WEEKDAY",
+              "Flinders Street", 1),
+    ]
+    stop_times = [
+        _st("T_UPF_LOOP_1", "U_FLINDERS", 1, "07:00:00"),
+        _st("T_UPF_LOOP_1", "U_SC", 2, "07:05:00"),
+        _st("T_UPF_LOOP_1", "U_NM", 3, "07:10:00"),
+        _st("T_UPF_LOOP_1", "U_BRUNSWICK", 4, "07:18:00"),
+        _st("T_UPF_LOOP_1", "U_COBURG", 5, "07:24:00"),
+        _st("T_UPF_LOOP_1", "U_GOWRIE", 6, "07:31:00"),
+        _st("T_UPF_LOOP_1", "U_UPFIELD", 7, "07:35:00"),
+        _st("T_UPF_LOOP_2", "U_FLINDERS", 1, "07:30:00"),
+        _st("T_UPF_LOOP_2", "U_SC", 2, "07:35:00"),
+        _st("T_UPF_LOOP_2", "U_NM", 3, "07:40:00"),
+        _st("T_UPF_LOOP_2", "U_BRUNSWICK", 4, "07:48:00"),
+        _st("T_UPF_LOOP_2", "U_COBURG", 5, "07:54:00"),
+        _st("T_UPF_LOOP_2", "U_GOWRIE", 6, "08:01:00"),
+        _st("T_UPF_LOOP_2", "U_UPFIELD", 7, "08:05:00"),
+        _st("T_UPF_LOOP_3", "U_FLINDERS", 1, "08:00:00"),
+        _st("T_UPF_LOOP_3", "U_SC", 2, "08:05:00"),
+        _st("T_UPF_LOOP_3", "U_NM", 3, "08:10:00"),
+        _st("T_UPF_LOOP_3", "U_BRUNSWICK", 4, "08:18:00"),
+        _st("T_UPF_LOOP_3", "U_COBURG", 5, "08:24:00"),
+        _st("T_UPF_LOOP_3", "U_GOWRIE", 6, "08:31:00"),
+        _st("T_UPF_LOOP_3", "U_UPFIELD", 7, "08:35:00"),
+        # Direct pattern: identical label, different intermediate signature.
+        _st("T_UPF_DIRECT", "U_FLINDERS", 1, "07:15:00"),
+        _st("T_UPF_DIRECT", "U_NM", 2, "07:22:00"),
+        _st("T_UPF_DIRECT", "U_BRUNSWICK", 3, "07:31:00"),
+        _st("T_UPF_DIRECT", "U_COBURG", 4, "07:38:00"),
+        _st("T_UPF_DIRECT", "U_GOWRIE", 5, "07:45:00"),
+        _st("T_UPF_DIRECT", "U_UPFIELD", 6, "07:49:00"),
+        # Express pattern: identical label, different intermediate signature.
+        _st("T_UPF_EXPRESS", "U_FLINDERS", 1, "07:45:00"),
+        _st("T_UPF_EXPRESS", "U_SC", 2, "07:50:00"),
+        _st("T_UPF_EXPRESS", "U_NM", 3, "07:55:00"),
+        _st("T_UPF_EXPRESS", "U_COBURG", 4, "08:08:00"),
+        _st("T_UPF_EXPRESS", "U_GOWRIE", 5, "08:15:00"),
+        _st("T_UPF_EXPRESS", "U_UPFIELD", 6, "08:19:00"),
+        # Inbound via the City Loop (penultimate = Southern Cross).
+        _st("T_UPF_IN_LOOP", "U_UPFIELD", 1, "06:40:00"),
+        _st("T_UPF_IN_LOOP", "U_GOWRIE", 2, "06:44:00"),
+        _st("T_UPF_IN_LOOP", "U_COBURG", 3, "06:51:00"),
+        _st("T_UPF_IN_LOOP", "U_BRUNSWICK", 4, "06:58:00"),
+        _st("T_UPF_IN_LOOP", "U_NM", 5, "07:06:00"),
+        _st("T_UPF_IN_LOOP", "U_SC", 6, "07:11:00"),
+        _st("T_UPF_IN_LOOP", "U_FLINDERS", 7, "07:15:00"),
+        # Inbound direct (penultimate = North Melbourne).
+        _st("T_UPF_IN_DIRECT", "U_UPFIELD", 1, "07:10:00"),
+        _st("T_UPF_IN_DIRECT", "U_GOWRIE", 2, "07:14:00"),
+        _st("T_UPF_IN_DIRECT", "U_COBURG", 3, "07:21:00"),
+        _st("T_UPF_IN_DIRECT", "U_BRUNSWICK", 4, "07:28:00"),
+        _st("T_UPF_IN_DIRECT", "U_NM", 5, "07:36:00"),
+        _st("T_UPF_IN_DIRECT", "U_FLINDERS", 6, "07:45:00"),
+    ]
+    return {
+        "routes": routes,
+        "trips": trips,
+        "stops": stops,
+        "stop_times": stop_times,
+        "calendar": [_calendar("SVC_UPF_WEEKDAY", REF - timedelta(days=30),
+                               REF + timedelta(days=60), saturday=0, sunday=0)],
     }
 
 
