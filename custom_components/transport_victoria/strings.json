@@ -137,53 +137,6 @@
         "data": {
           "confirm": "Create the board"
         }
-      },
-      "origin": {
-        "title": "Boarding Stop",
-        "description": "Find the stop this pin departs from.",
-        "data": {
-          "query": "Search stops",
-          "stop_id": "Select stop"
-        }
-      },
-      "to": {
-        "title": "Destination",
-        "description": "Where do you want to go from **{stop_name}**?",
-        "data": {
-          "destination_choice": "Destination",
-          "dest_query": "Search destination stops",
-          "destination_stop_id": "Select destination"
-        }
-      },
-      "select_lines": {
-        "title": "Select Line",
-        "description": "Which line/direction serves **{stop_name}** to **{destination}**?",
-        "data": {
-          "route_id_select": "Select line",
-          "line_select": "Select line"
-        }
-      },
-      "options": {
-        "title": "Pin Options",
-        "description": "Adjust the labels and options for this pin.",
-        "data": {
-          "label_from": "Origin label",
-          "label_to": "Destination label",
-          "include": "Include this pin",
-          "platform_filter": "Platform filter (optional)",
-          "colour_override": "Colour override (optional)"
-        }
-      },
-      "reconfigure": {
-        "title": "Edit Pin",
-        "description": "Edit this pin's labels and options.",
-        "data": {
-          "label_from": "Origin label",
-          "label_to": "Destination label",
-          "include": "Include this pin",
-          "platform_filter": "Platform filter (optional)",
-          "colour_override": "Colour override (optional)"
-        }
       }
     },
     "error": {
@@ -209,6 +162,64 @@
       "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker.",
       "no_pins": "This board has no pins yet.",
       "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported — they stay as-is."
+    }
+  },
+  "config_subentries": {
+    "pin": {
+      "entry_type": "Board line",
+      "initiate_flow": {
+        "user": "Add a line to the board",
+        "reconfigure": "Edit line"
+      },
+      "step": {
+        "origin": {
+          "title": "Boarding Stop",
+          "description": "Find the stop this pin departs from.",
+          "data": {
+            "query": "Search stops",
+            "stop_id": "Select stop"
+          }
+        },
+        "to": {
+          "title": "Destination",
+          "description": "Where do you want to go from **{stop_name}**?",
+          "data": {
+            "destination_choice": "Destination",
+            "dest_query": "Search destination stops",
+            "destination_stop_id": "Select destination"
+          }
+        },
+        "select_lines": {
+          "title": "Select Line",
+          "description": "Which line/direction serves **{stop_name}** to **{destination}**?",
+          "data": {
+            "route_id_select": "Select line",
+            "line_select": "Select line"
+          }
+        },
+        "options": {
+          "title": "Pin Options",
+          "description": "Adjust the labels and options for this pin.",
+          "data": {
+            "label_from": "Origin label",
+            "label_to": "Destination label",
+            "include": "Include this pin",
+            "platform_filter": "Platform filter (optional)",
+            "colour_override": "Colour override (optional)"
+          }
+        },
+        "reconfigure": {
+          "title": "Edit Pin",
+          "description": "Edit this pin's labels and options.",
+          "data": {
+            "label_from": "Origin label",
+            "label_to": "Destination label",
+            "include": "Include this pin",
+            "platform_filter": "Platform filter (optional)",
+            "colour_override": "Colour override (optional)"
+          }
+        }
+      }
     }
   },
   "options": {
@@ -249,6 +260,14 @@
         "data": {
           "pin_select": "Pin"
         }
+      }
+    }
+  },
+  "entity": {
+    "board_direction": {
+      "state": {
+        "configured": "Configured directions",
+        "opposite": "Opposite directions"
       }
     }
   }
