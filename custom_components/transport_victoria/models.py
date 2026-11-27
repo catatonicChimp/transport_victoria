@@ -127,3 +127,21 @@ class CoordinatorData:
 
     departures: list[Departure]          # Sorted by actual_departure
     alerts: list[Alert]                  # Active alerts for this watch
+
+
+@dataclass(slots=True)
+class BoardConfig:
+    """Configuration for a trip-group board (parent entry).
+
+    The board groups several pins (one HA subentry per line combination) into a
+    single departure board.  Pin data lives in the subentries (see
+    :class:`board.PinData`); this dataclass holds the board-level data + options.
+    """
+
+    board_name: str
+    departure_count: int = 5
+    show_run_numbers: bool = False
+    show_vehicle_type: bool = False
+    # Ordered list of subentry ids (canonical display order; never trust the
+    # frontend's subentry ordering).
+    subentry_order: list[str] = field(default_factory=list)

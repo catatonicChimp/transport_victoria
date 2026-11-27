@@ -155,6 +155,7 @@ CONF_ENTRY_TYPE = "entry_type"
 ENTRY_TYPE_WATCH = "watch"
 ENTRY_TYPE_VEHICLE_TRACKER = "vehicle_tracker"
 ENTRY_TYPE_ROUTE_TRACKER = "route_tracker"
+ENTRY_TYPE_BOARD = "board"
 CONF_PARENT_ENTRY_ID = "parent_entry_id"  # for vehicle tracker entries
 
 # Route tracker config keys
@@ -170,6 +171,83 @@ CONF_REFERENCE_STOP_LON = "reference_stop_lon"
 CONF_PROXIMITY_RADIUS_M = "proximity_radius_m"
 
 DEFAULT_MAX_VEHICLES = 5
+
+# -------------------------------------------------------------------
+# Trip-group board (T8)
+#
+# A "board" config entry groups several departure "pins" (one per line
+# combination) into a single TripView-style departure board.  The parent entry
+# is the board; each pin is a HA *subentry* (see config_flow.PTVBoardSubentryFlow).
+# -------------------------------------------------------------------
+
+# Subentry type registered via ConfigFlow.async_get_supported_subentry_types.
+SUBENTRY_TYPE_PIN = "pin"
+
+# Board (parent entry) data keys.
+CONF_BOARD_NAME = "board_name"
+
+# Board options keys (order lives here — never trust frontend subentry order).
+CONF_SUBENTRY_ORDER = "subentry_order"      # ordered list of subentry_ids
+CONF_SHOW_RUN_NUMBERS = "show_run_numbers"  # display pref; inert until T10
+CONF_SHOW_VEHICLE_TYPE = "show_vehicle_type"  # display pref; inert until T10
+BOARD_DEFAULT_DEPARTURE_COUNT = 5             # board default (bound 10, const)
+BOARD_MAX_DEPARTURE_COUNT = 10
+
+# Pin (subentry) data keys.
+CONF_PIN_KEY = "pin_key"                     # stable per-pin identity (== unique_id)
+CONF_LABEL_FROM = "label_from"               # display label for the origin
+CONF_LABEL_TO = "label_to"                   # display label for the destination
+CONF_ROUTE_TYPE = "route_type"               # GTFS route_type int (bundle mapping)
+CONF_BOARDING_STOP_ID = "boarding_stop_id"   # pin origin stop
+CONF_BOARDING_STOP_NAME = "boarding_stop_name"
+CONF_VIA_HINT = "via_hint"                   # disambiguating via stop (label+identity)
+CONF_COLOUR_OVERRIDE = "colour_override"     # optional per-pin colour override
+CONF_INCLUDE = "include"                     # pin enabled/disabled
+
+# Defaults for board display prefs (stored, but inert until T10 renders them).
+DEFAULT_SHOW_RUN_NUMBERS = False
+DEFAULT_SHOW_VEHICLE_TYPE = False
+
+# Every route type across all modes — used by the cross-mode board flow (origin
+# stop search and "all destinations" line listing span modes).
+ALL_ROUTE_TYPES: list[int] = sorted(
+    {rt for types in ROUTE_TYPE_MAP.values() for rt in types}
+)
+
+# Route type → bundle folders.  A pin carries a GTFS route_type; this maps it to
+# the bundle folder(s) whose schedule must be imported for that pin to resolve.
+# Route types are not unique to a mode (e.g. 701 spans bus + regional bus), so a
+# route_type can map to several folders — the board consumes the UNION.
+ROUTE_TYPE_BUNDLE_MAP: dict[int, frozenset[str]] = {
+    rt: frozenset(
+        folder
+        for mode, folders in MODE_BUNDLE_MAP.items()
+        if rt in ROUTE_TYPE_MAP.get(mode, [])
+        for folder in folders
+    )
+    for rt in {rt for types in ROUTE_TYPE_MAP.values() for rt in types}
+}
+
+# -------------------------------------------------------------------
+# Board entity unique-id contract (T10 consumes this)
+#
+# Entity unique ids for board entities are built as:
+#
+#     f"{parent_entry_id}:{role}:{rank}"
+#
+# where ``role`` names the entity slot (e.g. "departure", "realtime_status")
+# and ``rank`` is the pin's 1-based position in the board's ordered subentry
+# list (see CONF_SUBENTRY_ORDER).  The subentry_id is deliberately NOT part of
+# the entity unique id — it is an implementation detail that can change across
+# re-imports — so entities key off the stable rank instead.
+# -------------------------------------------------------------------
+
+BOARD_ENTITY_SEPARATOR = ":"
+
+
+def board_entity_unique_id(parent_entry_id: str, role: str, rank: int) -> str:
+    """Build the stable unique id for a board entity (see T10 contract)."""
+    return BOARD_ENTITY_SEPARATOR.join((parent_entry_id, role, str(rank)))
 
 # -------------------------------------------------------------------
 # Coordinator / polling

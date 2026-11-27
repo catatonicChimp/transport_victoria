@@ -484,6 +484,7 @@ class RouteResult:
     route_short_name: str
     route_long_name: str
     route_color: str | None = None  # hex colour string from routes table (no '#')
+    route_type: int | None = None   # GTFS route_type (for bundle mapping, T8)
 
 
 def get_routes_for_stop(
@@ -500,7 +501,8 @@ def get_routes_for_stop(
 
     rt_placeholders = ", ".join("?" * len(route_types))
     sql = f"""
-        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_color
+        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_color,
+               r.route_type
         FROM stop_times st
         JOIN trips t ON t.trip_id = st.trip_id
         JOIN routes r ON r.route_id = t.route_id
@@ -529,6 +531,7 @@ def get_routes_for_stop(
                     route_short_name=row["route_short_name"] or "",
                     route_long_name=row["route_long_name"] or "",
                     route_color=row["route_color"] or None,
+                    route_type=row["route_type"],
                 )
             )
         return results
@@ -780,7 +783,8 @@ def get_all_routes(
 
     rt_placeholders = ", ".join("?" * len(route_types))
     sql = f"""
-        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_color
+        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_color,
+               r.route_type
         FROM routes r
         WHERE r.route_type IN ({rt_placeholders})
           AND (r.route_long_name NOT LIKE 'Replacement%' OR r.route_long_name IS NULL)
@@ -805,6 +809,7 @@ def get_all_routes(
                     route_short_name=row["route_short_name"] or "",
                     route_long_name=row["route_long_name"] or "",
                     route_color=row["route_color"] or None,
+                    route_type=row["route_type"],
                 )
             )
         return results
@@ -831,7 +836,8 @@ def search_routes_by_name(
     rt_placeholders = ", ".join("?" * len(route_types))
     like_query = _escape_like(query) + "%"
     sql = f"""
-        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_color
+        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_color,
+               r.route_type
         FROM routes r
         WHERE (r.route_short_name LIKE ? ESCAPE '\\'
             OR r.route_long_name LIKE ? ESCAPE '\\')
@@ -858,6 +864,7 @@ def search_routes_by_name(
                     route_short_name=row["route_short_name"] or "",
                     route_long_name=row["route_long_name"] or "",
                     route_color=row["route_color"] or None,
+                    route_type=row["route_type"],
                 )
             )
         return results
@@ -928,6 +935,7 @@ class LineCandidate:
     terminal_stop_name: str
     via_hint: str | None = None
     route_color: str | None = None
+    route_type: int | None = None   # GTFS route_type (for bundle mapping, T8)
 
 
 def _destination_sort_key(d: Destination) -> tuple:
@@ -977,7 +985,7 @@ def load_trip_shapes(
 
     sql = f"""
         SELECT t.trip_id, t.route_id, t.direction_id, t.trip_headsign,
-               r.route_short_name, r.route_long_name, r.route_color,
+               r.route_short_name, r.route_long_name, r.route_color, r.route_type,
                st.stop_id, st.stop_sequence, s.stop_name
         FROM trips t
         JOIN routes r ON r.route_id = t.route_id
@@ -1001,10 +1009,11 @@ def load_trip_shapes(
                     "route_short_name": row[4] or "",
                     "route_long_name": row[5] or "",
                     "route_color": row[6] or None,
+                    "route_type": row[7],
                     "stops": [],
                 }
                 trips[tid] = entry
-            entry["stops"].append((row[7], row[9] or row[7]))
+            entry["stops"].append((row[8], row[10] or row[8]))
         return list(trips.values())
     except sqlite3.Error as exc:
         _LOGGER.error("load_trip_shapes failed: %s", exc)
@@ -1262,6 +1271,7 @@ def get_lines_between(
                 "route_short_name": tr["route_short_name"],
                 "route_long_name": tr["route_long_name"],
                 "route_color": tr["route_color"],
+                "route_type": tr["route_type"],
                 "direction_id": tr["direction_id"],
                 "terminal_stop_id": terminal[0],
                 "terminal_stop_name": terminal[1],
@@ -1287,6 +1297,7 @@ def get_lines_between(
                     terminal_stop_name=g["terminal_stop_name"],
                     via_hint=None,
                     route_color=g["route_color"],
+                    route_type=g["route_type"],
                 )
             )
         else:
@@ -1301,6 +1312,7 @@ def get_lines_between(
                         terminal_stop_name=g["terminal_stop_name"],
                         via_hint=rec["via"],
                         route_color=g["route_color"],
+                        route_type=g["route_type"],
                     )
                 )
 

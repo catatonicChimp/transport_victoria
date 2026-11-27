@@ -17,12 +17,14 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    BOARD_DEFAULT_DEPARTURE_COUNT,
     CONF_DEPARTURE_COUNT,
     CONF_ENTRY_TYPE,
     CONF_MODE,
     CONF_PARENT_ENTRY_ID,
     DEFAULT_DEPARTURE_COUNT,
     DOMAIN,
+    ENTRY_TYPE_BOARD,
     ENTRY_TYPE_ROUTE_TRACKER,
     ENTRY_TYPE_VEHICLE_TRACKER,
     GTFS_REFRESH_CHECK_INTERVAL,
@@ -32,6 +34,7 @@ from .const import (
     MODE_BUNDLE_MAP,
     PICTOGRAM_URL_BASE,
 )
+from .board import PinData, board_bundles, validate_pin
 from .coordinator import PTVDataUpdateCoordinator
 from .device_tracker import RouteVehicleCoordinator, VehicleTrackerCoordinator
 from .gtfs.downloader import check_for_remote_changes, download_zip
@@ -356,20 +359,34 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 def _bundles_for_all_entries(hass: HomeAssistant) -> list[str]:
-    """Return the union of bundle folders needed by all watch config entries."""
+    """Return the union of bundle folders needed by all live config entries.
+
+    Board entries contribute the union of their pins' route_type bundles (a
+    board can span modes, so it has no single ``CONF_MODE``).
+    """
     seen: set[str] = set()
     result: list[str] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
-        # Vehicle tracker entries don't have a mode/bundle to import
         entry_type = entry.data.get(CONF_ENTRY_TYPE)
+        # Vehicle/route tracker entries don't have a mode/bundle to import
         if entry_type in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER):
             continue
-        mode = entry.data.get(CONF_MODE, "")
-        for folder in MODE_BUNDLE_MAP.get(mode, []):
+        if entry_type == ENTRY_TYPE_BOARD:
+            folders = _board_bundles_for_entry(entry)
+        else:
+            mode = entry.data.get(CONF_MODE, "")
+            folders = MODE_BUNDLE_MAP.get(mode, [])
+        for folder in folders:
             if folder not in seen:
                 seen.add(folder)
                 result.append(folder)
     return result
+
+
+def _board_bundles_for_entry(entry: ConfigEntry) -> list[str]:
+    """Return the union bundle folders for a board entry's pins."""
+    pins = (PinData.from_dict(sub.data) for sub in entry.subentries.values())
+    return sorted(board_bundles(pins))
 
 
 class ScheduleManager:
@@ -616,6 +633,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
         return await _async_setup_route_tracker(hass, entry)
 
+    if entry_type == ENTRY_TYPE_BOARD:
+        return await _async_setup_board(hass, entry)
+
     return await _async_setup_watch(hass, entry)
 
 
@@ -669,6 +689,58 @@ async def _async_setup_watch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # is a BaseException on Py3.8+, so this also covers mid-setup
         # cancellation; we roll back then re-raise. A HA setup retry re-registers
         # cleanly (the consumer set is idempotent by entry_id).
+        await manager.consumer_unloaded(entry.entry_id)
+        raise
+    return True
+
+
+async def _async_setup_board(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a trip-group board config entry.
+
+    T8 models the board only — no entities yet (T9 aggregation, T10 entities).
+    This registers the board as a schedule consumer with the union of its pins'
+    bundle folders (so the shared manager keeps every pin's schedule fresh),
+    triggers a refresh of that union, and revalidates each pin against the
+    current generation (marking — not deleting — pins whose combination became
+    impossible).
+    """
+    # Ensure the data directory exists (blocking I/O → executor).
+    await hass.async_add_executor_job(
+        lambda: _data_dir(hass).mkdir(parents=True, exist_ok=True)
+    )
+
+    manager = _get_or_create_schedule_manager(hass)
+    manager.register_consumer(entry.entry_id)
+
+    try:
+        pins = [PinData.from_dict(sub.data) for sub in entry.subentries.values()]
+        bundles = sorted(board_bundles(pins))
+        if bundles:
+            hass.async_create_task(manager.ensure_fresh(bundles))
+
+        # Schedule-invalidated pins: validate against the current generation,
+        # log, and record invalid subentry ids (never delete silently).
+        invalid: set[str] = set()
+        db_path = _db_path(hass)
+        for sub in entry.subentries.values():
+            pin = PinData.from_dict(sub.data)
+            result = await hass.async_add_executor_job(validate_pin, db_path, pin)
+            if not result.ok:
+                invalid.add(sub.subentry_id)
+                _LOGGER.warning(
+                    "Board '%s' pin '%s' no longer resolves (%s) — marked invalid",
+                    entry.title,
+                    pin.title,
+                    result.reason,
+                )
+
+        hass.data[DOMAIN][entry.entry_id] = {
+            "invalid_pins": invalid,
+            "departure_count": int(
+                entry.options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT)
+            ),
+        }
+    except BaseException:
         await manager.consumer_unloaded(entry.entry_id)
         raise
     return True
@@ -734,9 +806,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry_type = entry.data.get(CONF_ENTRY_TYPE, "watch")
     is_tracker = entry_type in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER)
-    platforms = _TRACKER_PLATFORMS if is_tracker else _WATCH_PLATFORMS
+    is_board = entry_type == ENTRY_TYPE_BOARD
 
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
+    if is_board:
+        # No platforms to unload yet (T8 has no board entities).
+        unload_ok = True
+    else:
+        platforms = _TRACKER_PLATFORMS if is_tracker else _WATCH_PLATFORMS
+        unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
     if unload_ok:
         entry_data = hass.data[DOMAIN].pop(entry.entry_id, {})
@@ -745,8 +822,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if cancel:
                 cancel()
 
-        # A watch entry is a loaded schedule consumer — release it (and shut the
-        # manager down when the last one leaves).
+        # Watch and board entries are loaded schedule consumers — release them
+        # (and shut the manager down when the last one leaves).
         if not is_tracker:
             manager = hass.data[DOMAIN].get(_SCHEDULE_MANAGER_KEY)
             if manager is not None:
