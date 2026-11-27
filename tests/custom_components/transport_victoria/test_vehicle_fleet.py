@@ -8,6 +8,7 @@ the opt-in gate, and the removal of the legacy double-throttle limiter.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,16 +19,21 @@ from custom_components.transport_victoria import device_tracker as dt_module
 from custom_components.transport_victoria.device_tracker import (
     FleetTrackerCoordinator,
     PTVFleetVehicleTracker,
+    RouteVehicleCoordinator,
     _fleet_scope,
 )
 from custom_components.transport_victoria.const import (
     CONF_ENTRY_TYPE,
+    CONF_MAX_VEHICLES,
     CONF_MODE,
+    CONF_ROUTE_ID,
     CONF_ROUTE_ID_FILTER,
+    CONF_ROUTE_SHORT_NAME,
     CONF_STOP_ID,
     CONF_TRACK_VEHICLES,
     DOMAIN,
     ENTRY_TYPE_BOARD,
+    ENTRY_TYPE_ROUTE_TRACKER,
     ENTRY_TYPE_WATCH,
     MODE_METRO,
     MODE_TRAM,
@@ -37,7 +43,7 @@ from custom_components.transport_victoria.gtfs.repository import (
     routes_for_stop,
     trip_terminals,
 )
-from custom_components.transport_victoria.realtime.client import FeedMeta
+from custom_components.transport_victoria.realtime.client import FeedError, FeedMeta
 from custom_components.transport_victoria.realtime.vehicle_positions import (
     VehiclePosition,
     parse_vehicle_positions_by_vehicle,
@@ -599,3 +605,78 @@ class TestLegacyLimiterRemoval:
         # The old AsyncRateLimiter(24/60s) double-throttle is gone — the shared
         # client's PerFeedRateLimiter is the single enforcement point.
         assert not hasattr(dt_module, "AsyncRateLimiter")
+
+
+# ---------------------------------------------------------------------------
+# Route tracker — missing feed degrades gracefully (tram has no vehicle-positions)
+# ---------------------------------------------------------------------------
+
+
+class _RouteFeedClient:
+    """Stub client for the route tracker's ``fetch_feed`` port."""
+
+    def __init__(self, feed=None, error=None) -> None:
+        self._feed = feed
+        self._error = error
+        self.calls: list[tuple[str, str]] = []
+
+    async def fetch_feed(self, mode: str, feed_type: str):
+        self.calls.append((mode, feed_type))
+        if self._error is not None:
+            raise self._error
+        return self._feed
+
+
+def _route_entry(mode: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        entry_id="route1",
+        title="Route Tracker",
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_ROUTE_TRACKER,
+            CONF_MODE: mode,
+            CONF_ROUTE_ID: "R_METRO_FRANKSTON" if mode == MODE_METRO else "R_TRAM_6",
+            CONF_ROUTE_SHORT_NAME: "Frankston" if mode == MODE_METRO else "6",
+        },
+        options={CONF_MAX_VEHICLES: 5},
+    )
+
+
+class TestRouteTrackerMissingFeed:
+    async def test_tram_missing_feed_degrades_and_logs_once(self, caplog):
+        coordinator = RouteVehicleCoordinator(
+            FakeHass(Path("x.db")), _route_entry(MODE_TRAM), 0
+        )
+        coordinator._client = _RouteFeedClient(
+            error=FeedError(404, "feed not published for this mode", unavailable=True)
+        )
+        with caplog.at_level(logging.WARNING):
+            result1 = await coordinator._async_update_data()
+            result2 = await coordinator._async_update_data()
+
+        # Setup succeeds (no exception); the tracker degrades to zero vehicles.
+        assert result1 == []
+        assert result2 == []
+        warnings = [r for r in caplog.records if "not published" in r.message]
+        assert len(warnings) == 1
+
+    async def test_metro_route_tracker_unchanged(self):
+        coordinator = RouteVehicleCoordinator(
+            FakeHass(Path("x.db")), _route_entry(MODE_METRO), 0
+        )
+        coordinator._client = _RouteFeedClient(feed=vehicle_positions_fleet())
+        result = await coordinator._async_update_data()
+        # Frankston route: V_A / V_B match; V_C (Werribee) and V_D (no route) drop.
+        assert {pos.vehicle_id for pos in result} == {"V_A", "V_B"}
+
+    async def test_route_tracker_auth_error_still_raises(self):
+        from homeassistant.helpers.update_coordinator import UpdateFailed
+
+        coordinator = RouteVehicleCoordinator(
+            FakeHass(Path("x.db")), _route_entry(MODE_METRO), 0
+        )
+        coordinator._client = _RouteFeedClient(error=FeedError(401, "auth rejected"))
+        with pytest.raises(Exception) as excinfo:
+            await coordinator._async_update_data()
+        # Auth failure surfaces (ConfigEntryAuthFailed == Exception) — not degraded
+        # to empty, and not the retryable UpdateFailed path.
+        assert not isinstance(excinfo.value, UpdateFailed)

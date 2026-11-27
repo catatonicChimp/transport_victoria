@@ -79,7 +79,7 @@ from .const import (
     PICTOGRAM_URL_BASE,
 )
 from .gtfs.repository import route_ids_for_trips, routes_for_stop, trip_terminals
-from .realtime.client import PTVRealtimeClient
+from .realtime.client import FeedError, PTVRealtimeClient
 from .realtime.vehicle_positions import (
     VehiclePosition,
     parse_vehicle_positions,
@@ -555,6 +555,8 @@ class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # 
     ) -> None:
         self._entry = entry
         self._client: PTVRealtimeClient | None = None
+        # Log-once guard for the "feed not published for this mode" degradation.
+        self._missing_logged = False
 
         stagger = entry_index * COORDINATOR_STAGGER_SECONDS
         poll_interval = timedelta(seconds=DEFAULT_POLL_INTERVAL_SECONDS + stagger)
@@ -595,6 +597,22 @@ class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # 
 
         try:
             feed = await client.fetch_feed(mode, FEED_VEHICLE_POSITIONS)
+        except FeedError as exc:
+            if exc.unavailable:
+                # The portal does not publish this feed (e.g. tram vehicle
+                # positions, T13) — degrade to "no vehicles" rather than failing
+                # setup and retrying forever.  Log once per entry.
+                if not self._missing_logged:
+                    self._missing_logged = True
+                    _LOGGER.warning(
+                        "Vehicle positions are not published for %s — vehicle "
+                        "tracking disabled for route tracker %s",
+                        mode, route_id,
+                    )
+                return []
+            if exc.status == 401:
+                raise ConfigEntryAuthFailed("PTV API key rejected (401)") from exc
+            raise UpdateFailed(f"Vehicle positions fetch failed: {exc.status}") from exc
         except aiohttp.ClientResponseError as exc:
             if exc.status == 401:
                 raise ConfigEntryAuthFailed("PTV API key rejected (401)") from exc
