@@ -82,6 +82,46 @@ Exact entity ids follow Home Assistant’s naming; see **Developer tools → Sta
 
 ---
 
+## Importing existing watches as a board
+
+You can copy several existing watches into a single **trip-group board** without
+touching the originals. From **Settings → Devices & services → Add integration →
+Transport Victoria**, pick **"Trip-Group Board — import from existing watches"**.
+
+The import flow lists your current compatible watches as checkboxes plus a new
+board name. On submit it creates the board with **one line (pin) per watch** —
+using the same pin-derivation path as manual board creation, so labels and
+identity match — then shows a summary of what was imported, what was skipped,
+and any stale references.
+
+### Non-destructive guarantee
+
+The import is **opt-in and read-only with respect to your existing entries**:
+
+- Source watches are **never deleted, disabled, or modified** — their config
+  data is untouched.
+- The only thing created is the new board (and its pin subentries).
+- **Rollback = delete the new board.** Removing the board removes its pins and
+  entities; your original watches remain exactly as they were.
+
+### Compatibility matrix
+
+| Watch type | Imports? | Notes |
+|------------|----------|-------|
+| Departure watch with a specific line | ✅ | One pin per watch |
+| Departure watch, all-destinations, single line at the stop | ✅ | Line resolved automatically |
+| Departure watch, all lines across several routes | ❌ | No single line — stays as-is (create a board manually) |
+| Transfer **journey** (change at stop) | ❌ | Transfer journeys stay as-is |
+| Vehicle / route **tracker** | ❌ | Trackers stay as-is |
+| Watch whose route/stop/destination no longer resolve | ⚠️ | Imported with a *needs attention* flag — never silently dropped |
+
+Missing/optional fields (platform, colour override, direction) map to explicit
+empty values rather than being guessed.
+
+
+
+---
+
 ## Data sources
 
 All datasets are published by Transport Victoria on the **[open data portal](https://opendata.transport.vic.gov.au/)**.

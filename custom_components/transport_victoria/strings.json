@@ -123,6 +123,21 @@
           "board_name": "Name"
         }
       },
+      "import": {
+        "title": "Import Watches as a Board",
+        "description": "Select one or more of your existing watches to copy into a new trip-group board. Your existing watches are **never** changed or removed — this only creates a new board.",
+        "data": {
+          "watch_ids": "Watches to import",
+          "board_name": "New board name"
+        }
+      },
+      "import_summary": {
+        "title": "Confirm Board Import",
+        "description": "The new board **{board_name}** will be created with one line per selected watch.\n\n**Imported**\n{imported}\n\n**Skipped (stays as-is)**\n{skipped}\n\n**Needs attention (stale references)**\n{stale}\n\nYour existing watches are not modified. Roll back by deleting the new board.",
+        "data": {
+          "confirm": "Create the board"
+        }
+      },
       "origin": {
         "title": "Boarding Stop",
         "description": "Find the stop this pin departs from.",
@@ -184,6 +199,7 @@
       "no_direct_service": "No direct service found between these two stops. Try a different destination or use All destinations.",
       "destination_unreachable": "No service runs from your origin stop to this destination. Pick All destinations or another destination.",
       "invalid_route": "Route not found. Please select a route from the list.",
+      "select_at_least_one": "Select at least one watch to import.",
       "unknown": "An unexpected error occurred.",
       "required": "This field is required."
     },
@@ -191,7 +207,8 @@
       "already_configured": "This watch is already configured.",
       "no_routes_found": "No routes found for this transport mode. Make sure the timetable data has been imported.",
       "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker.",
-      "no_pins": "This board has no pins yet."
+      "no_pins": "This board has no pins yet.",
+      "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported — they stay as-is."
     }
   },
   "options": {
