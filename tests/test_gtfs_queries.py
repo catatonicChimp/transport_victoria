@@ -123,6 +123,24 @@ class TestMetroSharedStop:
         assert [r.trip_id for r in inbound] == ["T_FRK_IN_1"]
         assert inbound[0].direction_id == 1
 
+    def test_trips_direction_filter_selects_one_direction(self, metro_db: Path):
+        # A *direction* filter (T13) binds trips.direction_id directly, distinct
+        # from the destination EXISTS filter — opposite-direction boards use it.
+        outbound = next_departures(
+            metro_db, "RICHMOND", NOW_0800, limit=10,
+            trips_direction_filter=0,
+        )
+        assert outbound
+        assert all(r.direction_id == 0 for r in outbound)
+        assert "T_FRK_IN_1" not in [r.trip_id for r in outbound]
+
+        inbound = next_departures(
+            metro_db, "RICHMOND", NOW_0800, limit=10,
+            trips_direction_filter=1,
+        )
+        assert [r.trip_id for r in inbound] == ["T_FRK_IN_1"]
+        assert all(r.direction_id == 1 for r in inbound)
+
     def test_post_midnight_2510_service_is_next_service_day(self, metro_db: Path):
         # 00:20 Tuesday is still Monday's service day (03:00 cutover), so the
         # 25:10 Monday trip appears as 01:10 Tuesday.

@@ -153,6 +153,7 @@ def next_departures(
     lookback_seconds: int = 0,
     offset: int = 0,
     resolved_db: Path | None = None,
+    trips_direction_filter: int | None = None,
 ) -> list[DepartureRow]:
     """Return the next scheduled departures from a stop.
 
@@ -174,6 +175,13 @@ def next_departures(
     filter: a destination-filtered pin whose first page of raw route rows do not
     reach the destination still pages forward correctly.
 
+    A *direction* filter (``trips_direction_filter``) is distinct and orthogonal:
+    it binds ``trips.direction_id = :trips_direction_filter`` directly, so a
+    pin scoped to a direction returns ONLY that direction's trips.  It is used by
+    the board's Opposite-direction mode (T13), where the destination filter is
+    intentionally disabled but the flipped ``direction_id`` must still select one
+    direction rather than returning every service at the boarding stop.
+
     Args:
         db_path: Path to the SQLite database (the logical anchor).
         stop_id: The GTFS stop_id to query.
@@ -193,6 +201,8 @@ def next_departures(
         resolved_db: A pre-resolved generation file to query (bypasses pointer
             resolution).  The board aggregator pins one snapshot for a whole
             pagination sequence via this parameter.
+        trips_direction_filter: If set, only return trips whose ``direction_id``
+            equals this value (None = no direction filter).
 
     Returns:
         List of DepartureRow, sorted by absolute scheduled departure time,
@@ -208,6 +218,7 @@ def next_departures(
         resolved, stop_id, service_date, lower_bound, fetch_limit,
         route_id_filter=route_id_filter, platform_filter=platform_filter,
         direction_stop_id=direction_stop_id,
+        trips_direction_filter=trips_direction_filter,
     )
 
     # Second branch for post-midnight: query yesterday, offset now_seconds
@@ -216,6 +227,7 @@ def next_departures(
         resolved, stop_id, yesterday, lower_bound + 86400, fetch_limit,
         route_id_filter=route_id_filter, platform_filter=platform_filter,
         direction_stop_id=direction_stop_id,
+        trips_direction_filter=trips_direction_filter,
     )
 
     all_rows = sorted(rows_a + rows_b, key=lambda r: r.scheduled_departure)
@@ -232,6 +244,7 @@ def _query_branch(
     route_id_filter: str | None = None,
     platform_filter: str | None = None,
     direction_stop_id: str | None = None,
+    trips_direction_filter: int | None = None,
 ) -> list[DepartureRow]:
     """Run one branch of the departure query for a single service date.
 
@@ -251,6 +264,8 @@ def _query_branch(
         extra_clauses += "\n      AND s.platform_code = :platform_filter"
     if direction_stop_id:
         direction_clause = _DESTINATION_CLAUSE_SQL
+    if trips_direction_filter is not None:
+        extra_clauses += "\n      AND t.direction_id = :trips_direction_filter"
 
     sql = _DEPARTURE_SQL.format(
         active_services_sql=active_services_sql,
@@ -270,6 +285,8 @@ def _query_branch(
         params["platform_filter"] = platform_filter
     if direction_stop_id:
         params["direction_stop_id"] = direction_stop_id
+    if trips_direction_filter is not None:
+        params["trips_direction_filter"] = trips_direction_filter
 
     conn = sqlite3.connect(str(db_path))
     try:

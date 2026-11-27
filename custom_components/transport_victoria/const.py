@@ -22,9 +22,26 @@ REALTIME_BASE_URL = (
 # Auth header name for the PTV Open Data API key
 REALTIME_AUTH_HEADER = "KeyID"
 
-# Rate limit: 24 requests per 60 seconds across ALL endpoints combined
-RATE_LIMIT_CALLS = 24
-RATE_LIMIT_PERIOD = 60  # seconds
+# Rate limits.
+#
+# The portal publishes "20–27 calls per minute (depending on data size)" PER
+# realtime endpoint — not one global budget across all endpoints.  We enforce
+# two layers (see realtime/client.py + rate_limiter.py):
+#
+#   * Per-(mode, feed_type): 20 calls / 60 s — the conservative floor of the
+#     published 20–27 range.
+#   * Global safety ceiling: 40 calls / 60 s across ALL endpoints.  The published
+#     limit is per endpoint, but bursts across the 10 endpoints must not hammer
+#     the API, so total traffic is kept well inside the per-endpoint aggregate.
+RATE_LIMIT_PER_FEED_CALLS = 20
+RATE_LIMIT_PER_FEED_PERIOD = 60  # seconds
+
+RATE_LIMIT_GLOBAL_CALLS = 40
+RATE_LIMIT_GLOBAL_PERIOD = 60  # seconds
+
+# A feed honours a 429 ``Retry-After`` as a per-feed cooldown, clamped to this
+# many seconds (a server that asks for minutes still only pauses us ≤ 60 s).
+RATE_LIMIT_RETRY_AFTER_MAX_SECONDS = 60
 
 # -------------------------------------------------------------------
 # Realtime feed modes
@@ -48,12 +65,51 @@ MODE_LABELS: dict[str, str] = {
 }
 
 # -------------------------------------------------------------------
+# Realtime URL-mode resolution (regional buses ride the combined "bus" feed)
+# -------------------------------------------------------------------
+#
+# The GTFS *schedule* bundle splits regional buses (folders 4/11) from metro
+# buses (folder 6), but the *realtime* feeds do NOT: the portal serves a single
+# combined "bus" RT feed, and ``regional-bus`` / ``rural-bus`` / ``coach`` URL
+# segments return 404.  A pin configured as ``MODE_REGIONAL_BUS`` therefore
+# fetches the "bus" RT feed.  This maps a config mode to the RT URL segment ONLY
+# — ``MODE_REGIONAL_BUS`` itself is NOT renamed (config entries, labels, bundle
+# mapping, and schedule semantics are unchanged).  The realtime client resolves
+# the URL mode, and its cache / rate buckets / known-missing / scope-unavailable
+# keys all use the RESOLVED mode so regional-bus and bus SHARE one cached fetch.
+RT_URL_FEED_MODE: dict[str, str] = {
+    MODE_REGIONAL_BUS: MODE_BUS,
+}
+
+# -------------------------------------------------------------------
 # Realtime feed types
 # -------------------------------------------------------------------
 
 FEED_TRIP_UPDATES = "trip-updates"
 FEED_SERVICE_ALERTS = "service-alerts"
 FEED_VEHICLE_POSITIONS = "vehicle-positions"
+
+# (mode, feed_type) pairs the portal does NOT publish (verified via CKAN, which
+# lists each mode's GTFS-RT resources): trams have no Vehicle Positions, and
+# V/Line has no Service Alerts.  The realtime client treats a 404 on one of these
+# as "unavailable" (suppressed retry) instead of a transient failure, so it never
+# hammers endpoints that will never exist.
+REALTIME_KNOWN_MISSING_FEEDS: frozenset[tuple[str, str]] = frozenset({
+    (MODE_TRAM, FEED_VEHICLE_POSITIONS),
+    (MODE_VLINE, FEED_SERVICE_ALERTS),
+})
+
+# (mode, feed_type) pairs the portal serves but which a subscription key may not
+# be *scoped* to — these return 403 "Forbidden" (not 404).  ``bus/service-alerts``
+# returns 403 with the maintainer's key: the "Public Transport GTFS Realtime (Bus
+# Service Alerts)" portal product is not enabled on the key (enable it under My
+# Account → Products on opendata.transport.vic.gov.au).  The realtime client
+# treats a 403 on one of these as "unavailable" (suppressed retry + a one-time
+# diagnosis hint) and SELF-HEALS if the product is later enabled — it still makes
+# the request each poll and a 200 simply overrides the classification.
+REALTIME_SCOPE_UNAVAILABLE_FEEDS: frozenset[tuple[str, str]] = frozenset({
+    (MODE_BUS, FEED_SERVICE_ALERTS),
+})
 
 # -------------------------------------------------------------------
 # GTFS route_type codes used by PTV

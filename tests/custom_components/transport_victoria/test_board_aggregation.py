@@ -28,6 +28,7 @@ from custom_components.transport_victoria.board_aggregation import (
     FEED_FAILED,
     FEED_OK,
     FEED_STALE,
+    FEED_UNAVAILABLE,
     REALTIME_LIVE,
     REALTIME_SCHEDULED,
     REALTIME_STALE,
@@ -43,7 +44,11 @@ from custom_components.transport_victoria.board_aggregation import (
     match_board_alerts,
     route_type_to_mode,
 )
-from custom_components.transport_victoria.realtime.client import FeedMeta, _decode_feed
+from custom_components.transport_victoria.realtime.client import (
+    FeedError,
+    FeedMeta,
+    _decode_feed,
+)
 from custom_components.transport_victoria.gtfs.repository import next_departures
 from custom_components.transport_victoria.realtime.service_alerts import (
     ActivePeriod,
@@ -356,6 +361,16 @@ class TestMergeOrdering:
         # With a short horizon the post-midnight T_FRK_LATE is excluded.
         result = _agg(metro_db, pins, horizon=timedelta(hours=1))
         assert "T_FRK_LATE" not in {r.trip_id for r in result.rows}
+
+    def test_trips_direction_filter_excludes_other_direction(self, metro_db: Path):
+        # A pin whose direction filter is set (Opposite mode) returns ONLY that
+        # direction's trips — the schedule query binds trips.direction_id.
+        pin = _pin(R_FRANKSTON, RICHMOND, "Richmond", all_dest=False, direction=1)
+        pin.trips_direction_filter = 1
+        result = _agg(metro_db, [pin])
+        assert result.rows
+        assert [r.trip_id for r in result.rows] == ["T_FRK_IN_1"]  # 08:28 inbound
+        assert all(r.direction_id == 1 for r in result.rows)
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +819,162 @@ class TestFreshness:
                 _pin("R_TRAM_96", "T96_TERM", route_type=0)]
         data = await fetch_board_realtime(client, pins, True, now=NOW_UTC)
         assert data.stale_modes == frozenset({"metro"})
+
+
+class TestFeedHealthOnFailure:
+    def test_failed_feed_surfaces_age_from_last_success(self):
+        # A FeedError carrying last_success → FEED_FAILED with a non-None age.
+        last_success = NOW_UTC - timedelta(seconds=45)
+        exc = FeedError(429, last_success=last_success, last_failure=NOW_UTC)
+        health = ba._failed_health(exc, NOW_UTC)
+        assert health.state == FEED_FAILED
+        assert health.age == timedelta(seconds=45)
+
+    def test_failed_feed_without_history_has_none_age(self):
+        health = ba._failed_health(FeedError(500), NOW_UTC)
+        assert health.state == FEED_FAILED
+        assert health.age is None
+
+    def test_unavailable_feed_is_not_a_failure(self):
+        health = ba._failed_health(FeedError(404, unavailable=True), NOW_UTC)
+        assert health.state == FEED_UNAVAILABLE
+
+    async def test_known_missing_feed_is_unavailable_through_board(self):
+        # A client whose vline/service-alerts raises FeedError(unavailable=True)
+        # yields FEED_UNAVAILABLE (not FEED_FAILED) in the board's feed health.
+        class UnavailableClient:
+            async def fetch_feed_with_meta(self, mode, feed_type):
+                if (mode, feed_type) == ("vline", "service-alerts"):
+                    raise FeedError(404, unavailable=True)
+                return (_decode_feed(load_bytes("header_tick_0")),
+                        FeedMeta(NOW_UTC, NOW_UTC))
+
+        pins = [_pin("R_VLINE_GEELONG", "V_SC", route_type=2)]
+        data = await fetch_board_realtime(UnavailableClient(), pins, True, now=NOW_UTC)
+        assert data.feed_health[("vline", "service-alerts")].state == FEED_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Regional-bus → bus RT feed resolution (T13 follow-up)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRTResponse:
+    def __init__(self, status: int = 200, content: bytes = b"", headers=None):
+        self.status = status
+        self._content = content
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def read(self):
+        return self._content
+
+
+class _FakeRTSession:
+    def __init__(self, responses: dict[str, _FakeRTResponse]):
+        self.calls: list[str] = []
+        self._responses = responses
+
+    def get(self, url, **kw):
+        self.calls.append(url)
+        return self._responses[url]
+
+
+class _NoopLimiter:
+    async def acquire(self, key):
+        return None
+
+
+class TestRegionalBusBoardResolution:
+    def _db(self, tmp_path: Path) -> Path:
+        """A combined bus (route_type 3) + regional-bus (route_type 701) DB
+        sharing one boarding stop, so both pins resolve to the combined feed."""
+        stops = [
+            {"stop_id": "S", "stop_name": "Shared", "stop_lat": -37.8, "stop_lon": 144.9,
+             "stop_code": "S", "location_type": None, "parent_station": "",
+             "platform_code": "", "wheelchair_boarding": 0},
+        ]
+        routes = [
+            {"route_id": "R_BUS", "route_short_name": "220", "route_long_name": "Bus",
+             "route_type": 3, "route_color": "000000"},
+            {"route_id": "R_REG", "route_short_name": "R1", "route_long_name": "Regional",
+             "route_type": 701, "route_color": "000000"},
+        ]
+        trips = [
+            {"trip_id": "T_BUS_1", "route_id": "R_BUS", "service_id": "SVC",
+             "shape_id": "", "trip_headsign": "City", "direction_id": 0, "block_id": ""},
+            {"trip_id": "T_REG_1", "route_id": "R_REG", "service_id": "SVC",
+             "shape_id": "", "trip_headsign": "Regional", "direction_id": 0, "block_id": ""},
+        ]
+        stop_times = [
+            {"trip_id": "T_BUS_1", "stop_id": "S", "stop_sequence": 1,
+             "arrival_time": "08:05:00", "departure_time": "08:05:00"},
+            {"trip_id": "T_REG_1", "stop_id": "S", "stop_sequence": 1,
+             "arrival_time": "08:10:00", "departure_time": "08:10:00"},
+        ]
+        calendar = [{"service_id": "SVC", "start_date": "20260520", "end_date": "20260701",
+                     "monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+                     "friday": 1, "saturday": 1, "sunday": 1}]
+        return import_bundle(tmp_path, routes=routes, trips=trips, stops=stops,
+                             stop_times=stop_times, calendar=calendar)
+
+    async def test_bus_and_regional_bus_share_one_fetch_and_join(self, tmp_path: Path):
+        from custom_components.transport_victoria.realtime.client import (
+            PTVRealtimeClient,
+        )
+
+        db = self._db(tmp_path)
+
+        # Combined "bus" realtime feed with a delay for BOTH the bus and the
+        # regional-bus trip (they share one RT feed).
+        tu_feed = rt.FeedMessage()
+        tu_feed.header.gtfs_realtime_version = "2.0"
+        tu_feed.header.timestamp = int(NOW_UTC.timestamp())
+        for tid, delay in (("T_BUS_1", 60), ("T_REG_1", 120)):
+            entity = tu_feed.entity.add()
+            entity.id = f"tu-{tid}"
+            entity.trip_update.trip.trip_id = tid
+            stu = entity.trip_update.stop_time_update.add()
+            stu.stop_id = "S"
+            stu.stop_sequence = 1
+            stu.departure.delay = delay
+
+        base = "https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1"
+        session = _FakeRTSession({
+            f"{base}/bus/trip-updates": _FakeRTResponse(200, tu_feed.SerializeToString()),
+            f"{base}/bus/service-alerts": _FakeRTResponse(
+                200, _decode_feed(load_bytes("header_tick_0")).SerializeToString()
+            ),
+        })
+        client = PTVRealtimeClient("k", session, rate_limiter=_NoopLimiter())
+
+        pins = [
+            _pin("R_BUS", "S", route_type=3),
+            _pin("R_REG", "S", route_type=701),
+        ]
+        realtime = await fetch_board_realtime(client, pins, True, now=NOW_UTC)
+
+        # ONE trip-updates HTTP request despite two distinct config modes.
+        trip_calls = [u for u in session.calls if u.endswith("/trip-updates")]
+        assert len(trip_calls) == 1
+        assert realtime.trip_updates is not None
+
+        # Both boards' rows join normally against the shared bus feed.
+        result = aggregate_board(
+            db, pins, BASE, local_tz=MEL, now_utc=NOW_UTC, realtime_enabled=True,
+            trip_updates=realtime.trip_updates, stale_modes=realtime.stale_modes,
+            alerts=realtime.alerts,
+        )
+        by_trip = {r.trip_id: r for r in result.rows}
+        assert by_trip["T_BUS_1"].delay_seconds == 60
+        assert by_trip["T_REG_1"].delay_seconds == 120
+        assert by_trip["T_BUS_1"].route_id == "R_BUS"
+        assert by_trip["T_REG_1"].route_id == "R_REG"
 
 
 # ---------------------------------------------------------------------------

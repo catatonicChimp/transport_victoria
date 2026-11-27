@@ -5,29 +5,47 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from ..models import Alert
 
 _LOGGER = logging.getLogger(__name__)
 
-# Protobuf enum → human-readable string mappings
-_CAUSE_MAP = {
-    0: "UNKNOWN_CAUSE",
-    1: "OTHER_CAUSE",
-    2: "TECHNICAL_PROBLEM",
-    3: "STRIKE",
-    4: "DEMONSTRATION",
-    5: "ACCIDENT",
-    6: "HOLIDAY",
-    7: "WEATHER",
-    8: "MAINTENANCE",
-    9: "CONSTRUCTION",
-    10: "POLICE_ACTIVITY",
-    11: "MEDICAL_EMERGENCY",
+# Protobuf enum → human-readable string mappings.
+#
+# GTFS-RT enum values are 1-based: ``Alert.Cause`` starts at ``UNKNOWN_CAUSE = 1``
+# and ``Alert.Effect`` at ``NO_SERVICE = 1``.  An *unset* field reads ``0`` (the
+# protobuf default), which is not a valid enum value and maps to the "UNKNOWN"
+# string via the ``.get(..., "UNKNOWN_*")`` fallback at each call site.
+#
+# These maps are derived programmatically from the bound ``gtfs_realtime_pb2``
+# enums so the integer→name mapping can never drift from the bindings.  The
+# previous hand-maintained dicts were off-by-one (they numbered from 0), which
+# mislabelled every cause/effect.  The enum import is deferred and cached via
+# :func:`_cause_map` / :func:`_effect_map` (``functools.lru_cache``) so the
+# C-extension import never blocks the event loop at integration-import time
+# (matching ``realtime.client``'s decode-in-executor pattern); the hand-maintained
+# fallbacks below are used only if the bindings are unavailable.
+
+# Explicit fallbacks, 1-based to match the bound enums (used only when the
+# google.transit bindings cannot be imported).
+_CAUSE_FALLBACK = {
+    1: "UNKNOWN_CAUSE",
+    2: "OTHER_CAUSE",
+    3: "TECHNICAL_PROBLEM",
+    4: "STRIKE",
+    5: "DEMONSTRATION",
+    6: "ACCIDENT",
+    7: "HOLIDAY",
+    8: "WEATHER",
+    9: "MAINTENANCE",
+    10: "CONSTRUCTION",
+    11: "POLICE_ACTIVITY",
+    12: "MEDICAL_EMERGENCY",
+    13: "SPECIAL_EVENT",
 }
 
-_EFFECT_MAP = {
-    0: "UNKNOWN_EFFECT",
+_EFFECT_FALLBACK = {
     1: "NO_SERVICE",
     2: "REDUCED_SERVICE",
     3: "SIGNIFICANT_DELAYS",
@@ -35,10 +53,37 @@ _EFFECT_MAP = {
     5: "ADDITIONAL_SERVICE",
     6: "MODIFIED_SERVICE",
     7: "OTHER_EFFECT",
-    8: "STOP_MOVED",
-    9: "NO_EFFECT",
-    10: "ACCESSIBILITY_ISSUE",
+    8: "UNKNOWN_EFFECT",
+    9: "STOP_MOVED",
+    10: "NO_EFFECT",
+    11: "ACCESSIBILITY_ISSUE",
 }
+
+
+def _build_enum_map(enum_name: str, fallback: dict[int, str]) -> dict[int, str]:
+    """Build ``{int_value: name}`` for a bound ``gtfs_realtime_pb2.Alert`` enum.
+
+    Falls back to the hand-maintained ``fallback`` dict when the bindings cannot
+    be imported (they are always present in-tree, so this is a safety net only).
+    """
+    try:
+        from google.transit import gtfs_realtime_pb2 as rt
+    except ImportError:  # pragma: no cover - bindings ship with the integration
+        return dict(fallback)
+    enum = getattr(rt.Alert, enum_name)
+    return {value: name for name, value in enum.items()}
+
+
+@lru_cache(maxsize=None)
+def _cause_map() -> dict[int, str]:
+    """Return the ``{int_value: name}`` Cause map (built lazily, cached)."""
+    return _build_enum_map("Cause", _CAUSE_FALLBACK)
+
+
+@lru_cache(maxsize=None)
+def _effect_map() -> dict[int, str]:
+    """Return the ``{int_value: name}`` Effect map (built lazily, cached)."""
+    return _build_enum_map("Effect", _EFFECT_FALLBACK)
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,7 +133,8 @@ class ServiceAlert:
     preserves the *per-selector* structure (AND-within / OR-across), the trip
     and direction selectors, and the agency/route_type scope.  Matching is by
     selector only — ``cause`` is informational and MUST NOT be used for
-    matching (the ``_CAUSE_MAP`` numbering is fixed separately in T13).
+    matching (the ``_CAUSE_MAP`` / ``_EFFECT_MAP`` numbering is derived from the
+    bound enum — fixed in T13).
     """
 
     alert_id: str
@@ -177,8 +223,8 @@ def parse_service_alerts(feed: object, feed_mode: str | None = None) -> list[Ser
                 alert_id=entity.id,
                 header=header,
                 description=_first_translation(raw.description_text),
-                cause=_CAUSE_MAP.get(raw.cause, "UNKNOWN_CAUSE"),
-                effect=_EFFECT_MAP.get(raw.effect, "UNKNOWN_EFFECT"),
+                cause=_cause_map().get(raw.cause, "UNKNOWN_CAUSE"),
+                effect=_effect_map().get(raw.effect, "UNKNOWN_EFFECT"),
                 active_periods=periods,
                 selectors=selectors,
                 feed_mode=feed_mode,
@@ -301,8 +347,8 @@ def parse_alerts(
                 alert_id=entity.id,
                 header=header,
                 description=description,
-                cause=_CAUSE_MAP.get(raw.cause, "UNKNOWN_CAUSE"),
-                effect=_EFFECT_MAP.get(raw.effect, "UNKNOWN_EFFECT"),
+                cause=_cause_map().get(raw.cause, "UNKNOWN_CAUSE"),
+                effect=_effect_map().get(raw.effect, "UNKNOWN_EFFECT"),
                 active_from=active_from,
                 active_until=active_until,
                 affected_route_ids=affected_routes,
