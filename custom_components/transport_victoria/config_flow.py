@@ -10,21 +10,35 @@ from typing import Any
 import aiohttp
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    ConfigSubentryFlow,
+    OptionsFlow,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import selector
 
 from .const import (
+    ALL_ROUTE_TYPES,
+    BOARD_DEFAULT_DEPARTURE_COUNT,
+    BOARD_MAX_DEPARTURE_COUNT,
     CITY_LOOP_STOP_IDS,
     CONF_ALL_DESTINATIONS,
     CONF_API_KEY,
+    CONF_BOARD_NAME,
+    CONF_COLOUR_OVERRIDE,
     CONF_DESTINATION_STOP_ID,
     CONF_DESTINATION_STOP_NAME,
     CONF_DIRECTION,
     CONF_ENTRY_TYPE,
+    CONF_INCLUDE,
     CONF_JOURNEY_DESTINATION_STOP_ID,
     CONF_JOURNEY_DESTINATION_STOP_NAME,
     CONF_JOURNEY_MODE,
+    CONF_LABEL_FROM,
+    CONF_LABEL_TO,
     CONF_MAX_VEHICLES,
     CONF_MIN_TRANSFER_MINUTES,
     CONF_MODE,
@@ -43,15 +57,21 @@ from .const import (
     CONF_ROUTE_ID_FILTER,
     CONF_ROUTE_LONG_NAME,
     CONF_ROUTE_SHORT_NAME,
+    CONF_SHOW_RUN_NUMBERS,
+    CONF_SHOW_VEHICLE_TYPE,
     CONF_STOP_ID,
     CONF_STOP_NAME,
+    CONF_SUBENTRY_ORDER,
     CONF_TRANSFER_STOP_ID,
     CONF_TRANSFER_STOP_NAME,
     CONF_WATCH_NAME,
     DEFAULT_DEPARTURE_COUNT,
     DEFAULT_MAX_VEHICLES,
     DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_SHOW_RUN_NUMBERS,
+    DEFAULT_SHOW_VEHICLE_TYPE,
     DOMAIN,
+    ENTRY_TYPE_BOARD,
     ENTRY_TYPE_ROUTE_TRACKER,
     ENTRY_TYPE_VEHICLE_TRACKER,
     ENTRY_TYPE_WATCH,
@@ -59,12 +79,23 @@ from .const import (
     MODE_LABELS,
     MODES,
     ROUTE_TYPE_MAP,
+    SUBENTRY_TYPE_PIN,
+)
+from .board import (
+    PinData,
+    line_value,
+    move_subentry,
+    normalize_order,
+    pin_from_line,
+    pin_from_route_all,
 )
 from .gtfs.repository import (
     Destination,
+    LineCandidate,
     RouteResult,
     StopResult,
     get_all_routes,
+    get_lines_between,
     get_platforms_for_stop,
     get_routes_for_stop,
     get_stop_lat_lon,
@@ -78,6 +109,7 @@ from .realtime.client import PTVRealtimeClient
 from .routing.destination import (
     destination_label,
     destination_value,
+    line_label,
     resolve_destination,
 )
 from .routing.path_finder import validate_route
@@ -1003,13 +1035,15 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     async def async_step_entry_type(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose between a Departure Watch, Vehicle Tracker, or Route Tracker."""
+        """Choose between a Departure Watch, Vehicle Tracker, Route Tracker, or Board."""
         if user_input is not None:
             entry_type = user_input.get("entry_type", ENTRY_TYPE_WATCH)
             if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
                 return await self.async_step_vehicle_tracker()
             if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
                 return await self.async_step_route_tracker_mode()
+            if entry_type == ENTRY_TYPE_BOARD:
+                return await self.async_step_board_name()
             # Default: departure watch — continue with mode selection
             return await self.async_step_mode()
 
@@ -1031,12 +1065,67 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                                 value=ENTRY_TYPE_ROUTE_TRACKER,
                                 label="Route Tracker (all vehicles on a line)",
                             ),
+                            selector.SelectOptionDict(
+                                value=ENTRY_TYPE_BOARD,
+                                label="Trip-Group Board (multiple lines at a stop)",
+                            ),
                         ],
                         mode=selector.SelectSelectorMode.LIST,
                     )
                 ),
             }),
         )
+
+    async def async_step_board_name(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Name the board and create the parent config entry.
+
+        Pins are added afterwards as subentries (see PTVBoardSubentryFlow).  A
+        fresh board triggers a full GTFS refresh (all bundles) in the background
+        so the subsequent pin flow has schedule data to resolve against.
+        """
+        if user_input is not None:
+            board_name = user_input.get(CONF_BOARD_NAME, "").strip()
+            if not board_name:
+                return self.async_show_form(
+                    step_id="board_name",
+                    errors={CONF_BOARD_NAME: "required"},
+                    data_schema=vol.Schema({
+                        vol.Required(CONF_BOARD_NAME, default=""): selector.TextSelector(),
+                    }),
+                )
+            self.hass.async_create_task(async_trigger_gtfs_refresh(self.hass))
+            return self.async_create_entry(
+                title=board_name,
+                data={
+                    CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
+                    CONF_BOARD_NAME: board_name,
+                    CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
+                },
+                options={
+                    CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
+                    CONF_SUBENTRY_ORDER: [],
+                    CONF_SHOW_RUN_NUMBERS: DEFAULT_SHOW_RUN_NUMBERS,
+                    CONF_SHOW_VEHICLE_TYPE: DEFAULT_SHOW_VEHICLE_TYPE,
+                },
+            )
+
+        return self.async_show_form(
+            step_id="board_name",
+            data_schema=vol.Schema({
+                vol.Required(CONF_BOARD_NAME, default="Departure Board"): selector.TextSelector(),
+            }),
+        )
+
+    @classmethod
+    def async_get_supported_subentry_types(
+        cls, config_entry: ConfigEntry
+    ) -> dict[str, type[ConfigSubentryFlow]]:
+        """Return the subentry types this handler supports (pins for boards)."""
+        if config_entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD:
+            return {SUBENTRY_TYPE_PIN: PTVBoardSubentryFlow}
+        return {}
 
     async def async_step_vehicle_tracker(
         self, user_input: dict[str, Any] | None = None
@@ -1410,6 +1499,352 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return PTVOptionsFlow()
 
 
+class PTVBoardSubentryFlow(ConfigSubentryFlow):  # type: ignore[misc]
+    """Create or edit one trip-group pin (a HA subentry of a board entry).
+
+    Add flow (source ``user``) mirrors the TripView order, adapted to the T7
+    resolver:
+
+        1. ``origin``       — pick the boarding stop (cross-mode name search)
+        2. ``to``           — "All destinations" (default) or a specific stop
+        3. ``select_lines`` — one line/direction candidate from the resolver
+                              (``get_lines_between`` for a specific destination,
+                              ``get_routes_for_stop`` for "all destinations");
+                              auto-advances when a single candidate exists
+        4. ``options``      — per-pin labels, include toggle, platform filter,
+                              colour override
+        5. create the subentry (``pin_key`` as the unique_id)
+
+    Reconfigure flow (source ``reconfigure``) edits the labels / include /
+    platform / colour of an existing pin in place.
+    """
+
+    def __init__(self) -> None:
+        self._stop_search_results: list[StopResult] = []
+        self._dest_search_results: list[StopResult] = []
+        self._all_destinations = True
+        self._destination_stop_id: str | None = None
+        self._destination_stop_name: str | None = None
+        self._boarding_stop_id = ""
+        self._boarding_stop_name = ""
+        self._route_choices: list[RouteResult] = []
+        self._line_choices: list[LineCandidate] = []
+        self._selected_route: RouteResult | None = None
+        self._selected_line: LineCandidate | None = None
+
+    def _db(self) -> Path:
+        return _db_path(self.hass.config.config_dir)
+
+    # -- add flow -------------------------------------------------------
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Start the add-pin flow at the origin stop step."""
+        return await self.async_step_origin(user_input)
+
+    async def async_step_origin(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Search for and select the boarding stop (cross-mode)."""
+        errors: dict[str, str] = {}
+        db = self._db()
+
+        if user_input is not None:
+            if CONF_STOP_ID in user_input and user_input[CONF_STOP_ID]:
+                stop_id = user_input[CONF_STOP_ID]
+                matching = [s for s in self._stop_search_results if s.stop_id == stop_id]
+                stop_name = matching[0].stop_name if matching else stop_id
+                self._boarding_stop_id = stop_id
+                self._boarding_stop_name = stop_name
+                return await self.async_step_to(None)
+
+            query = user_input.get("query", "").strip()
+            if len(query) < 2:
+                if query:
+                    errors["query"] = "search_too_short"
+            else:
+                self._stop_search_results = await self.hass.async_add_executor_job(
+                    search_stops_by_name, db, query, ALL_ROUTE_TYPES, 20
+                )
+                if not self._stop_search_results:
+                    errors["query"] = "no_stops_found"
+
+        schema_fields: dict[Any, Any] = {
+            vol.Optional("query"): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
+            ),
+        }
+        if self._stop_search_results:
+            schema_fields[vol.Optional(CONF_STOP_ID)] = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=_stops_to_selector_options(self._stop_search_results),
+                    mode=selector.SelectSelectorMode.LIST,
+                )
+            )
+
+        return self.async_show_form(
+            step_id="origin",
+            data_schema=vol.Schema(schema_fields),
+            errors=errors,
+        )
+
+    async def async_step_to(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Choose "All destinations" or a specific destination stop."""
+        errors: dict[str, str] = {}
+        db = self._db()
+
+        if user_input is not None:
+            choice = user_input.get("destination_choice", "__all__")
+
+            if choice == "__all__":
+                self._all_destinations = True
+                self._destination_stop_id = None
+                self._destination_stop_name = None
+                return await self.async_step_select_lines(None)
+
+            # "specific" — a destination stop was selected from the search list
+            if CONF_DESTINATION_STOP_ID in user_input and user_input[CONF_DESTINATION_STOP_ID]:
+                stop_id = user_input[CONF_DESTINATION_STOP_ID]
+                matching = [s for s in self._dest_search_results if s.stop_id == stop_id]
+                stop_name = matching[0].stop_name if matching else stop_id
+                self._all_destinations = False
+                self._destination_stop_id = stop_id
+                self._destination_stop_name = stop_name
+                return await self.async_step_select_lines(None)
+
+            query = user_input.get("dest_query", "").strip()
+            if len(query) < 2:
+                if query:
+                    errors["dest_query"] = "search_too_short"
+            else:
+                self._dest_search_results = await self.hass.async_add_executor_job(
+                    search_stops_by_name, db, query, ALL_ROUTE_TYPES, 20
+                )
+                if not self._dest_search_results:
+                    errors["dest_query"] = "no_stops_found"
+
+        options = [
+            selector.SelectOptionDict(value="__all__", label="All destinations"),
+            selector.SelectOptionDict(value="specific", label="Specific destination"),
+        ]
+        schema_fields: dict[Any, Any] = {
+            vol.Required(
+                "destination_choice", default="__all__"
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=options,
+                    mode=selector.SelectSelectorMode.LIST,
+                )
+            ),
+        }
+        if user_input and user_input.get("destination_choice") == "specific":
+            schema_fields[vol.Optional("dest_query")] = selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
+            )
+            if self._dest_search_results:
+                schema_fields[
+                    vol.Optional(CONF_DESTINATION_STOP_ID)
+                ] = selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=_stops_to_selector_options(self._dest_search_results),
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                )
+
+        return self.async_show_form(
+            step_id="to",
+            data_schema=vol.Schema(schema_fields),
+            errors=errors,
+            description_placeholders={
+                "stop_name": self._boarding_stop_name,
+            },
+        )
+
+    async def async_step_select_lines(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick one line/direction combination (single-select; auto-advance)."""
+        db = self._db()
+
+        if self._all_destinations:
+            if not self._route_choices:
+                self._route_choices = await self.hass.async_add_executor_job(
+                    get_routes_for_stop, db, self._boarding_stop_id, ALL_ROUTE_TYPES
+                )
+            if not self._route_choices:
+                return self.async_abort(reason="no_routes_found")
+            if user_input is not None:
+                route_id = user_input.get("route_id_select")
+                matched = next(
+                    (r for r in self._route_choices if r.route_id == route_id), None
+                )
+                if matched is None:
+                    matched = self._route_choices[0]
+                self._selected_route = matched
+                return await self.async_step_options(None)
+            if len(self._route_choices) == 1:
+                self._selected_route = self._route_choices[0]
+                return await self.async_step_options(None)
+            options = [
+                selector.SelectOptionDict(
+                    value=r.route_id, label=_route_display_label(r)
+                )
+                for r in self._route_choices
+            ]
+            return self.async_show_form(
+                step_id="select_lines",
+                data_schema=vol.Schema({
+                    vol.Required(
+                        "route_id_select", default=self._route_choices[0].route_id
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=options,
+                            mode=selector.SelectSelectorMode.LIST,
+                        )
+                    ),
+                }),
+                description_placeholders={"stop_name": self._boarding_stop_name},
+            )
+
+        # Specific destination → resolver candidates via get_lines_between
+        if not self._line_choices:
+            self._line_choices = await self.hass.async_add_executor_job(
+                get_lines_between,
+                db,
+                self._boarding_stop_id,
+                self._destination_stop_id,
+                None,  # cross-mode
+            )
+        if not self._line_choices:
+            return self.async_abort(reason="destination_unreachable")
+        if user_input is not None:
+            line_value_str = user_input.get("line_select")
+            matched = next(
+                (l for l in self._line_choices if line_value_str == line_value(l)),
+                None,
+            )
+            if matched is None:
+                matched = self._line_choices[0]
+            self._selected_line = matched
+            return await self.async_step_options(None)
+        if len(self._line_choices) == 1:
+            self._selected_line = self._line_choices[0]
+            return await self.async_step_options(None)
+        options = [
+            selector.SelectOptionDict(value=line_value(l), label=line_label(l))
+            for l in self._line_choices
+        ]
+        return self.async_show_form(
+            step_id="select_lines",
+            data_schema=vol.Schema({
+                vol.Required(
+                    "line_select", default=line_value(self._line_choices[0])
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }),
+            description_placeholders={
+                "stop_name": self._boarding_stop_name,
+                "destination": self._destination_stop_name or "",
+            },
+        )
+
+    def _draft_pin(self) -> PinData:
+        """Return the draft pin for the currently selected route/line."""
+        if self._selected_line is not None:
+            return pin_from_line(
+                self._selected_line, self._boarding_stop_id, self._boarding_stop_name
+            )
+        assert self._selected_route is not None
+        return pin_from_route_all(
+            self._selected_route, self._boarding_stop_id, self._boarding_stop_name
+        )
+
+    async def async_step_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Per-pin labels, include toggle, platform filter, colour override."""
+        draft = self._draft_pin()
+
+        if user_input is not None:
+            pin = PinData(
+                pin_key=draft.pin_key,
+                route_type=draft.route_type,
+                route_id=draft.route_id,
+                boarding_stop_id=draft.boarding_stop_id,
+                boarding_stop_name=draft.boarding_stop_name,
+                route_short_name=draft.route_short_name,
+                route_long_name=draft.route_long_name,
+                all_destinations=draft.all_destinations,
+                destination_stop_id=draft.destination_stop_id,
+                destination_stop_name=draft.destination_stop_name,
+                direction_id=draft.direction_id,
+                via_hint=draft.via_hint,
+                label_from=user_input.get(CONF_LABEL_FROM, draft.label_from).strip()
+                or draft.label_from,
+                label_to=user_input.get(CONF_LABEL_TO, draft.label_to).strip()
+                or draft.label_to,
+                platform_filter=user_input.get(CONF_PLATFORM_FILTER) or None,
+                colour_override=user_input.get(CONF_COLOUR_OVERRIDE) or None,
+                include=bool(user_input.get(CONF_INCLUDE, True)),
+            )
+            return self.async_create_entry(
+                title=pin.title,
+                data=pin.to_dict(),
+                unique_id=pin.pin_key,
+            )
+
+        return self.async_show_form(
+            step_id="options",
+            data_schema=vol.Schema({
+                vol.Required(CONF_LABEL_FROM, default=draft.label_from): selector.TextSelector(),
+                vol.Required(CONF_LABEL_TO, default=draft.label_to): selector.TextSelector(),
+                vol.Required(CONF_INCLUDE, default=True): selector.BooleanSelector(),
+                vol.Optional(CONF_PLATFORM_FILTER, default=""): selector.TextSelector(),
+                vol.Optional(CONF_COLOUR_OVERRIDE, default=""): selector.TextSelector(),
+            }),
+        )
+
+    # -- reconfigure (edit) flow ----------------------------------------
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit a pin's labels, include flag, platform filter, and colour."""
+        subentry = self._get_reconfigure_subentry()
+        pin = PinData.from_dict(subentry.data)
+
+        if user_input is not None:
+            return self.async_update_and_abort(
+                self._get_entry(),
+                subentry,
+                data_updates={
+                    CONF_LABEL_FROM: user_input.get(CONF_LABEL_FROM, pin.label_from),
+                    CONF_LABEL_TO: user_input.get(CONF_LABEL_TO, pin.label_to),
+                    CONF_INCLUDE: bool(user_input.get(CONF_INCLUDE, pin.include)),
+                    CONF_PLATFORM_FILTER: user_input.get(CONF_PLATFORM_FILTER) or None,
+                    CONF_COLOUR_OVERRIDE: user_input.get(CONF_COLOUR_OVERRIDE) or None,
+                },
+            )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema({
+                vol.Required(CONF_LABEL_FROM, default=pin.label_from): selector.TextSelector(),
+                vol.Required(CONF_LABEL_TO, default=pin.label_to): selector.TextSelector(),
+                vol.Required(CONF_INCLUDE, default=pin.include): selector.BooleanSelector(),
+                vol.Optional(CONF_PLATFORM_FILTER, default=pin.platform_filter or ""): selector.TextSelector(),
+                vol.Optional(CONF_COLOUR_OVERRIDE, default=pin.colour_override or ""): selector.TextSelector(),
+            }),
+        )
+
+
 class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
     """Options flow for an existing PTV entry.
 
@@ -1417,6 +1852,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
     - Departure watch: name, poll interval, realtime toggle, departure count
     - Route tracker: name, max vehicles
     - Linked vehicle tracker: name only
+    - Board: settings + pin reorder/remove (see ``_board_*`` helpers)
     """
 
     async def async_step_init(
@@ -1429,7 +1865,168 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
             return await self._step_route_tracker(user_input)
         if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
             return await self._step_vehicle_tracker(user_input)
+        if entry_type == ENTRY_TYPE_BOARD:
+            return await self._step_board_menu(user_input)
         return await self._step_watch(user_input)
+
+    # ------------------------------------------------------------------
+    # Board options (settings + pin reorder/remove)
+    # ------------------------------------------------------------------
+
+    def _board_subentries(
+        self,
+    ) -> list[tuple[str, object]]:
+        """Return ``(subentry_id, subentry)`` in canonical display order."""
+        ids = list(self.config_entry.subentries.keys())
+        order = normalize_order(
+            self.config_entry.options.get(CONF_SUBENTRY_ORDER, []), ids
+        )
+        return [(sid, self.config_entry.subentries[sid]) for sid in order]
+
+    async def _step_board_menu(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Top-level menu for a board entry's options."""
+        return self.async_show_menu(
+            step_id="init",
+            menu_options={
+                "board_settings": "Board settings",
+                "board_reorder": "Reorder pins",
+                "board_remove": "Remove a pin",
+            },
+        )
+
+    async def async_step_board_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Board settings: name, departure count, and display prefs."""
+        if user_input is not None:
+            board_name = user_input.get(CONF_BOARD_NAME, "").strip()
+            data_updates = {}
+            if board_name:
+                data_updates[CONF_BOARD_NAME] = board_name
+            options = dict(self.config_entry.options)
+            options[CONF_DEPARTURE_COUNT] = int(
+                user_input.get(CONF_DEPARTURE_COUNT, options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT))
+            )
+            options[CONF_SHOW_RUN_NUMBERS] = bool(user_input.get(CONF_SHOW_RUN_NUMBERS, options.get(CONF_SHOW_RUN_NUMBERS, DEFAULT_SHOW_RUN_NUMBERS)))
+            options[CONF_SHOW_VEHICLE_TYPE] = bool(user_input.get(CONF_SHOW_VEHICLE_TYPE, options.get(CONF_SHOW_VEHICLE_TYPE, DEFAULT_SHOW_VEHICLE_TYPE)))
+            # Persist the name change (data) + options.
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, **data_updates
+            )
+            return self.async_create_entry(data=options)
+
+        options = self.config_entry.options
+        data = self.config_entry.data
+        current_name = data.get(CONF_BOARD_NAME, self.config_entry.title)
+        current_count = int(options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT))
+        current_runs = bool(options.get(CONF_SHOW_RUN_NUMBERS, DEFAULT_SHOW_RUN_NUMBERS))
+        current_vehicle = bool(options.get(CONF_SHOW_VEHICLE_TYPE, DEFAULT_SHOW_VEHICLE_TYPE))
+
+        return self.async_show_form(
+            step_id="board_settings",
+            data_schema=vol.Schema({
+                vol.Required(CONF_BOARD_NAME, default=current_name): selector.TextSelector(),
+                vol.Required(CONF_DEPARTURE_COUNT, default=current_count): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1,
+                        max=BOARD_MAX_DEPARTURE_COUNT,
+                        step=1,
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Required(CONF_SHOW_RUN_NUMBERS, default=current_runs): selector.BooleanSelector(),
+                vol.Required(CONF_SHOW_VEHICLE_TYPE, default=current_vehicle): selector.BooleanSelector(),
+            }),
+        )
+
+    async def async_step_board_reorder(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Move a pin up/down one position."""
+        subentries = self._board_subentries()
+        if not subentries:
+            return self.async_abort(reason="no_pins")
+
+        if user_input is not None:
+            sid = user_input.get("pin_select")
+            action = user_input.get("reorder_action", "down")
+            order = normalize_order(
+                self.config_entry.options.get(CONF_SUBENTRY_ORDER, []),
+                list(self.config_entry.subentries.keys()),
+            )
+            direction = -1 if action == "up" else 1
+            new_order = move_subentry(order, sid, direction)
+            options = {**self.config_entry.options, CONF_SUBENTRY_ORDER: new_order}
+            return self.async_create_entry(data=options)
+
+        pin_options = [
+            selector.SelectOptionDict(
+                value=sid, label=PinData.from_dict(sub.data).title
+            )
+            for sid, sub in subentries
+        ]
+        return self.async_show_form(
+            step_id="board_reorder",
+            data_schema=vol.Schema({
+                vol.Required(
+                    "pin_select", default=subentries[0][0]
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=pin_options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+                vol.Required("reorder_action", default="down"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(value="up", label="Move up"),
+                            selector.SelectOptionDict(value="down", label="Move down"),
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }),
+        )
+
+    async def async_step_board_remove(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Remove a pin (subentry) from the board."""
+        subentries = self._board_subentries()
+        if not subentries:
+            return self.async_abort(reason="no_pins")
+
+        if user_input is not None:
+            sid = user_input.get("pin_select")
+            self.hass.config_entries.async_remove_subentry(self.config_entry, sid)
+            order = [
+                x for x in self.config_entry.options.get(CONF_SUBENTRY_ORDER, [])
+                if x != sid
+            ]
+            options = {**self.config_entry.options, CONF_SUBENTRY_ORDER: order}
+            return self.async_create_entry(data=options)
+
+        pin_options = [
+            selector.SelectOptionDict(
+                value=sid, label=PinData.from_dict(sub.data).title
+            )
+            for sid, sub in subentries
+        ]
+        return self.async_show_form(
+            step_id="board_remove",
+            data_schema=vol.Schema({
+                vol.Required(
+                    "pin_select", default=subentries[0][0]
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=pin_options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }),
+        )
 
     async def _step_watch(
         self, user_input: dict[str, Any] | None
