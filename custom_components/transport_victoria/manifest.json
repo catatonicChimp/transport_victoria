@@ -1,7 +1,9 @@
 {
   "domain": "transport_victoria",
   "name": "Transport Victoria",
-  "codeowners": ["@catatonicChimp"],
+  "codeowners": [
+    "@catatonicChimp"
+  ],
   "config_flow": true,
   "dependencies": [
     "http",
@@ -14,5 +16,8 @@
   "requirements": [
     "gtfs-realtime-bindings==3.0.0"
   ],
-  "version": "0.2.0"
+  "version": "0.2.0",
+  "categories": [
+    "vehicles_transport"
+  ]
 }
