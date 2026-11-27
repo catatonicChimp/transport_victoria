@@ -129,6 +129,7 @@ CONF_STOP_NAME = "stop_name"
 CONF_DESTINATION_STOP_ID = "destination_stop_id"
 CONF_DESTINATION_STOP_NAME = "destination_stop_name"
 CONF_ALL_DESTINATIONS = "all_destinations"
+CONF_DIRECTION = "direction"  # direction_id derived from trip evidence (T7)
 CONF_WATCH_NAME = "watch_name"
 
 # Options (user-adjustable after setup via the gear icon)

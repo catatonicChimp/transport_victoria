@@ -128,6 +128,7 @@
       "no_stops_near_location": "No stops found within 500 m of the selected location. Try zooming in closer.",
       "location_required": "Please pick a location on the map.",
       "no_direct_service": "No direct service found between these two stops. Try a different destination or use All destinations.",
+      "destination_unreachable": "No service runs from your origin stop to this destination. Pick All destinations or another destination.",
       "invalid_route": "Route not found. Please select a route from the list.",
       "unknown": "An unexpected error occurred."
     },
