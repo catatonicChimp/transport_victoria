@@ -122,9 +122,23 @@ _DEPARTURE_SQL = """
           AND (s2.location_type = 0 OR s2.location_type IS NULL)
     )
       AND st.departure_seconds >= :now_seconds
-      AND t.service_id IN ({active_services_sql}){extra_clauses}
+      AND t.service_id IN ({active_services_sql}){extra_clauses}{direction_clause}
     ORDER BY st.departure_seconds
     LIMIT :limit
+"""
+
+# Destination-eligibility clause (T9): keep only trips that call at the
+# requested destination stop at a LATER stop_sequence than this boarding
+# occurrence.  Pushed into the SQL so LIMIT/pagination applies AFTER eligibility
+# (a destination-filtered pin whose first N route rows don't reach the
+# destination no longer produces an empty page that hides later valid rows).
+_DESTINATION_CLAUSE_SQL = """
+      AND EXISTS (
+          SELECT 1 FROM stop_times sd
+          WHERE sd.trip_id = st.trip_id
+            AND sd.stop_id = :direction_stop_id
+            AND sd.stop_sequence > st.stop_sequence
+      )
 """
 
 
@@ -137,6 +151,8 @@ def next_departures(
     route_id_filter: str | None = None,
     platform_filter: str | None = None,
     lookback_seconds: int = 0,
+    offset: int = 0,
+    resolved_db: Path | None = None,
 ) -> list[DepartureRow]:
     """Return the next scheduled departures from a stop.
 
@@ -145,11 +161,21 @@ def next_departures(
     - Branch B: yesterday's service date, departure_seconds >= 86400 + now_seconds
       (catches late-night trips published under yesterday's calendar)
 
-    Results from both branches are merged, sorted, and the first `limit` rows
-    returned.
+    Both branches are merged and sorted by the ABSOLUTE scheduled datetime
+    (each row carries its own service date, so a 25:10 post-midnight row and a
+    10:00 same-day row order by real wall-clock time, not their raw
+    service-day offsets), then the first ``limit`` rows after ``offset`` are
+    returned.  ``offset`` enables pagination so a caller can walk the full
+    window without a small ``limit`` hiding later rows behind many earlier ones.
+
+    Destination eligibility (``direction_stop_id``) is enforced IN SQL (an
+    ``EXISTS`` on ``stop_times`` for the destination at a later ``stop_sequence``
+    than this boarding occurrence), so ``LIMIT``/pagination apply AFTER the
+    filter: a destination-filtered pin whose first page of raw route rows do not
+    reach the destination still pages forward correctly.
 
     Args:
-        db_path: Path to the SQLite database.
+        db_path: Path to the SQLite database (the logical anchor).
         stop_id: The GTFS stop_id to query.
         now: Current local datetime (naive or aware).
         limit: Maximum number of departures to return.
@@ -162,31 +188,39 @@ def next_departures(
             departure is in the recent past but which a realtime delay has
             pushed into the future.  The service-date anchor is unchanged, so
             the 00:00–03:00 cutover is still resolved against ``now``.
+        offset: Skip this many rows (by absolute scheduled time) before
+            returning ``limit`` rows.
+        resolved_db: A pre-resolved generation file to query (bypasses pointer
+            resolution).  The board aggregator pins one snapshot for a whole
+            pagination sequence via this parameter.
 
     Returns:
-        List of DepartureRow, sorted by departure time, length <= limit.
+        List of DepartureRow, sorted by absolute scheduled departure time,
+        length <= limit.
     """
     service_date, now_seconds = service_day_for_time(now)
     lower_bound = now_seconds - lookback_seconds
+    fetch_limit = offset + limit
+
+    resolved = resolved_db if resolved_db is not None else _resolve(db_path)
 
     rows_a = _query_branch(
-        db_path, stop_id, service_date, lower_bound, limit,
+        resolved, stop_id, service_date, lower_bound, fetch_limit,
         route_id_filter=route_id_filter, platform_filter=platform_filter,
+        direction_stop_id=direction_stop_id,
     )
 
     # Second branch for post-midnight: query yesterday, offset now_seconds
     yesterday = date.fromordinal(service_date.toordinal() - 1)
     rows_b = _query_branch(
-        db_path, stop_id, yesterday, lower_bound + 86400, limit,
+        resolved, stop_id, yesterday, lower_bound + 86400, fetch_limit,
         route_id_filter=route_id_filter, platform_filter=platform_filter,
+        direction_stop_id=direction_stop_id,
     )
 
-    all_rows = sorted(rows_a + rows_b, key=lambda r: r.departure_seconds)
+    all_rows = sorted(rows_a + rows_b, key=lambda r: r.scheduled_departure)
 
-    if direction_stop_id:
-        all_rows = _filter_by_destination(db_path, all_rows, direction_stop_id)
-
-    return all_rows[:limit]
+    return all_rows[offset:offset + limit]
 
 
 def _query_branch(
@@ -197,8 +231,12 @@ def _query_branch(
     limit: int,
     route_id_filter: str | None = None,
     platform_filter: str | None = None,
+    direction_stop_id: str | None = None,
 ) -> list[DepartureRow]:
-    """Run one branch of the departure query for a single service date."""
+    """Run one branch of the departure query for a single service date.
+
+    ``db_path`` is the RESOLVED generation file (not the anchor).
+    """
     dow_col = day_of_week_column(service_date)
     service_date_s = service_date_str(service_date)
 
@@ -206,14 +244,18 @@ def _query_branch(
 
     # Build optional filter clauses
     extra_clauses = ""
+    direction_clause = ""
     if route_id_filter:
         extra_clauses += "\n      AND t.route_id = :route_id_filter"
     if platform_filter:
         extra_clauses += "\n      AND s.platform_code = :platform_filter"
+    if direction_stop_id:
+        direction_clause = _DESTINATION_CLAUSE_SQL
 
     sql = _DEPARTURE_SQL.format(
         active_services_sql=active_services_sql,
         extra_clauses=extra_clauses,
+        direction_clause=direction_clause,
     )
 
     params: dict[str, object] = {
@@ -226,8 +268,10 @@ def _query_branch(
         params["route_id_filter"] = route_id_filter
     if platform_filter:
         params["platform_filter"] = platform_filter
+    if direction_stop_id:
+        params["direction_stop_id"] = direction_stop_id
 
-    conn = sqlite3.connect(str(_resolve(db_path)))
+    conn = sqlite3.connect(str(db_path))
     try:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(sql, params)
@@ -256,50 +300,6 @@ def _query_branch(
     except sqlite3.Error as exc:
         _LOGGER.error("Departure query failed: %s", exc)
         return []
-    finally:
-        conn.close()
-
-
-def _filter_by_destination(
-    db_path: Path,
-    rows: list[DepartureRow],
-    destination_stop_id: str,
-) -> list[DepartureRow]:
-    """Keep only trips that also call at destination_stop_id after the origin.
-
-    Keys the origin sequence by ``(trip_id, stop_sequence)`` so a loop trip
-    (whose origin stop repeats at a later sequence) is kept when the same trip
-    calls at the destination *after* that specific boarding occurrence, rather
-    than being collapsed to the trip's last occurrence and dropped.
-    """
-    if not rows:
-        return rows
-
-    trip_ids = sorted({r.trip_id for r in rows})
-    origin_seqs_by_trip: dict[str, set[int]] = {}
-    for r in rows:
-        origin_seqs_by_trip.setdefault(r.trip_id, set()).add(r.stop_sequence)
-
-    placeholders = ", ".join("?" * len(trip_ids))
-    sql = f"""
-        SELECT trip_id, stop_sequence FROM stop_times
-        WHERE stop_id = ? AND trip_id IN ({placeholders})
-    """
-
-    conn = sqlite3.connect(str(_resolve(db_path)))
-    try:
-        qualifying: set[tuple[str, int]] = set()
-        for db_row in conn.execute(sql, [destination_stop_id] + trip_ids):
-            trip_id, dest_seq = db_row
-            for origin_seq in origin_seqs_by_trip.get(trip_id, ()):
-                if dest_seq > origin_seq:
-                    qualifying.add((trip_id, origin_seq))
-        return [
-            r for r in rows if (r.trip_id, r.stop_sequence) in qualifying
-        ]
-    except sqlite3.Error as exc:
-        _LOGGER.error("Destination filter query failed: %s", exc)
-        return rows
     finally:
         conn.close()
 

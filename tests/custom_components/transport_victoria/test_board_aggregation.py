@@ -44,6 +44,7 @@ from custom_components.transport_victoria.board_aggregation import (
     route_type_to_mode,
 )
 from custom_components.transport_victoria.realtime.client import FeedMeta, _decode_feed
+from custom_components.transport_victoria.gtfs.repository import next_departures
 from custom_components.transport_victoria.realtime.service_alerts import (
     ActivePeriod,
     SelectorRecord,
@@ -52,7 +53,9 @@ from custom_components.transport_victoria.realtime.service_alerts import (
     parse_service_alerts,
 )
 from custom_components.transport_victoria.realtime.trip_updates import (
+    TripStopUpdate,
     TripUpdateIndex,
+    parse_trip_updates,
     parse_trip_updates_index,
 )
 
@@ -994,3 +997,394 @@ class TestPurity:
             assert not hasattr(row, "hass")
             assert not hasattr(row, "coordinator")
         assert isinstance(result.feed_health, dict)
+
+
+# ---------------------------------------------------------------------------
+# F1a: pagination (many past candidates must not hide upcoming rows)
+# ---------------------------------------------------------------------------
+
+
+def _build_many_db(tmp_path: Path, n: int, prefix: str = "T_A_") -> Path:
+    """Build a single-route generation with ``n`` departures 1 min apart from 07:00."""
+    stops = [{"stop_id": "S", "stop_name": "Shared", "stop_lat": -37.8,
+              "stop_lon": 144.9, "stop_code": "S", "location_type": None,
+              "parent_station": "", "platform_code": "", "wheelchair_boarding": 0}]
+    routes = [{"route_id": "R_A", "route_short_name": "A", "route_long_name": "A Line",
+               "route_type": 1, "route_color": "000000"}]
+    trips = []
+    stop_times = []
+    for i in range(n):
+        tid = f"{prefix}{i:03d}"
+        trips.append({"trip_id": tid, "route_id": "R_A", "service_id": "SVC",
+                      "shape_id": "", "trip_headsign": "A", "direction_id": 0,
+                      "block_id": ""})
+        t = 7 * 3600 + i * 60
+        stop_times.append({"trip_id": tid, "stop_id": "S", "stop_sequence": 1,
+                           "arrival_time": _hms(t), "departure_time": _hms(t)})
+    calendar = [{"service_id": "SVC", "start_date": "20260520", "end_date": "20260701",
+                 "monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+                 "friday": 1, "saturday": 1, "sunday": 1}]
+    return import_bundle(tmp_path, routes=routes, trips=trips, stops=stops,
+                         stop_times=stop_times, calendar=calendar)
+
+
+class TestPagination:
+    def test_many_past_candidates_do_not_hide_upcoming(self, tmp_path):
+        # 130 departures 07:00..09:09; now=09:00 with a 2h lookback pulls in all
+        # 130, the first ~120 of which are past.  Pagination must still surface
+        # the upcoming (09:00+) rows.
+        db = _build_many_db(tmp_path, 130)
+        pins = [_pin("R_A", "S", "Shared", route_type=1)]
+        now = datetime(2026, 6, 1, 9, 0, 0)
+        result = aggregate_board(
+            db, pins, now, local_tz=MEL, now_utc=NOW_UTC, realtime_enabled=False,
+            lookback=timedelta(hours=2),
+        )
+        trip_ids = [r.trip_id for r in result.rows]
+        assert "T_A_120" in trip_ids  # 07:00 + 120min = 09:00 (upcoming)
+        # All surfaced rows are at/after now.
+        assert all(r.effective_departure >= now for r in result.rows)
+
+
+# ---------------------------------------------------------------------------
+# F1b: cross-service-date ordering (repository)
+# ---------------------------------------------------------------------------
+
+
+def _build_pm_db(tmp_path: Path) -> Path:
+    """Daily service with a post-midnight (31:30) trip and a same-day (08:00) trip."""
+    stops = [{"stop_id": "S", "stop_name": "S", "stop_lat": -37.8, "stop_lon": 144.9,
+              "stop_code": "S", "location_type": None, "parent_station": "",
+              "platform_code": "", "wheelchair_boarding": 0}]
+    routes = [{"route_id": "R", "route_short_name": "1", "route_long_name": "Line",
+               "route_type": 1, "route_color": "000000"}]
+    trips = [
+        {"trip_id": "T_PM", "route_id": "R", "service_id": "SVC", "shape_id": "",
+         "trip_headsign": "D", "direction_id": 0, "block_id": ""},
+        {"trip_id": "T_AM", "route_id": "R", "service_id": "SVC", "shape_id": "",
+         "trip_headsign": "D", "direction_id": 0, "block_id": ""},
+    ]
+    stop_times = [
+        {"trip_id": "T_PM", "stop_id": "S", "stop_sequence": 1,
+         "arrival_time": "31:30:00", "departure_time": "31:30:00"},
+        {"trip_id": "T_AM", "stop_id": "S", "stop_sequence": 1,
+         "arrival_time": "08:00:00", "departure_time": "08:00:00"},
+    ]
+    calendar = [{"service_id": "SVC", "start_date": "20260520", "end_date": "20260701",
+                 "monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+                 "friday": 1, "saturday": 1, "sunday": 1}]
+    return import_bundle(tmp_path, routes=routes, trips=trips, stops=stops,
+                         stop_times=stop_times, calendar=calendar)
+
+
+class TestCrossDateOrdering:
+    def test_post_midnight_orders_by_real_time(self, tmp_path):
+        db = _build_pm_db(tmp_path)
+        now = datetime(2026, 6, 1, 8, 0, 0)  # Monday
+        rows = next_departures(db, "S", now, limit=10, lookback_seconds=2700)
+        # The post-midnight T_PM (Monday 07:30, from Sunday's service date) must
+        # sort BEFORE T_AM (Monday 08:00) by real wall-clock time.
+        times = [r.scheduled_departure for r in rows]
+        assert times == sorted(times)
+        assert rows[0].trip_id == "T_PM"
+        assert rows[0].scheduled_departure == datetime(2026, 6, 1, 7, 30, 0)
+
+
+# ---------------------------------------------------------------------------
+# F2: sequence-zero presence
+# ---------------------------------------------------------------------------
+
+
+class TestSequenceZero:
+    def test_sequence_zero_lands_in_by_sequence(self):
+        feed = _feed("T", [{"stop_id": "S", "seq": 0, "delay": 30}])
+        index = parse_trip_updates_index(feed)
+        assert ("T", 0) in index.by_sequence
+        assert index.by_sequence[("T", 0)].delay_seconds == 30
+
+    def test_sequence_zero_joins(self):
+        update = TripStopUpdate(delay_seconds=30, absolute_time=None, is_skipped=False)
+        index = TripUpdateIndex(
+            by_sequence={("T", 0): update},
+            by_stop_id={},
+            trip_cancelled={},
+            trip_skipped_count={},
+        )
+        assert ba._lookup_update(index, "T", 0, "S") is update
+
+
+# ---------------------------------------------------------------------------
+# F3: selector conjunction + zero-selector
+# ---------------------------------------------------------------------------
+
+
+class TestSelectorConjunction:
+    def test_agency_conjunction_with_route_cross_mode(self):
+        # Selector names route R_A AND agency on the metro feed; a bus-mode pin
+        # on R_A must NOT match (agency is conjuncted, not bypassed).
+        pins = {p.pin_key: p for p in [_pin("R_A", "S", "S", route_type=3)]}
+        trips = {k: set() for k in pins}
+        alert = _alert(selectors=(_sel(agency_id="X", route_id="R_A"),),
+                       feed_mode="metro")
+        assert match_board_alerts([alert], pins, trips, NOW_UTC) == []
+
+    def test_agency_route_type_conjunction_matches_same_feed(self):
+        pins = {p.pin_key: p for p in [_pin("R_A", "S", "S", route_type=1)]}
+        trips = {k: set() for k in pins}
+        alert = _alert(selectors=(_sel(agency_id="X", route_type_id=1),),
+                       feed_mode="metro")
+        matched = match_board_alerts([alert], pins, trips, NOW_UTC)
+        assert len(matched) == 1
+        assert set(matched[0].matches[0].reasons) == {"agency", "route_type"}
+
+    def test_zero_selector_matches_all_pins(self):
+        pins = {
+            _pin(R_FRANKSTON, RICHMOND, "Richmond").pin_key:
+                _pin(R_FRANKSTON, RICHMOND, "Richmond"),
+            _pin(R_WERRIBEE, RICHMOND, "Richmond").pin_key:
+                _pin(R_WERRIBEE, RICHMOND, "Richmond"),
+        }
+        trips = {k: set() for k in pins}
+        alert = _alert(selectors=())  # no informed_entity selectors
+        matched = match_board_alerts([alert], pins, trips, NOW_UTC)
+        assert {m.pin_key for m in matched[0].matches} == set(pins)
+
+
+# ---------------------------------------------------------------------------
+# F4: legacy parser precedence
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyPrecedence:
+    def test_arrival_delay_when_departure_has_absolute_time(self):
+        # departure carries only an absolute time; arrival carries a delay.  The
+        # legacy flat map must report the arrival delay (historical precedence),
+        # while the board index prefers the absolute time (deliberate divergence).
+        feed = rt.FeedMessage()
+        entity = feed.entity.add()
+        entity.id = "t"
+        tu = entity.trip_update
+        tu.trip.trip_id = "T"
+        stu = tu.stop_time_update.add()
+        stu.stop_id = "S"
+        stu.departure.time = 1_750_000_000
+        stu.arrival.delay = 120
+
+        legacy = parse_trip_updates(feed)
+        assert legacy["T:S"].delay_seconds == 120  # arrival delay, not 0
+
+        index = parse_trip_updates_index(feed)
+        # No stop_sequence → lands in by_stop_id; the board index carries the
+        # absolute time (delay None), deliberately divergent from the legacy map.
+        updates = index.by_stop_id[("T", "S")]
+        assert len(updates) == 1
+        assert updates[0].delay_seconds is None
+        assert updates[0].absolute_time is not None
+
+
+# ---------------------------------------------------------------------------
+# F5: fetch-port shape + per-feed isolation
+# ---------------------------------------------------------------------------
+
+
+class ProductionLikeClient:
+    """Mimics PTVRealtimeClient: bare ``fetch_feed`` + ``fetch_feed_with_meta``."""
+
+    def __init__(self, feeds):
+        self.feeds = feeds
+        self.meta_calls: list[tuple[str, str]] = []
+
+    async def fetch_feed(self, mode, feed_type):
+        r = self.feeds[(mode, feed_type)]
+        if isinstance(r, Exception):
+            raise r
+        feed, _meta = r
+        return feed  # bare feed (like the production plain fetch_feed)
+
+    async def fetch_feed_with_meta(self, mode, feed_type):
+        self.meta_calls.append((mode, feed_type))
+        return self.feeds[(mode, feed_type)]
+
+
+class TestFetchPort:
+    async def test_production_client_meta_port_used(self):
+        delay_feed = _decode_feed(load_bytes("trip_update_delay"))
+        meta = FeedMeta(header_timestamp=NOW_UTC, fetched_at=NOW_UTC)
+        client = ProductionLikeClient({
+            ("metro", "trip-updates"): (delay_feed, meta),
+            ("metro", "service-alerts"): (_decode_feed(load_bytes("header_tick_0")), meta),
+        })
+        data = await fetch_board_realtime(
+            client, [_pin(R_FRANKSTON, RICHMOND, route_type=1)], True, now=NOW_UTC,
+        )
+        assert client.meta_calls  # fetch_feed_with_meta was preferred
+        assert data.trip_updates is not None
+        assert data.feed_health[("metro", "trip-updates")].state == FEED_OK
+
+    async def test_bare_feed_client_is_wrapped(self):
+        # A client exposing only bare fetch_feed (no meta) is wrapped with an
+        # empty FeedMeta → classified fresh, still parsed.
+        feed = _decode_feed(load_bytes("trip_update_delay"))
+
+        class BareClient:
+            async def fetch_feed(self, mode, feed_type):
+                return feed
+
+        data = await fetch_board_realtime(
+            BareClient(), [_pin(R_FRANKSTON, RICHMOND, route_type=1)], True, now=NOW_UTC,
+        )
+        assert data.trip_updates is not None
+        assert data.feed_health[("metro", "trip-updates")].state == FEED_OK
+
+    async def test_parser_exception_isolated(self, monkeypatch):
+        good = _decode_feed(load_bytes("trip_update_delay"))
+        empty = _decode_feed(load_bytes("header_tick_0"))
+        client = CountingClient({
+            ("metro", "trip-updates"): (good, FeedMeta(NOW_UTC, NOW_UTC)),
+            ("metro", "service-alerts"): (empty, FeedMeta(NOW_UTC, NOW_UTC)),
+        })
+
+        def boom(feed, **kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ba, "parse_service_alerts", boom)
+        data = await fetch_board_realtime(
+            client, [_pin(R_FRANKSTON, RICHMOND, route_type=1)], True, now=NOW_UTC,
+        )
+        # Trip-updates feed healthy; the failing service-alert feed isolated.
+        assert data.feed_health[("metro", "trip-updates")].state == FEED_OK
+        assert data.feed_health[("metro", "service-alerts")].state == FEED_FAILED
+        assert data.trip_updates is not None
+
+
+# ---------------------------------------------------------------------------
+# F1 (round 5): destination eligibility pushed into SQL → pagination correct
+# ---------------------------------------------------------------------------
+
+
+def _build_dest_db(tmp_path: Path, n_other: int, n_dest: int) -> Path:
+    """A route where the first ``n_other`` trips go O→B (not the destination) and
+    the last ``n_dest`` trips go O→D (the destination), all 1 min apart."""
+    stops = [
+        {"stop_id": "O", "stop_name": "Origin", "stop_lat": -37.8, "stop_lon": 144.9,
+         "stop_code": "O", "location_type": None, "parent_station": "",
+         "platform_code": "", "wheelchair_boarding": 0},
+        {"stop_id": "B", "stop_name": "Other", "stop_lat": -37.9, "stop_lon": 144.9,
+         "stop_code": "B", "location_type": None, "parent_station": "",
+         "platform_code": "", "wheelchair_boarding": 0},
+        {"stop_id": "D", "stop_name": "Dest", "stop_lat": -38.0, "stop_lon": 144.9,
+         "stop_code": "D", "location_type": None, "parent_station": "",
+         "platform_code": "", "wheelchair_boarding": 0},
+    ]
+    routes = [{"route_id": "R_D", "route_short_name": "1", "route_long_name": "Line",
+               "route_type": 1, "route_color": "000000"}]
+    trips = []
+    stop_times = []
+    for i in range(n_other):
+        tid = f"T_B_{i:03d}"
+        trips.append({"trip_id": tid, "route_id": "R_D", "service_id": "SVC",
+                      "shape_id": "", "trip_headsign": "B", "direction_id": 0,
+                      "block_id": ""})
+        t = 7 * 3600 + i * 60
+        stop_times.append({"trip_id": tid, "stop_id": "O", "stop_sequence": 1,
+                           "arrival_time": _hms(t), "departure_time": _hms(t)})
+        stop_times.append({"trip_id": tid, "stop_id": "B", "stop_sequence": 2,
+                           "arrival_time": _hms(t + 600), "departure_time": _hms(t + 600)})
+    for i in range(n_dest):
+        tid = f"T_D_{i:03d}"
+        trips.append({"trip_id": tid, "route_id": "R_D", "service_id": "SVC",
+                      "shape_id": "", "trip_headsign": "D", "direction_id": 0,
+                      "block_id": ""})
+        t = 9 * 3600 + i * 60
+        stop_times.append({"trip_id": tid, "stop_id": "O", "stop_sequence": 1,
+                           "arrival_time": _hms(t), "departure_time": _hms(t)})
+        stop_times.append({"trip_id": tid, "stop_id": "D", "stop_sequence": 2,
+                           "arrival_time": _hms(t + 600), "departure_time": _hms(t + 600)})
+    calendar = [{"service_id": "SVC", "start_date": "20260520", "end_date": "20260701",
+                 "monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+                 "friday": 1, "saturday": 1, "sunday": 1}]
+    return import_bundle(tmp_path, routes=routes, trips=trips, stops=stops,
+                         stop_times=stop_times, calendar=calendar)
+
+
+class TestDestinationFilterPagination:
+    def test_zero_match_first_page_surfaces_destination_rows(self, tmp_path):
+        # 120 O→B trips (07:00..08:59) precede 10 O→D trips (09:00..09:09).  A
+        # destination=D pin must surface the D trips even though the first page
+        # of raw route rows would be entirely ineligible.
+        db = _build_dest_db(tmp_path, 120, 10)
+        pins = [_pin("R_D", "O", "Origin", all_dest=False, dest="D", route_type=1)]
+        result = aggregate_board(db, pins, BASE, local_tz=MEL, now_utc=NOW_UTC,
+                                 realtime_enabled=False)
+        trip_ids = [r.trip_id for r in result.rows]
+        assert trip_ids and all(t.startswith("T_D_") for t in trip_ids)
+        assert sorted(trip_ids) == [f"T_D_{i:03d}" for i in range(10)]
+
+    def test_partial_first_page_surfaces_rows_beyond(self, tmp_path):
+        # 60 O→B + 130 O→D: the D trips span two pages; all 130 must surface.
+        db = _build_dest_db(tmp_path, 60, 130)
+        pins = [_pin("R_D", "O", "Origin", all_dest=False, dest="D", route_type=1)]
+        result = aggregate_board(
+            db, pins, datetime(2026, 6, 1, 9, 0, 0), local_tz=MEL, now_utc=NOW_UTC,
+            realtime_enabled=False, horizon=timedelta(hours=3),
+        )
+        trip_ids = sorted(r.trip_id for r in result.rows)
+        assert all(t.startswith("T_D_") for t in trip_ids)
+        assert len(trip_ids) > 100  # paginated past the first page
+
+
+# ---------------------------------------------------------------------------
+# F2 (round 5): generation pinning + restart-on-swap
+# ---------------------------------------------------------------------------
+
+
+class TestGenerationPinning:
+    def test_pages_pin_one_resolved_snapshot(self, tmp_path, monkeypatch):
+        db = _build_many_db(tmp_path, 130)  # 2 pages
+        captured: list = []
+
+        real_next = ba.next_departures
+
+        def fake_next(db_path, *args, **kwargs):
+            captured.append(kwargs.get("resolved_db"))
+            return real_next(db_path, *args, **kwargs)
+
+        monkeypatch.setattr(ba, "next_departures", fake_next)
+        pins = [_pin("R_A", "S", "Shared", route_type=1)]
+        aggregate_board(db, pins, datetime(2026, 6, 1, 9, 0, 0), local_tz=MEL,
+                        now_utc=NOW_UTC, realtime_enabled=False,
+                        lookback=timedelta(hours=2))
+        # Every page used the SAME resolved generation path.
+        assert len(captured) > 1
+        assert len(set(captured)) == 1
+
+    def test_generation_swap_restarts_once(self, tmp_path, monkeypatch):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        gen_a_anchor = _build_many_db(tmp_path / "a", 130, "A_")
+        gen_b_anchor = _build_many_db(tmp_path / "b", 150, "B_")
+        # Resolve the REAL generation files before monkeypatching.
+        gen_a = ba.store.resolve_db(gen_a_anchor)
+        gen_b = ba.store.resolve_db(gen_b_anchor)
+
+        calls = {"n": 0}
+
+        def fake_resolve(anchor):
+            calls["n"] += 1
+            return gen_b if calls["n"] >= 3 else gen_a
+
+        monkeypatch.setattr(ba.store, "resolve_db", fake_resolve)
+
+        pins = [_pin("R_A", "S", "Shared", route_type=1)]
+        result = aggregate_board(
+            tmp_path / "gtfs.db", pins, datetime(2026, 6, 1, 9, 0, 0),
+            local_tz=MEL, now_utc=NOW_UTC, realtime_enabled=False,
+            lookback=timedelta(hours=2),
+        )
+        trip_ids = [r.trip_id for r in result.rows]
+        # Coherent: all rows from the fresh generation (B_), none from the old (A_).
+        assert trip_ids and all(t.startswith("B_") for t in trip_ids)
+        assert not any(t.startswith("A_") for t in trip_ids)
+        assert len(trip_ids) == len(set(trip_ids))  # no duplicates
+        # A restart was detected (more than a single pin+page resolution).
+        assert calls["n"] >= 3

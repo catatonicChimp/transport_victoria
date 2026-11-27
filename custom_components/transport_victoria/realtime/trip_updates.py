@@ -147,8 +147,9 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
                 start_time=start_time,
             )
 
-            if has_seq and stop_sequence:
-                # Primary key: unambiguous even for a loop trip.
+            if has_seq:
+                # Primary key: unambiguous even for a loop trip.  Presence-only,
+                # so an explicit stop_sequence == 0 still keys here.
                 by_sequence[(trip_id, stop_sequence)] = update
             elif stop_id and not has_seq:
                 # Secondary fallback: keyed by stop_id, may be ambiguous.
@@ -242,11 +243,29 @@ def parse_trip_updates(feed: object) -> dict[str, StopDelay]:
             stop_id = stu.stop_id
             if not stop_id:
                 continue
-            delay, _ = _prediction(stu)
             result[f"{trip_id}:{stop_id}"] = StopDelay(
-                delay_seconds=delay if delay is not None else 0,
+                delay_seconds=_legacy_delay(stu),
                 is_cancelled=is_cancelled,
                 is_skipped=stu.schedule_relationship == _STU_SKIPPED,
             )
 
     return result
+
+
+def _legacy_delay(stu: object) -> int:
+    """Historical delay precedence for the legacy flat map.
+
+    The watch coordinator's :class:`StopDelay` has no absolute-time field, so the
+    legacy map is DELIBERATELY divergent from the board index (:func:`_prediction`,
+    which prefers an absolute ``time`` over an arrival ``delay``).  It restores the
+    pre-T9 behaviour: ``departure.delay`` → ``arrival.delay`` → ``0``, so a stop
+    whose departure carries only an absolute time but whose arrival carries a
+    delay still reports that arrival delay (never a misleading 0).
+    """
+    for event_name in ("departure", "arrival"):
+        if not _has_msg_field(stu, event_name):
+            continue
+        event = getattr(stu, event_name)
+        if _has_int_field(event, "delay"):
+            return int(event.delay)
+    return 0

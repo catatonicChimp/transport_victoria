@@ -89,6 +89,7 @@ from .const import (
     MODE_TRAM,
     MODE_VLINE,
 )
+from .gtfs import store
 from .gtfs.repository import DepartureRow, next_departures
 from .realtime.client import FeedMeta
 from .realtime.service_alerts import (
@@ -125,9 +126,23 @@ SCHEDULE_LOOKBACK = timedelta(minutes=45)
 # Upper bound on how far ahead the board looks (replaces an unbounded LIMIT-only
 # query so a sparse stop cannot spill arbitrarily far into the future).
 SCHEDULE_HORIZON = timedelta(hours=3)
-# Candidates fetched per pin, before cross-pin dedupe + effective-time windowing.
-# Over-fetched so significant realtime reordering cannot starve the top-N rows.
-_PER_PIN_LIMIT = 40
+# Page size for walking a pin's full bounded window (lookback..horizon).  The
+# aggregation paginates rather than truncating, so a pin with many past
+# departures in the lookback cannot starve its upcoming rows; the display limit
+# is applied only after the effective-time filter.
+_PER_PIN_PAGE = 100
+
+
+class _GenerationSwapped(Exception):
+    """Raised internally when the GTFS generation pointer changes mid-aggregation.
+
+    Carries the freshly-resolved generation (or None if resolution itself
+    failed) so the caller can restart once with a single coherent snapshot.
+    """
+
+    def __init__(self, new_generation) -> None:
+        self.new_generation = new_generation
+        super().__init__("GTFS generation swapped during board aggregation")
 
 # --- Freshness thresholds -------------------------------------------------
 # A feed whose header/fetch timestamp is older than this is "stale".
@@ -277,23 +292,30 @@ async def fetch_board_realtime(
 
     Runs in two phases:
 
-    * **I/O (on the event loop):** ``client.fetch_feed(mode, feed_type)`` is
-      awaited once per distinct ``(mode, feed_type)`` — N pins on one mode make
-      exactly one request per feed type, no multiplication.  The port MUST
-      return ``(feed, FeedMeta)`` so freshness is classified from the fetched
-      data itself (production: ``PTVRealtimeClient.fetch_feed_with_meta``).
+    * **I/O (on the event loop):** the client's feed port is awaited once per
+      distinct ``(mode, feed_type)`` — N pins on one mode make exactly one
+      request per feed type, no multiplication.  The port returns
+      ``(feed, FeedMeta)`` so freshness is classified from the fetched data
+      itself.  Two port shapes are accepted: a client exposing
+      ``fetch_feed_with_meta`` (the production ``PTVRealtimeClient``) is used
+      directly; otherwise ``fetch_feed`` is called and its return value detected
+      (a 2-tuple ``(feed, FeedMeta)`` is used as-is, a bare feed is wrapped with
+      ``FeedMeta(header_timestamp=None)``).
     * **Parse (offloaded):** all protobuf parsing runs inside
       :func:`_parse_fetched` via ``run_sync`` — by default ``asyncio.to_thread``
       so the blocking C-extension decode never touches the event loop (matching
       the realtime client's decode-in-executor pattern and T2's sqlite pattern).
       The T10 coordinator adapter must keep this offload in place.
 
-    A per-feed failure is recorded in ``feed_health`` and never raised; the
-    board stays healthy and falls back to scheduled data.
+    A per-feed failure — the fetch itself, a malformed return shape, freshness
+    classification, or a parser exception — is isolated and recorded in
+    ``feed_health`` and never raised; one bad feed leaves the others and the
+    board healthy (falling back to scheduled data).
 
     Args:
-        client: Realtime client exposing ``async fetch_feed(mode, feed_type)
-            -> (feed, FeedMeta)``.
+        client: Realtime client.  Either exposes ``async fetch_feed_with_meta(
+            mode, feed_type) -> (feed, FeedMeta)`` or ``async fetch_feed(mode,
+            feed_type) -> (feed, FeedMeta) | feed``.
         pins: The board's pins (order-independent here).
         realtime_enabled: False short-circuits all fetches (empty result).
         now: Aware UTC clock for freshness classification (defaults to now).
@@ -320,13 +342,33 @@ async def fetch_board_realtime(
     for mode in modes:
         for feed_type in (FEED_TRIP_UPDATES, FEED_SERVICE_ALERTS):
             try:
-                fetched[(mode, feed_type)] = await client.fetch_feed(mode, feed_type)
+                fetched[(mode, feed_type)] = await _fetch_with_meta(
+                    client, mode, feed_type
+                )
             except Exception as exc:  # noqa: BLE001 - per-feed isolation
                 fetched[(mode, feed_type)] = exc
 
     # --- Parse phase (offloaded) -------------------------------------------
     run_sync = run_sync or asyncio.to_thread
     return await run_sync(_parse_fetched, fetched, modes, now)
+
+
+async def _fetch_with_meta(client, mode: str, feed_type: str):
+    """Call the client's feed port and normalise to ``(feed, FeedMeta)``.
+
+    Prefers ``fetch_feed_with_meta`` (the production port).  Otherwise calls
+    ``fetch_feed`` and detects the return shape: a 2-tuple ``(feed, FeedMeta)``
+    is used as-is (custom fakes), a bare feed is wrapped with an empty
+    :class:`FeedMeta` (no header timestamp, no fetch time).
+    """
+    fetch_meta = getattr(client, "fetch_feed_with_meta", None)
+    if fetch_meta is not None:
+        return await fetch_meta(mode, feed_type)
+
+    result = await client.fetch_feed(mode, feed_type)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], FeedMeta):
+        return result
+    return result, FeedMeta(header_timestamp=None, fetched_at=None)
 
 
 def _parse_fetched(
@@ -357,22 +399,30 @@ def _parse_fetched(
                 feed_health[key] = FeedHealth(FEED_FAILED)
                 continue
 
-            feed, meta = result  # type: ignore[misc]
-            state, age = _classify_freshness(meta, now)
-            feed_health[key] = FeedHealth(state, age)
+            # One malformed feed (bad tuple shape, bad metadata, or a parser
+            # exception) must not sink the others: isolate each entirely.
+            try:
+                feed, meta = result
+                state, age = _classify_freshness(meta, now)
+                feed_health[key] = FeedHealth(state, age)
 
-            if feed_type == FEED_TRIP_UPDATES:
-                index = parse_trip_updates_index(feed)
-                by_sequence.update(index.by_sequence)
-                by_stop_id.update(index.by_stop_id)
-                trip_cancelled.update(index.trip_cancelled)
-                trip_skipped_count.update(index.trip_skipped_count)
-                any_trip_feed = True
-                if state == FEED_STALE:
-                    stale_modes.add(mode)
-            else:  # service alerts
-                # Alerts never affect a departure's realtime_state.
-                alerts.extend(parse_service_alerts(feed, feed_mode=mode))
+                if feed_type == FEED_TRIP_UPDATES:
+                    index = parse_trip_updates_index(feed)
+                    by_sequence.update(index.by_sequence)
+                    by_stop_id.update(index.by_stop_id)
+                    trip_cancelled.update(index.trip_cancelled)
+                    trip_skipped_count.update(index.trip_skipped_count)
+                    any_trip_feed = True
+                    if state == FEED_STALE:
+                        stale_modes.add(mode)
+                else:  # service alerts
+                    # Alerts never affect a departure's realtime_state.
+                    alerts.extend(parse_service_alerts(feed, feed_mode=mode))
+            except Exception as exc:  # noqa: BLE001 - per-feed isolation
+                _LOGGER.warning(
+                    "feed parse failed for %s/%s: %s", mode, feed_type, exc
+                )
+                feed_health[key] = FeedHealth(FEED_FAILED)
 
     trip_updates: TripUpdateIndex | None = None
     if any_trip_feed:
@@ -474,8 +524,16 @@ def aggregate_board(
        ``alert_id`` and capped).
     7. Compute the :func:`sync_index` fingerprint (pin-order + TZ independent).
 
+    Generation snapshot: the schedule is resolved to ONE generation at the
+    start, and every page in the pagination queries that pinned file (passed as
+    ``resolved_db``).  If the pointer swaps mid-computation (or resolution
+    fails), the aggregation restarts ONCE with the fresh snapshot, so a result
+    never mixes rows from two generations.
+
     Args:
-        db_path: GTFS generation anchor (resolved via ``store.resolve``).
+        db_path: GTFS generation anchor (resolved via ``store.resolve``); the
+            schedule is pinned to ONE generation for the whole computation (see
+            the generation-snapshot note above).
         pins: Pins in canonical display order (order index = list position).
         now: Local naive datetime (drives the schedule query + sort).
         local_tz: tzinfo for converting absolute RT times to local (and a naive
@@ -519,36 +577,25 @@ def aggregate_board(
         kept.append((idx, pin))
 
     # --- Build raw rows (pin order), then window + dedupe + sort ----------
-    trips_by_pin: dict[str, set[str]] = {}
-    raw_rows: list[BoardDeparture] = []
     horizon_dt = now + horizon
 
-    for pin_index, pin in kept:
-        destination = None if pin.all_destinations else pin.destination_stop_id
-        pin_mode = route_type_to_mode(pin.route_type)
-        pin_stale = pin_mode in stale_modes
-
-        departure_rows = next_departures(
-            db_path,
-            pin.boarding_stop_id,
-            now,
-            limit=_PER_PIN_LIMIT,
-            direction_stop_id=destination,
-            route_id_filter=pin.route_id,
-            platform_filter=pin.platform_filter,
-            lookback_seconds=int(lookback.total_seconds()),
-        )
-
-        pin_trips: set[str] = set()
-        for row in departure_rows:
-            pin_trips.add(row.trip_id)
-            dep = _build_departure(
-                pin, pin_index, row, trip_updates, realtime_enabled, pin_stale,
-                local_tz,
+    # Pin ONE generation snapshot for the whole pagination sequence.  If the
+    # pointer swaps (or resolution fails) mid-computation, restart ONCE with the
+    # fresh snapshot so the board never mixes rows from two generations.
+    pinned = store.resolve_db(db_path)
+    raw_rows: list[BoardDeparture] = []
+    trips_by_pin: dict[str, set[str]] = {}
+    for _attempt in range(2):
+        try:
+            raw_rows, trips_by_pin = _collect_departures(
+                db_path, pinned, kept, now, horizon_dt, lookback,
+                trip_updates, realtime_enabled, stale_modes, local_tz,
             )
-            if _in_window(dep, now, horizon_dt, lookback):
-                raw_rows.append(dep)
-        trips_by_pin[pin.pin_key] = pin_trips
+            break  # success — one coherent snapshot
+        except _GenerationSwapped as exc:
+            pinned = exc.new_generation or store.resolve_db(db_path)
+            raw_rows = []
+            trips_by_pin = {}
 
     rows = _dedupe(raw_rows)
     rows.sort(key=_departure_sort_key)
@@ -572,6 +619,84 @@ def aggregate_board(
         sync_index=compute_sync_index(rows),
         generated_at=now,
     )
+
+
+def _collect_departures(
+    db_path: Path,
+    pinned: Path,
+    kept: list[tuple[int, PinData]],
+    now: datetime,
+    horizon_dt: datetime,
+    lookback: timedelta,
+    trip_updates: TripUpdateIndex | None,
+    realtime_enabled: bool,
+    stale_modes: frozenset[str],
+    local_tz: tzinfo,
+) -> tuple[list[BoardDeparture], dict[str, set[str]]]:
+    """Build all pins' in-window departure rows against ONE pinned generation.
+
+    Raises :class:`_GenerationSwapped` when the generation pointer resolves to a
+    different path mid-computation (checked before each page), so the caller can
+    restart with a fresh, coherent snapshot instead of mixing two generations.
+    """
+    raw_rows: list[BoardDeparture] = []
+    trips_by_pin: dict[str, set[str]] = {}
+
+    for pin_index, pin in kept:
+        destination = None if pin.all_destinations else pin.destination_stop_id
+        pin_mode = route_type_to_mode(pin.route_type)
+        pin_stale = pin_mode in stale_modes
+
+        pin_trips: set[str] = set()
+        # Paginate the pin's full bounded window (lookback..horizon) so a large
+        # number of past departures can't hide upcoming rows; the display limit
+        # is applied only after the effective-time filter (see aggregate_board).
+        offset = 0
+        while True:
+            # Detect an activation swap: re-resolve and compare to the snapshot.
+            try:
+                current = store.resolve_db(db_path)
+            except Exception:  # noqa: BLE001 - resolution error → restart
+                current = None
+            if current != pinned:
+                raise _GenerationSwapped(current)
+
+            page = next_departures(
+                db_path,
+                pin.boarding_stop_id,
+                now,
+                limit=_PER_PIN_PAGE,
+                offset=offset,
+                direction_stop_id=destination,
+                route_id_filter=pin.route_id,
+                platform_filter=pin.platform_filter,
+                lookback_seconds=int(lookback.total_seconds()),
+                resolved_db=pinned,
+            )
+            if not page:
+                break
+
+            past_horizon = False
+            for row in page:
+                # Rows are sorted by absolute scheduled time; stop once we pass
+                # the horizon (nothing later can belong on the board).
+                if row.scheduled_departure > horizon_dt:
+                    past_horizon = True
+                    break
+                pin_trips.add(row.trip_id)
+                dep = _build_departure(
+                    pin, pin_index, row, trip_updates, realtime_enabled, pin_stale,
+                    local_tz,
+                )
+                if _in_window(dep, now, horizon_dt, lookback):
+                    raw_rows.append(dep)
+
+            offset += len(page)
+            if past_horizon or len(page) < _PER_PIN_PAGE:
+                break
+        trips_by_pin[pin.pin_key] = pin_trips
+
+    return raw_rows, trips_by_pin
 
 
 def _in_window(
@@ -811,6 +936,10 @@ def _selector_kinds(
     """Return the matching reason kinds across the alert's selectors (OR), or
     None when none match.  Within each selector the populated fields are ANDed."""
     pin_mode = route_type_to_mode(pin.route_type)
+    if not alert.selectors:
+        # An alert with no informed_entity selectors is unscoped → matches every
+        # pin (agency-wide).
+        return frozenset({"agency"})
     kinds: set[str] = set()
     for selector in alert.selectors:
         matched = _selector_match(selector, pin, pin_trips, pin_mode, alert.feed_mode)
@@ -826,8 +955,20 @@ def _selector_match(
     pin_mode: str | None,
     feed_mode: str | None,
 ) -> tuple[str, ...] | None:
-    """AND across a selector's populated fields; return the matching kinds."""
+    """AND across a selector's populated fields; return the matching kinds.
+
+    The agency/feed scope is part of the conjunction, never short-circuited: a
+    selector naming an agency (or bound to a feed) additionally requires the pin
+    to belong to that feed/mode, alongside every other populated field.
+    """
     kinds: list[str] = []
+    # Agency/feed scope — conjuncted with everything else.  In the
+    # single-feed-per-mode model the alert's ``feed_mode`` IS the agency, so an
+    # agency-scoped selector matches only pins on that feed.
+    if selector.agency_id is not None:
+        if feed_mode is not None and pin_mode != feed_mode:
+            return None
+        kinds.append("agency")
     if selector.route_type_id is not None:
         if pin.route_type != selector.route_type_id:
             return None
@@ -852,13 +993,8 @@ def _selector_match(
     if kinds:
         return tuple(kinds)
 
-    # No route/stop/trip/route_type/direction scope.
-    if selector.agency_id is not None:
-        # Agency-scoped: matches pins on the same feed/mode (implicit agency).
-        if feed_mode is not None and pin_mode == feed_mode:
-            return ("agency",)
-        return None
-    return ("agency",)  # truly unscoped → matches everything
+    # No populated fields at all → matches everything.
+    return ("agency",)
 
 
 # ---------------------------------------------------------------------------

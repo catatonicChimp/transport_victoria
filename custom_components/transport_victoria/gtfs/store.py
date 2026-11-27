@@ -195,11 +195,14 @@ def resolve_generation(anchor: Path) -> Path | None:
     ptr = read_pointer(anchor)
     if ptr is not None:
         gen = generations_dir(anchor) / ptr["generation"]
+        key = str(pointer_path(anchor)) + ":" + ptr["generation"]
         if gen.is_file():
+            # Generation is present again — reset the dedupe so a FUTURE
+            # disappearance is logged afresh (mirrors _warned_pointers).
+            _warned_missing_generations.discard(key)
             return gen
         # Deduped like malformed-pointer warnings so a persistently missing
         # generation doesn't spam the log on every resolve.
-        key = str(pointer_path(anchor)) + ":" + ptr["generation"]
         if key not in _warned_missing_generations:
             _warned_missing_generations.add(key)
             _LOGGER.warning(
