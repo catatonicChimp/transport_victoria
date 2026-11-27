@@ -113,12 +113,22 @@ from .routing.destination import (
     resolve_destination,
 )
 from .routing.path_finder import validate_route
+from .watch_import import (
+    REASON_LABELS,
+    STALE_LABELS,
+    WatchMapping,
+    map_watches,
+)
 from . import async_trigger_gtfs_refresh
 
 _LOGGER = logging.getLogger(__name__)
 
 # Sentinel value used in the destination selector to mean "all destinations"
 _ALL_DESTINATIONS_KEY = "__all__"
+
+# Entry-type menu value that branches into the T11 "import watches as a board"
+# flow (not a persisted entry type — the created entry is always a board).
+_IMPORT_OPTION = "import"
 
 
 def _data_dir(hass_config_path: str) -> Path:
@@ -194,6 +204,12 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         # Step to redirect to after GTFS download/import completes.
         # "stop" for departure watches; "route_tracker_route" for route trackers.
         self._post_import_step: str = "stop"
+        # T11 watch-import scratch state (populated between the select and
+        # summary steps; never persisted to the created board entry).
+        self._import_watch_ids: list[str] = []
+        self._import_board_name: str = ""
+        self._import_skipped: list[tuple[str, str]] = []
+        self._import_stale: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------
     # Step 1 — API key (skipped if a key is already stored)
@@ -1044,6 +1060,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 return await self.async_step_route_tracker_mode()
             if entry_type == ENTRY_TYPE_BOARD:
                 return await self.async_step_board_name()
+            if entry_type == _IMPORT_OPTION:
+                return await self.async_step_import()
             # Default: departure watch — continue with mode selection
             return await self.async_step_mode()
 
@@ -1068,6 +1086,10 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                             selector.SelectOptionDict(
                                 value=ENTRY_TYPE_BOARD,
                                 label="Trip-Group Board (multiple lines at a stop)",
+                            ),
+                            selector.SelectOptionDict(
+                                value=_IMPORT_OPTION,
+                                label="Trip-Group Board — import from existing watches",
                             ),
                         ],
                         mode=selector.SelectSelectorMode.LIST,
@@ -1117,6 +1139,216 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             data_schema=vol.Schema({
                 vol.Required(CONF_BOARD_NAME, default="Departure Board"): selector.TextSelector(),
             }),
+        )
+
+    # ------------------------------------------------------------------
+    # T11 — Import existing watches into a new trip-group board
+    # ------------------------------------------------------------------
+
+    async def async_step_import(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Select one or more compatible watches to import into a new board.
+
+        Lists the CURRENT compatible watches (non-journey, non-tracker, with a
+        resolvable single line) as checkboxes plus a board name.  On submit the
+        selection is classified (imported / skipped / stale-flagged) and the
+        flow advances to the summary step.  Source entries are never touched.
+        """
+        db_path = _db_path(self.hass.config.config_dir)
+        entries = self.hass.config_entries.async_entries(DOMAIN)
+
+        watch_entries = [
+            e for e in entries
+            if e.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH) == ENTRY_TYPE_WATCH
+        ]
+        tracker_entries = [
+            e for e in entries
+            if e.data.get(CONF_ENTRY_TYPE) in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER)
+        ]
+
+        # Map all watches off the event loop (the mapper runs sqlite queries).
+        mappings: dict[str, WatchMapping] = await self.hass.async_add_executor_job(
+            map_watches, db_path, [(e.entry_id, e.data) for e in watch_entries]
+        )
+        compatible = [
+            (e, mappings[e.entry_id]) for e in watch_entries
+            if mappings[e.entry_id].compatible
+        ]
+
+        if not compatible:
+            return self.async_abort(reason="no_compatible_watches")
+
+        if user_input is not None:
+            selected = list(user_input.get("watch_ids") or [])
+            board_name = user_input.get(CONF_BOARD_NAME, "").strip()
+            errors: dict[str, str] = {}
+            if not selected:
+                errors["watch_ids"] = "select_at_least_one"
+            elif not board_name:
+                errors[CONF_BOARD_NAME] = "required"
+            if not errors:
+                self._import_watch_ids = selected
+                self._import_board_name = board_name
+                self._import_skipped = self._classify_skipped(
+                    watch_entries, tracker_entries, mappings
+                )
+                self._import_stale = [
+                    (
+                        self._entry_label(entry),
+                        "; ".join(
+                            STALE_LABELS[f] for f in mappings[entry.entry_id].stale_fields
+                        ),
+                    )
+                    for entry in watch_entries
+                    if entry.entry_id in selected
+                    and mappings[entry.entry_id].stale
+                ]
+                return await self.async_step_import_summary()
+            return self.async_show_form(
+                step_id="import",
+                data_schema=self._import_schema(compatible, board_name),
+                errors=errors,
+            )
+
+        return self.async_show_form(
+            step_id="import",
+            data_schema=self._import_schema(compatible, "Departure Board"),
+        )
+
+    @staticmethod
+    def _entry_label(entry: ConfigEntry) -> str:
+        """Return a stable display label for an entry (watch name → title)."""
+        return entry.data.get(CONF_WATCH_NAME) or entry.title or entry.entry_id
+
+    @staticmethod
+    def _classify_skipped(
+        watch_entries: list[ConfigEntry],
+        tracker_entries: list[ConfigEntry],
+        mappings: dict[str, WatchMapping],
+    ) -> list[tuple[str, str]]:
+        """Return ``(label, reason_label)`` for every entry that stays as-is.
+
+        Covers transfer journeys + incompatible all-lines watches (from the
+        watch mappings) and vehicle/route trackers (separate entry types).
+        """
+        skipped: list[tuple[str, str]] = []
+        for entry in watch_entries:
+            mapping = mappings[entry.entry_id]
+            if mapping.compatible:
+                continue
+            reason = REASON_LABELS.get(mapping.reason, mapping.reason or "incompatible")
+            skipped.append((PTVConfigFlow._entry_label(entry), reason))
+        for entry in tracker_entries:
+            skipped.append((PTVConfigFlow._entry_label(entry), REASON_LABELS["tracker"]))
+        return skipped
+
+    def _import_schema(
+        self, compatible: list[tuple[ConfigEntry, WatchMapping]], default_name: str
+    ) -> vol.Schema:
+        """Build the checkbox + board-name schema for the import select step."""
+        options = [
+            selector.SelectOptionDict(
+                value=e.entry_id, label=self._entry_label(e)
+            )
+            for e, _m in compatible
+        ]
+        return vol.Schema({
+            vol.Required("watch_ids"): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=options,
+                    multiple=True,
+                    mode=selector.SelectSelectorMode.LIST,
+                )
+            ),
+            vol.Required(CONF_BOARD_NAME, default=default_name): selector.TextSelector(),
+        })
+
+    async def async_step_import_summary(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show the import summary, then create the board with one pin per watch.
+
+        The summary lists imported ✓ entries, skipped entries (with reason), and
+        stale-flagged entries.  Submitting creates the board parent entry with
+        one pin subentry per selected compatible watch — via the same pin
+        derivation path T8 uses.  Source entries are never modified.
+        """
+        if user_input is not None:
+            return await self._create_imported_board()
+
+        imported = self._import_watch_ids
+        imported_labels = [
+            self._entry_label(
+                self.hass.config_entries.async_get_entry(entry_id)
+            )
+            for entry_id in imported
+            if self.hass.config_entries.async_get_entry(entry_id) is not None
+        ]
+        skipped_text = (
+            "\n".join(f"- {name}: {reason}" for name, reason in self._import_skipped)
+            or "- none"
+        )
+        stale_text = (
+            "\n".join(f"- {name}: {fields}" for name, fields in self._import_stale)
+            or "- none"
+        )
+
+        return self.async_show_form(
+            step_id="import_summary",
+            data_schema=vol.Schema({
+                vol.Required("confirm", default=True): selector.BooleanSelector(),
+            }),
+            description_placeholders={
+                "board_name": self._import_board_name,
+                "imported": "\n".join(f"- {n}" for n in imported_labels) or "- none",
+                "skipped": skipped_text,
+                "stale": stale_text,
+            },
+        )
+
+    async def _create_imported_board(self) -> ConfigFlowResult:
+        """Create the board parent entry with one pin subentry per watch."""
+        db_path = _db_path(self.hass.config.config_dir)
+        entries = self.hass.config_entries.async_entries(DOMAIN)
+        selected = [
+            e for e in entries
+            if e.entry_id in self._import_watch_ids
+            and e.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH) == ENTRY_TYPE_WATCH
+        ]
+
+        mappings: dict[str, WatchMapping] = await self.hass.async_add_executor_job(
+            map_watches, db_path, [(e.entry_id, e.data) for e in selected]
+        )
+
+        subentries: list[dict[str, Any]] = []
+        for entry in selected:
+            pin = mappings[entry.entry_id].pin
+            if pin is None:
+                continue
+            subentries.append({
+                "data": pin.to_dict(),
+                "subentry_type": SUBENTRY_TYPE_PIN,
+                "title": pin.title,
+                "unique_id": pin.pin_key,
+            })
+
+        self.hass.async_create_task(async_trigger_gtfs_refresh(self.hass))
+        return self.async_create_entry(
+            title=self._import_board_name,
+            data={
+                CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
+                CONF_BOARD_NAME: self._import_board_name,
+                CONF_API_KEY: self._get_existing_api_key() or "",
+            },
+            options={
+                CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
+                CONF_REALTIME_ENABLED: True,
+                CONF_SUBENTRY_ORDER: [],
+                CONF_SHOW_RUN_NUMBERS: DEFAULT_SHOW_RUN_NUMBERS,
+                CONF_SHOW_VEHICLE_TYPE: DEFAULT_SHOW_VEHICLE_TYPE,
+            },
+            subentries=subentries,
         )
 
     @classmethod
