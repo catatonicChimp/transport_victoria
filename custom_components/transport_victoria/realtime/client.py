@@ -138,6 +138,19 @@ def _decode_feed(content: bytes) -> object:
     return feed
 
 
+def feed_fetched_at(mode: str, feed_type: str) -> datetime | None:
+    """Return when the cached feed for (mode, feed_type) was fetched, or None.
+
+    The board aggregator (T9) uses this to classify a feed as ``stale`` when
+    its data is older than ``REALTIME_CACHE_TTL_SECONDS``.  Returns an aware
+    UTC datetime matching ``fetch_feed``'s cache timestamps.
+    """
+    entry = _FEED_CACHE.get((mode, feed_type))
+    if entry is None:
+        return None
+    return entry[1]
+
+
 def invalidate_cache(mode: str | None = None, feed_type: str | None = None) -> None:
     """Invalidate one or all cache entries.
 

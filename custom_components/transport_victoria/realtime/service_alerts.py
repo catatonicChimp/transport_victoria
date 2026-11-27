@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..models import Alert
@@ -38,6 +39,131 @@ _EFFECT_MAP = {
     9: "NO_EFFECT",
     10: "ACCESSIBILITY_ISSUE",
 }
+
+
+@dataclass(slots=True, frozen=True)
+class ActivePeriod:
+    """One active_period window from a service alert (start inclusive, end
+    exclusive per GTFS-RT; either bound may be absent)."""
+
+    start: datetime | None
+    end: datetime | None
+
+
+@dataclass(slots=True, frozen=True)
+class ServiceAlert:
+    """A service alert with its full informed_entity selector sets (T9).
+
+    Unlike :class:`~custom_components.transport_victoria.models.Alert`, this
+    preserves the *trip* and *direction* selectors (not just route/stop) so a
+    board can match an alert against a specific pin's trips.  Matching is by
+    selector only — ``cause`` is informational and MUST NOT be used for
+    matching (the ``_CAUSE_MAP`` numbering is fixed separately in T13).
+    """
+
+    alert_id: str
+    header: str
+    description: str
+    cause: str
+    effect: str
+    active_periods: tuple[ActivePeriod, ...]
+    route_ids: tuple[str, ...]
+    stop_ids: tuple[str, ...]
+    trip_ids: tuple[str, ...]
+    direction_ids: tuple[int, ...]
+
+
+def is_alert_active(alert: ServiceAlert, now: datetime) -> bool:
+    """Return True if ``alert`` is active at ``now`` (UTC-aware).
+
+    An alert with no active_periods is always active.  Otherwise it is active
+    when any period satisfies ``start <= now < end`` (start and end each
+    optional).  ``now`` must be an aware UTC datetime matching the period
+    timestamps.
+    """
+    if not alert.active_periods:
+        return True
+    for period in alert.active_periods:
+        start_ok = period.start is None or period.start <= now
+        end_ok = period.end is None or now < period.end
+        if start_ok and end_ok:
+            return True
+    return False
+
+
+def parse_service_alerts(feed: object) -> list[ServiceAlert]:
+    """Parse a service-alerts FeedMessage into selector-rich ServiceAlert rows.
+
+    Returns *all* alerts with their full informed_entity selectors and active
+    periods, WITHOUT any now-based filtering — callers apply
+    :func:`is_alert_active` with their own clock so matching is testable.
+
+    Args:
+        feed: A decoded ``gtfs_realtime_pb2.FeedMessage`` instance.
+
+    Returns:
+        List of :class:`ServiceAlert` (empty on a malformed/empty feed).
+    """
+    alerts: list[ServiceAlert] = []
+
+    try:
+        entities = feed.entity  # type: ignore[attr-defined]
+    except AttributeError:
+        _LOGGER.warning(
+            "parse_service_alerts received unexpected feed type: %s", type(feed)
+        )
+        return alerts
+
+    for entity in entities:
+        if not entity.HasField("alert"):
+            continue
+        raw = entity.alert
+
+        header = _first_translation(raw.header_text)
+        if not header:
+            continue
+
+        periods = tuple(
+            ActivePeriod(
+                start=(
+                    datetime.fromtimestamp(p.start, tz=timezone.utc)
+                    if p.start
+                    else None
+                ),
+                end=(
+                    datetime.fromtimestamp(p.end, tz=timezone.utc) if p.end else None
+                ),
+            )
+            for p in raw.active_period  # type: ignore[attr-defined]
+        )
+
+        route_ids = tuple(ie.route_id for ie in raw.informed_entity if ie.route_id)
+        stop_ids = tuple(ie.stop_id for ie in raw.informed_entity if ie.stop_id)
+        trip_ids = tuple(
+            ie.trip.trip_id for ie in raw.informed_entity if ie.trip.trip_id
+        )
+        direction_ids = tuple(
+            ie.trip.direction_id
+            for ie in raw.informed_entity
+            if ie.trip.trip_id and ie.trip.direction_id
+        )
+
+        alerts.append(
+            ServiceAlert(
+                alert_id=entity.id,
+                header=header,
+                description=_first_translation(raw.description_text),
+                cause=_CAUSE_MAP.get(raw.cause, "UNKNOWN_CAUSE"),
+                effect=_EFFECT_MAP.get(raw.effect, "UNKNOWN_EFFECT"),
+                active_periods=periods,
+                route_ids=route_ids,
+                stop_ids=stop_ids,
+                trip_ids=trip_ids,
+                direction_ids=direction_ids,
+            )
+        )
+
+    return alerts
 
 
 def parse_alerts(
