@@ -101,6 +101,50 @@ class TestDirectionDerivation:
         assert len(res.candidates) == 6  # same as get_terminals_for_route
 
 
+class TestDuplicateLabelCollapse:
+    """Regression: distinct patterns to one terminus must not repeat a label.
+
+    The ``duplicate_labels_db`` fixture has three Upfield-bound patterns whose
+    intermediate stops differ but whose penultimate stop is always Gowrie, so
+    all three render "Upfield Station via Gowrie Station".
+    """
+
+    def test_three_identical_patterns_collapse_to_one(self, duplicate_labels_db: Path):
+        cands = get_terminals_for_route(duplicate_labels_db, "R_METRO_UPFIELD")
+        labels = [destination_label(c) for c in cands]
+        assert labels == [
+            "Upfield Station via Gowrie Station",
+            "Flinders Street via North Melbourne",
+            "Flinders Street via Southern Cross",
+        ]
+        assert len(labels) == len(set(labels))
+
+    def test_collapse_keeps_most_representative_pattern(self, duplicate_labels_db: Path):
+        upfield = next(
+            c
+            for c in get_terminals_for_route(duplicate_labels_db, "R_METRO_UPFIELD")
+            if c.direction_id == 0
+        )
+        # Three City Loop trips share the label; the longest pattern survives.
+        assert upfield.terminal_stop_id == "U_UPFIELD"
+        assert upfield.pattern_trip_ids == [
+            "T_UPF_LOOP_1",
+            "T_UPF_LOOP_2",
+            "T_UPF_LOOP_3",
+        ]
+
+    def test_distinct_via_labels_are_not_collapsed(self, duplicate_labels_db: Path):
+        cands = get_terminals_for_route(duplicate_labels_db, "R_METRO_UPFIELD")
+        inbound = [c for c in cands if c.direction_id == 1]
+        assert {c.via_hint for c in inbound} == {
+            "North Melbourne",
+            "Southern Cross",
+        }
+        # Distinct selector values, too (one per surviving label).
+        values = [destination_value(c) for c in cands]
+        assert len(values) == len(set(values))
+
+
 class TestLabels:
     def test_label_includes_via_only_when_needed(self, bus_db: Path):
         cands = get_terminals_for_route(bus_db, "R_BUS_220")

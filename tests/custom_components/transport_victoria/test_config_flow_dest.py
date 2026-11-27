@@ -22,8 +22,12 @@ from custom_components.transport_victoria.const import (
     CONF_STOP_ID,
     CONF_STOP_NAME,
     MODE_BUS,
+    MODE_METRO,
 )
-from custom_components.transport_victoria.routing.destination import destination_value
+from custom_components.transport_victoria.routing.destination import (
+    destination_label,
+    destination_value,
+)
 
 
 class FakeHass:
@@ -101,3 +105,50 @@ async def test_all_destinations_preserved(make_flow):
     assert flow._config[CONF_ALL_DESTINATIONS] is True
     assert flow._config[CONF_DESTINATION_STOP_ID] is None
     assert flow._config[CONF_DIRECTION] is None
+
+
+@pytest.fixture
+def make_metro_flow(duplicate_labels_db: Path, monkeypatch):
+    """Metro flow whose origin is served by one route with colliding patterns."""
+
+    def _make():
+        flow = cf.PTVConfigFlow()
+        flow.hass = FakeHass()
+        flow._config = {
+            CONF_MODE: MODE_METRO,
+            CONF_STOP_ID: "U_FLINDERS",
+            CONF_STOP_NAME: "Flinders Street",
+        }
+        captured: dict = {}
+
+        async def fake_confirm(user_input=None):
+            captured["confirmed"] = True
+            return {"step_id": "confirm"}
+
+        def fake_show_form(*args, **kwargs):
+            captured["form"] = kwargs
+            return {"type": "form", "step_id": "dest"}
+
+        monkeypatch.setattr(flow, "async_step_confirm", fake_confirm)
+        monkeypatch.setattr(flow, "async_show_form", fake_show_form)
+        monkeypatch.setattr(cf, "_db_path", lambda cfg: duplicate_labels_db)
+        return flow, captured
+
+    return _make
+
+
+async def test_metro_destination_step_has_no_duplicate_labels(make_metro_flow):
+    """Regression: identical pattern labels must appear once in the selector."""
+    flow, captured = make_metro_flow()
+    await flow.async_step_dest(None)
+
+    assert captured["form"] is not None
+    labels = [destination_label(c) for c in flow._dest_candidates]
+    assert labels == [
+        "Upfield Station via Gowrie Station",
+        "Flinders Street via North Melbourne",
+        "Flinders Street via Southern Cross",
+    ]
+    # No duplicate option labels anywhere in the rendered selector.
+    assert len(labels) == len(set(labels))
+

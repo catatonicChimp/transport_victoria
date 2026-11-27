@@ -1247,17 +1247,50 @@ def collapse_direction_candidates(
     return candidates
 
 
+def _collapse_duplicate_labels(candidates: list[Destination]) -> list[Destination]:
+    """Collapse candidates whose rendered label text is identical.
+
+    Distinct trip patterns often reach the same terminus with the same penultimate
+    stop (e.g. City Loop vs direct Upfield services both arrive via Gowrie), so
+    ``(direction_id, terminal_stop_id, via_hint)`` alone is NOT a unique UI key:
+    several candidates then render the same label.  Keeping one candidate per
+    final label text guarantees the selector can never offer two identically
+    labelled options.
+
+    Input is expected in :func:`_destination_sort_key` order (as returned by
+    :func:`build_destination_candidates`).  The first occurrence wins ties; when
+    patterns differ in evidence the candidate backed by the most trips wins, so
+    the retained candidate is the most representative pattern.  Its position in
+    the ordering is unchanged.
+    """
+    # Deferred import: routing.destination imports this module at import time.
+    from ..routing.destination import destination_label
+
+    kept: dict[str, Destination] = {}
+    for candidate in candidates:
+        label = destination_label(candidate)
+        existing = kept.get(label)
+        if existing is None or len(candidate.pattern_trip_ids) > len(
+            existing.pattern_trip_ids
+        ):
+            kept[label] = candidate
+    return list(kept.values())
+
+
 def get_terminals_for_route(db_path: Path, route_id: str) -> list[Destination]:
     """Return distinct destination candidates (termini) for a route.
 
     Derived from the ordered ``stop_sequences`` of the route's trips, with
-    headsign/via disambiguation (see :func:`build_destination_candidates`).
-    Deterministically ordered by (direction, terminal name, via, stop_id).
+    headsign/via disambiguation (see :func:`build_destination_candidates`),
+    then collapsed to one candidate per final label text so the UI never shows
+    two identically labelled destinations (see
+    :func:`_collapse_duplicate_labels`).  Deterministically ordered by
+    (direction, terminal name, via, stop_id).
     """
     trips = load_trip_shapes(db_path, route_id=route_id)
     if not trips:
         return []
-    return build_destination_candidates(trips)
+    return _collapse_duplicate_labels(build_destination_candidates(trips))
 
 
 def get_lines_between(

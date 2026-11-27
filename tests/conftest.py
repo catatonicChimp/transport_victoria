@@ -37,6 +37,13 @@ def vline_db(tmp_path_factory: pytest.TempPathFactory):
 
 
 @pytest.fixture(scope="session")
+def duplicate_labels_db(tmp_path_factory: pytest.TempPathFactory):
+    return import_bundle(
+        tmp_path_factory.mktemp("dup-labels"), **fx.duplicate_labels_spec()
+    )
+
+
+@pytest.fixture(scope="session")
 def expired_db(tmp_path_factory: pytest.TempPathFactory):
     return import_bundle(
         tmp_path_factory.mktemp("expired"), **fx.expired_calendar_spec()
