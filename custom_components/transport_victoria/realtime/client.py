@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -104,6 +105,20 @@ class PTVRealtimeClient:
         _FEED_CACHE[cache_key] = (feed, now)
         return feed
 
+    async def fetch_feed_with_meta(
+        self, mode: str, feed_type: str
+    ) -> tuple[object, FeedMeta]:
+        """Fetch a feed and return ``(feed, FeedMeta)`` for freshness.
+
+        Thin wrapper over :meth:`fetch_feed` that also surfaces the feed's
+        header timestamp and retrieval time, so the board aggregator (T9) can
+        classify freshness from the fetched data itself rather than reading the
+        module cache directly.
+        """
+        feed = await self.fetch_feed(mode, feed_type)
+        fetched_at = feed_fetched_at(mode, feed_type)
+        return feed, feed_meta(feed, fetched_at)
+
     # ------------------------------------------------------------------
     # API key validation
     # ------------------------------------------------------------------
@@ -136,6 +151,45 @@ def _decode_feed(content: bytes) -> object:
     feed = gtfs_realtime_pb2.FeedMessage()
     feed.ParseFromString(content)
     return feed
+
+
+def feed_fetched_at(mode: str, feed_type: str) -> datetime | None:
+    """Return when the cached feed for (mode, feed_type) was fetched, or None.
+
+    The board aggregator (T9) uses this to classify a feed as ``stale`` when
+    its data is older than ``REALTIME_CACHE_TTL_SECONDS``.  Returns an aware
+    UTC datetime matching ``fetch_feed``'s cache timestamps.
+    """
+    entry = _FEED_CACHE.get((mode, feed_type))
+    if entry is None:
+        return None
+    return entry[1]
+
+
+@dataclass(slots=True, frozen=True)
+class FeedMeta:
+    """Freshness metadata for one fetched realtime feed.
+
+    ``header_timestamp`` is the GTFS-RT feed's own publication time
+    (``feed.header.timestamp``, epoch seconds → aware UTC) — the PRIMARY
+    freshness signal.  ``fetched_at`` is when the data was retrieved (the TTL
+    cache's timestamp), used only as a fallback when the header is absent.
+    """
+
+    header_timestamp: datetime | None
+    fetched_at: datetime | None
+
+
+def feed_meta(feed: object, fetched_at: datetime | None) -> FeedMeta:
+    """Build :class:`FeedMeta` for a decoded feed (header timestamp + fetch time)."""
+    header_ts: datetime | None = None
+    try:
+        ts = feed.header.timestamp  # type: ignore[attr-defined]
+    except AttributeError:
+        ts = 0
+    if ts:
+        header_ts = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return FeedMeta(header_timestamp=header_ts, fetched_at=fetched_at)
 
 
 def invalidate_cache(mode: str | None = None, feed_type: str | None = None) -> None:
