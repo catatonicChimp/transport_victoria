@@ -69,7 +69,7 @@ disruption sensors; vehicle trackers and route trackers; local SQLite search.
   required by the setup flow and for realtime feeds. It is self-service under
   *My Account → Subscription Keys* and is sent as the `KeyID` header.
 - GTFS **schedule downloads are keyless**; only realtime needs the key.
-- Python requirements are unchanged: `gtfs-realtime-bindings==1.0.0`.
+- Python requirements are unchanged: `gtfs-realtime-bindings==3.0.0`.
 
 ## Known limitations
 

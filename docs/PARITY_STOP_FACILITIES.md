@@ -17,8 +17,8 @@ facilities dataset. Investigated 27 Nov 2026 against the full portal catalogue
   mismatches at 1e-5°). Examples: `11212 Flinders Street Station`,
   `20043 Southern Cross Station`, tram and bus stops all matched exactly.
 - Field coverage of the GeoJSON is a **subset** of the GTFS data already imported:
-  it drops `parent_station`, `location_type`, `wheelchair_boarding`, `platform_code`
-  and `stop_url`. Enriching from it would be a no-op.
+  it drops `parent_station`, `location_type`, `wheelchair_boarding` and
+  `platform_code`. Enriching from it would be a no-op.
 - Portal searches for facilities/amenities/shelter/park-and-ride/myki outlets all
   return 0 results; slug probes (`stop-facilities`, `station-facilities`,
   `myki-outlets`, `ticket-outlets`, `park-and-ride`) all 404. Neither the state
@@ -30,8 +30,8 @@ facilities dataset. Investigated 27 Nov 2026 against the full portal catalogue
 ## Consequence
 
 Stop detail in this integration is documented as **GTFS-only**: name, coordinates,
-`location_type`, `parent_station`, `platform_code`, `stop_url` and
-`wheelchair_boarding` (0/1/2, with roughly 1,365 stops blank). The current TV GTFS
+`location_type`, `parent_station`, `platform_code` and `wheelchair_boarding`
+(0/1/2, with roughly 1,365 stops blank). The current TV GTFS
 feeds contain **no `zone_id`**.
 
 Amenity, accessibility-detail, staffing, contact and ticketing information is not
