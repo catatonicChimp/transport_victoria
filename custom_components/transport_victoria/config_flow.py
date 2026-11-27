@@ -130,6 +130,22 @@ _ALL_DESTINATIONS_KEY = "__all__"
 # flow (not a persisted entry type — the created entry is always a board).
 _IMPORT_OPTION = "import"
 
+# Upper bound on the post-download import wait (5 s per poll → 15 minutes).
+# Without a bound a failed/cancelled refresh leaves the spinner up forever.
+_MAX_IMPORT_POLLS = 180
+
+
+def _task_succeeded(task: asyncio.Task[Any]) -> bool:
+    """Return True when a finished refresh/poll task reported success.
+
+    Callers must only invoke this once ``task.done()`` is true.
+    """
+    if task.cancelled():
+        return False
+    if task.exception() is not None:
+        return False
+    return bool(task.result())
+
 
 def _data_dir(hass_config_path: str) -> Path:
     return Path(hass_config_path) / "transport_victoria_data"
@@ -322,9 +338,10 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     ) -> ConfigFlowResult:
         """Show a spinner while the GTFS ZIP is being downloaded.
 
-        Transitions to async_step_importing once the ZIP file exists on disk.
-        If the ZIP is already present (cached from a prior run), skips through
-        immediately.
+        The refresh runs as a task off the flow and the frontend polls this
+        step; when the task finishes we either advance to the import step or —
+        if the download/import failed — offer a retry instead of pretending
+        work is still in progress.
         """
         zip_path = _zip_path(self.hass.config.config_dir)
         db_path = _db_path(self.hass.config.config_dir)
@@ -362,7 +379,41 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 progress_task=self._zip_wait_task,
             )
 
+        if not _task_succeeded(self._zip_wait_task):
+            _LOGGER.error(
+                "Config flow: GTFS refresh failed for bundles %s — offering retry",
+                bundles,
+            )
+            return self.async_show_progress_done(next_step_id="schedule_failed")
+
         return self.async_show_progress_done(next_step_id="importing")
+
+    # ------------------------------------------------------------------
+    # Step 3a-failure — schedule download/import failed
+    # ------------------------------------------------------------------
+
+    async def async_step_schedule_failed(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Explain a failed timetable download and offer retry or cancel."""
+        return self.async_show_menu(
+            step_id="schedule_failed",
+            menu_options=["retry_download", "abort_setup"],
+        )
+
+    async def async_step_retry_download(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Restart the download/import after a failure."""
+        self._zip_wait_task = None
+        self._db_wait_task = None
+        return await self.async_step_downloading()
+
+    async def async_step_abort_setup(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Give up on setup when the schedule cannot be fetched."""
+        return self.async_abort(reason="schedule_unavailable")
 
     # ------------------------------------------------------------------
     # Step 3b — SQLite import progress screen
@@ -386,9 +437,11 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 return await getattr(self, f"async_step_{self._post_import_step}")()
 
             # Import not done yet (e.g. ZIP was huge and import is still running).
-            # Poll until ready without firing a second async_trigger_gtfs_refresh.
+            # Poll until ready without firing a second async_trigger_gtfs_refresh,
+            # and stop as soon as the refresh task reports failure (or the poll
+            # budget runs out) so the UI never spins forever.
             self._db_wait_task = self.hass.async_create_task(
-                self._poll_until_mode_ready(db_path, bundles)
+                self._poll_until_mode_ready(db_path, bundles, self._zip_wait_task)
             )
 
         if not self._db_wait_task.done():
@@ -398,10 +451,26 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 progress_task=self._db_wait_task,
             )
 
+        if not _task_succeeded(self._db_wait_task):
+            _LOGGER.error(
+                "Config flow: timetable import did not complete for bundles %s",
+                bundles,
+            )
+            return self.async_show_progress_done(next_step_id="schedule_failed")
+
         return self.async_show_progress_done(next_step_id=self._post_import_step)
 
-    async def _poll_until_mode_ready(self, db_path: Path, bundles: list[str]) -> None:
-        """Poll every 5 seconds until the selected mode's bundles are imported."""
+    async def _poll_until_mode_ready(
+        self,
+        db_path: Path,
+        bundles: list[str],
+        refresh_task: asyncio.Task[Any] | None = None,
+    ) -> bool:
+        """Poll every 5 seconds until the selected mode's bundles are imported.
+
+        Returns False when the refresh task has finished without a usable
+        schedule, or after ``_MAX_IMPORT_POLLS`` polls (15 minutes).
+        """
         poll = 0
         while not self.hass.is_stopping:
             ready = await self.hass.async_add_executor_job(
@@ -409,13 +478,27 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             )
             if ready:
                 _LOGGER.debug("Config flow: mode bundles %s ready", bundles)
-                return
+                return True
+            if refresh_task is not None and refresh_task.done():
+                if not _task_succeeded(refresh_task):
+                    _LOGGER.debug(
+                        "Config flow: refresh finished without usable schedule; "
+                        "stopping import poll"
+                    )
+                    return False
             poll += 1
+            if poll >= _MAX_IMPORT_POLLS:
+                _LOGGER.warning(
+                    "Config flow: timetable import not ready after %ds — giving up",
+                    poll * 5,
+                )
+                return False
             if poll % 6 == 0:
                 _LOGGER.debug(
                     "Config flow: waiting for bundles %s (%ds elapsed)", bundles, poll * 5
                 )
             await asyncio.sleep(5)
+        return False
 
     # ------------------------------------------------------------------
     # Step 3 — Stop search (name / distance / map)

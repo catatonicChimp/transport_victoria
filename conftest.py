@@ -201,6 +201,10 @@ if not _real_homeassistant():  # pragma: no cover - only reached in the light en
     class _TrackerEntityBase:
         """Distinct from _Stub so multi-inheritance in device_tracker does not collapse."""
 
+    # Production code imports the real location (the config_entry module is a
+    # deprecated alias since HA 2026.2). Keep the alias stubbed too so legacy
+    # imports still resolve.
+    _dt_tr.TrackerEntity = _TrackerEntityBase  # type: ignore[attr-defined]
     _dt_tr_ce = sys.modules["homeassistant.components.device_tracker.config_entry"]
     _dt_tr_ce.TrackerEntity = _TrackerEntityBase  # type: ignore[attr-defined]
 
