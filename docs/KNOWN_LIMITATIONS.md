@@ -8,7 +8,7 @@ and what to do instead. The technical evidence behind each gap is in
 ## Stop detail is GTFS-only
 
 **What the timetable contains:** stop name, coordinates, `location_type`,
-`parent_station`, `platform_code`, `stop_url` and `wheelchair_boarding` (0 = no
+`parent_station`, `platform_code` and `wheelchair_boarding` (0 = no
 information, 1 = accessible, 2 = not accessible).
 
 **What you do not get:** station amenities (toilets, lifts, parking, shelters),
@@ -51,8 +51,8 @@ catalogue.
 ## No PTV disruption themes or categories
 
 **What you get:** the alert header and description text, GTFS-RT `cause` and
-`effect`, active periods, affected routes/stops/trips and the alert URL when
-present.
+`effect`, active periods, and affected routes/stops/trips. Transport Victoria
+alerts carry no URL field, so no alert URL is exposed.
 
 **What you do not get:** the PTV website's disruption themes, category badges or
 "advice" pages, and no scraped PTV content.

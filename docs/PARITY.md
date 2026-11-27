@@ -35,11 +35,11 @@ deliberately rejected here.
 | 9 | Runs by route or run reference; run details | `trips.txt` + ordered `stop_times`; realtime trip identity | **replicated** | GTFS trip/route ids are exposed in attributes. A GTFS `trip_id` is treated as one run identity; see [trip identity](#trip-identity-is-per-run) below. |
 | 10 | Stops on a route and stops in stopping order | Distinct stops from route trip patterns; ordered `stop_times` per trip | **replicated-better** | Supports variants and short workings. |
 | 11 | Stop location and stops by geolocation | `stops.txt` coordinates plus local distance queries | **replicated-better** | Offline; uses the proximity-radius option. |
-| 12 | Basic stop accessibility | `wheelchair_boarding`, `platform_code`, `parent_station`, `stop_url` | **partial** | No `zone_id` in the current TV feeds; no facilities detail (see [stop facilities](#stop-facilities--not-viable) and [PARITY_STOP_FACILITIES.md](PARITY_STOP_FACILITIES.md)). |
+| 12 | Basic stop accessibility | `wheelchair_boarding`, `platform_code`, `parent_station` | **partial** | No `zone_id` in the current TV feeds; no facilities detail (see [stop facilities](#stop-facilities--not-viable) and [PARITY_STOP_FACILITIES.md](PARITY_STOP_FACILITIES.md)). |
 | 13 | Stop facilities (amenities, accessibility detail, staffing, contact, ticketing) | No core GTFS equivalent | **gap** | Portal investigated in T12: no facilities dataset exists. Documented limitation; never a PTV fallback. |
 | 14 | Geopath for routes and departures | `shapes.txt` via a trip's `shape_id` | **gap** | Trip `shape_id` is stored, but `shapes.txt` geometry is deliberately not imported (11 M rows with no departure-query value). No geopath/route-line geometry is exposed; the classic integration did not use this capability either. |
 | 15 | Disruptions (all / route / stop / route+stop / id / mode) | Service Alerts filtered locally by `informed_entity`, feed, route, stop, trip and active period | **replicated** | Alerts are combined across feeds; identity and active periods are retained. Selectors are AND-ed within one `informed_entity` and OR-ed across selectors. |
-| 16 | Disruption status, cause, effect and text | Alert active periods, cause, effect, header and description | **replicated** | URLs preserved; optional fields stay absent rather than being invented. |
+| 16 | Disruption status, cause, effect and text | Alert active periods, cause, effect, header and description | **replicated** | Header, description, cause, effect, informed entities and active periods are preserved. Transport Victoria alerts carry no URL field, and optional fields stay absent rather than being invented. |
 | 17 | PTV disruption themes/categories/advice URLs | No consistent equivalent | **gap** | Cosmetic loss. Alert text plus cause/effect only; no PTV website scraping. |
 | 18 | Vehicle positions/expansion | Vehicle Positions feeds joined to trips | **partial** | Published for Metro Trains, the combined Metro & Regional Bus feed, and V/Line. No documented tram Vehicle Positions product; tram vehicle tracking remains unsupported. |
 | 19 | Search (text/id/geo) | Local SQLite + FTS + coordinates | **replicated-better** | No network needed for config search. |
@@ -62,7 +62,7 @@ Full evidence, including the 32,055-feature join test and catalogue probes, is
 recorded in [PARITY_STOP_FACILITIES.md](PARITY_STOP_FACILITIES.md).
 
 **Consequence:** stop detail is GTFS-only — name, coordinates, `location_type`,
-`parent_station`, `platform_code`, `stop_url` and `wheelchair_boarding` (0/1/2,
+`parent_station`, `platform_code` and `wheelchair_boarding` (0/1/2,
 with roughly 1,365 stops blank). The current TV GTFS feeds contain no `zone_id`.
 Amenities, accessibility detail beyond wheelchair boarding, staffing, contact
 and ticketing attributes are absent, not synthesised.
@@ -71,8 +71,9 @@ and ticketing attributes are absent, not synthesised.
 
 PTV's website taxonomy is not carried in GTFS Realtime and has no documented
 open-data equivalent. The integration exposes what the feed carries: alert
-header/description text, `cause`, `effect`, active periods, informed entities
-and URLs. `cause` is informational and is never used for selector matching.
+header/description text, `cause`, `effect`, active periods and informed
+entities. Alert URLs are not available from Transport Victoria alerts. `cause`
+is informational and is never used for selector matching.
 Scraping the PTV website for themes/advice URLs was rejected: it is fragile,
 undocumented and outside the open-data licence surface.
 
@@ -229,8 +230,8 @@ example, Metro Bus Trip Updates do not include platform information or
 cancellations). The integration never invents the missing data: absent
 prediction fields stay absent, the scheduled departure remains the fallback,
 and the `realtime_state`/`cancelled` attributes report only what was received.
-Optional alert fields (URL, description, active periods) are likewise omitted,
-not synthesised.
+Optional alert fields (description, active periods) are likewise omitted, not
+synthesised.
 
 ### Schedule window and refresh
 
