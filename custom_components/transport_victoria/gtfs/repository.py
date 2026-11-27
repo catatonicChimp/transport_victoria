@@ -1036,6 +1036,65 @@ def routes_for_stop(db_path: Path, stop_id: str) -> set[str]:
     return result
 
 
+@dataclass(slots=True, frozen=True)
+class TerminalInfo:
+    """The terminal (last stop) of one trip, plus its direction (T18)."""
+
+    terminal_stop_id: str
+    terminal_stop_name: str
+    direction_id: int | None
+
+
+# ``trip_terminals`` batches its ``IN`` clause to stay well under SQLite's
+# variable limit; the fleet is capped at 30 vehicles, so this is defensive.
+_TRIP_TERMINALS_BATCH = 500
+
+
+def trip_terminals(db_path: Path, trip_ids: list[str]) -> dict[str, TerminalInfo]:
+    """Return ``trip_id`` → :class:`TerminalInfo` for the given trips (T18).
+
+    The terminal is each trip's ``stop_times`` row with the MAX ``stop_sequence``
+    (the last stop served — the destination), joined to ``stops`` for its name
+    and to ``trips`` for its ``direction_id``.  Unknown trips are simply absent
+    from the result.  Batches the ``IN`` clause at :data:`_TRIP_TERMINALS_BATCH`
+    ids per query.  Runs against the current generation; callers wrap this in an
+    executor.
+    """
+    if not trip_ids:
+        return {}
+    sql = """
+        SELECT st.trip_id, st.stop_id, s.stop_name, t.direction_id
+        FROM stop_times st
+        JOIN stops s ON s.stop_id = st.stop_id
+        JOIN trips t ON t.trip_id = st.trip_id
+        WHERE st.trip_id IN ({placeholders})
+          AND st.stop_sequence = (
+              SELECT MAX(st2.stop_sequence)
+              FROM stop_times st2
+              WHERE st2.trip_id = st.trip_id
+          )
+    """
+    result: dict[str, TerminalInfo] = {}
+    conn = sqlite3.connect(str(_resolve(db_path)))
+    try:
+        for start in range(0, len(trip_ids), _TRIP_TERMINALS_BATCH):
+            batch = trip_ids[start:start + _TRIP_TERMINALS_BATCH]
+            placeholders = ", ".join("?" * len(batch))
+            for trip_id, stop_id, stop_name, direction_id in conn.execute(
+                sql.format(placeholders=placeholders), batch
+            ):
+                result[trip_id] = TerminalInfo(
+                    terminal_stop_id=stop_id,
+                    terminal_stop_name=stop_name or stop_id,
+                    direction_id=direction_id,
+                )
+    except sqlite3.Error as exc:
+        _LOGGER.error("trip_terminals failed: %s", exc)
+    finally:
+        conn.close()
+    return result
+
+
 def load_trip_shapes(
     db_path: Path,
     *,

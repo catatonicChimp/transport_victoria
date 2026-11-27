@@ -49,6 +49,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from .gtfs.repository import TerminalInfo
 from .realtime.vehicle_positions import VehiclePosition
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,6 +97,11 @@ class FleetVehicle:
     occupancy_status: str | None
     direction_id: int | None
     last_seen: datetime
+    # Destination enrichment (T18): GTFS-RT VehiclePosition has no headsign
+    # field, so the destination label is the trip's terminal stop ("to X").
+    terminal_stop_id: str | None = None
+    terminal_stop_name: str | None = None
+    trip_terminal_direction_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -142,6 +148,26 @@ def resolve_vehicle_route(
     return trip_update_routes.get(position.trip_id)
 
 
+def matched_trip_ids(
+    positions: list[VehiclePosition],
+    watched_routes: frozenset[str],
+    route_by_trip_id: dict[str, str],
+    trip_update_routes: dict[str, str],
+) -> set[str]:
+    """Return the trip ids of positions whose resolved route is watched.
+
+    Lets the caller batch-fetch only the terminals of vehicles that will
+    actually be tracked (a vehicle whose route is not watched is never tracked,
+    so its terminal is irrelevant).
+    """
+    ids: set[str] = set()
+    for pos in positions:
+        route = resolve_vehicle_route(pos, route_by_trip_id, trip_update_routes)
+        if route is not None and route in watched_routes and pos.trip_id:
+            ids.add(pos.trip_id)
+    return ids
+
+
 def feed_is_stale(
     header_timestamp: datetime | None,
     fetched_at: datetime | None,
@@ -171,6 +197,7 @@ def update_fleet(
     trip_update_routes: dict[str, str],
     now: datetime,
     *,
+    terminals: dict[str, TerminalInfo] | None = None,
     grace_seconds: int = GRACE_ABSENT_SECONDS,
     max_vehicles: int = MAX_VEHICLES_PER_ENTRY,
 ) -> FleetUpdate:
@@ -194,11 +221,13 @@ def update_fleet(
         route_by_trip_id: ``trip_id`` → ``route_id`` from the GTFS trips table.
         trip_update_routes: ``trip_id`` → ``route_id`` from trip-updates.
         now: Aware UTC datetime for ``last_seen`` / grace computations.
+        terminals: ``trip_id`` → :class:`TerminalInfo` (destination enrichment).
         grace_seconds: Absence threshold before removal.
         max_vehicles: Hard cap on tracked vehicles.
     """
     added: list[str] = []
     next_tracked: dict[str, FleetVehicle] = {}
+    terminals = terminals or {}
 
     for pos in positions:
         route = resolve_vehicle_route(pos, route_by_trip_id, trip_update_routes)
@@ -207,6 +236,7 @@ def update_fleet(
         vehicle_id = pos.vehicle_id
         if not vehicle_id:
             continue
+        terminal = terminals.get(pos.trip_id)
         vehicle = FleetVehicle(
             vehicle_id=vehicle_id,
             route_id=route,
@@ -220,6 +250,9 @@ def update_fleet(
             occupancy_status=pos.occupancy_status,
             direction_id=pos.direction_id,
             last_seen=now,
+            terminal_stop_id=terminal.terminal_stop_id if terminal else None,
+            terminal_stop_name=terminal.terminal_stop_name if terminal else None,
+            trip_terminal_direction_id=terminal.direction_id if terminal else None,
         )
         if vehicle_id not in tracked:
             added.append(vehicle_id)

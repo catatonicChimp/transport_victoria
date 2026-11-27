@@ -35,6 +35,7 @@ from custom_components.transport_victoria.const import (
 from custom_components.transport_victoria.gtfs.repository import (
     route_ids_for_trips,
     routes_for_stop,
+    trip_terminals,
 )
 from custom_components.transport_victoria.realtime.client import FeedMeta
 from custom_components.transport_victoria.realtime.vehicle_positions import (
@@ -44,7 +45,9 @@ from custom_components.transport_victoria.realtime.vehicle_positions import (
 from custom_components.transport_victoria.vehicle_fleet import (
     GRACE_ABSENT_SECONDS,
     MAX_VEHICLES_PER_ENTRY,
+    FleetVehicle,
     feed_is_stale,
+    matched_trip_ids,
     update_fleet,
     vehicle_state,
 )
@@ -202,6 +205,50 @@ class TestFleetMatching:
 
         index = parse_trip_updates_index(trip_update_delay())
         assert index.trip_routes == {"T_FRK_OUT_2": "R_METRO_FRANKSTON"}
+
+
+# ---------------------------------------------------------------------------
+# Terminal / destination enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestTripTerminals:
+    def test_returns_terminal_info(self, metro_db: Path):
+        result = trip_terminals(metro_db, ["T_FRK_OUT_1", "T_WRB_OUT_1", "T_UNKNOWN"])
+        assert result["T_FRK_OUT_1"].terminal_stop_id == "FRANKSTON"
+        assert result["T_FRK_OUT_1"].terminal_stop_name == "Frankston"
+        assert result["T_FRK_OUT_1"].direction_id == 0
+        assert result["T_WRB_OUT_1"].terminal_stop_name == "Werribee"
+        assert "T_UNKNOWN" not in result
+
+    def test_empty_input_returns_empty(self, metro_db: Path):
+        assert trip_terminals(metro_db, []) == {}
+
+
+class TestFleetEnrichment:
+    def test_reconcile_enriches_terminal(self, metro_db: Path):
+        positions = _fleet_positions()
+        lookup = _route_lookup(metro_db, positions)
+        matched = matched_trip_ids(list(positions.values()), WATCHED, lookup, {})
+        terminals = trip_terminals(metro_db, sorted(matched))
+        update = update_fleet(
+            {}, list(positions.values()), WATCHED, lookup, {}, NOW, terminals=terminals
+        )
+        assert update.vehicles["V_A"].terminal_stop_name == "Frankston"
+        assert update.vehicles["V_A"].terminal_stop_id == "FRANKSTON"
+        assert update.vehicles["V_A"].trip_terminal_direction_id == 0
+        # V_D (no feed route) resolves via the trips table and also gets a terminal.
+        assert update.vehicles["V_D"].terminal_stop_name == "Frankston"
+        # V_C is on the unwatched Werribee route and is dropped entirely.
+        assert "V_C" not in update.vehicles
+
+    def test_unknown_trip_has_none_terminal(self, metro_db: Path):
+        pos = _vp("V_X", route_id=ROUTE_FRANKSTON)
+        update = update_fleet({}, [pos], WATCHED, {}, {}, NOW, terminals={})
+        vehicle = update.vehicles["V_X"]
+        assert vehicle.terminal_stop_name is None
+        assert vehicle.terminal_stop_id is None
+        assert vehicle.trip_terminal_direction_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +530,63 @@ class TestEntityContract:
         assert entity.available is True
         entity.coordinator.last_update_success = False
         assert entity.available is False
+
+
+# ---------------------------------------------------------------------------
+# Destination / direction on the tracker name + attributes
+# ---------------------------------------------------------------------------
+
+
+class TestEntityDestination:
+    def _entity(self, terminal_name: str | None = None) -> PTVFleetVehicleTracker:
+        entry = _watch_entry()
+        vehicle = FleetVehicle(
+            vehicle_id="V123456",
+            route_id=ROUTE_FRANKSTON,
+            trip_id="T_FRK_OUT_1",
+            latitude=-37.8,
+            longitude=145.0,
+            bearing=None,
+            speed_kmh=None,
+            vehicle_label=None,
+            current_status="IN_TRANSIT_TO",
+            occupancy_status=None,
+            direction_id=0,
+            last_seen=NOW,
+            terminal_stop_id="FRANKSTON" if terminal_name else None,
+            terminal_stop_name=terminal_name,
+            trip_terminal_direction_id=0 if terminal_name else None,
+        )
+        coordinator = SimpleNamespace(
+            data={"V123456": vehicle}, last_update_success=True
+        )
+        return PTVFleetVehicleTracker(coordinator, entry, "V123456")
+
+    def test_name_includes_terminal(self):
+        assert self._entity("Flinders Street").name == "Vehicle 3456 \u2192 Flinders Street"
+
+    def test_name_falls_back_without_terminal(self):
+        assert self._entity(None).name == "Vehicle 3456"
+
+    def test_attributes_include_destination(self):
+        attrs = self._entity("Flinders Street").extra_state_attributes
+        assert attrs["destination"] == "Flinders Street"
+        assert attrs["terminal_stop_id"] == "FRANKSTON"
+        assert attrs["trip_terminal_direction_id"] == 0
+        assert attrs["trip_id"] == "T_FRK_OUT_1"
+        assert attrs["direction_id"] == 0
+
+    def test_name_updates_live_when_trip_changes(self):
+        from dataclasses import replace
+
+        entity = self._entity("Flinders Street")
+        assert entity.name == "Vehicle 3456 \u2192 Flinders Street"
+        entity.coordinator.data["V123456"] = replace(
+            entity.coordinator.data["V123456"],
+            terminal_stop_name="Werribee",
+            terminal_stop_id="WERRIBEE",
+        )
+        assert entity.name == "Vehicle 3456 \u2192 Werribee"
 
 
 # ---------------------------------------------------------------------------

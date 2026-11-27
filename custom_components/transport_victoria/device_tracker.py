@@ -78,7 +78,7 @@ from .const import (
     MODE_TRAM,
     PICTOGRAM_URL_BASE,
 )
-from .gtfs.repository import route_ids_for_trips, routes_for_stop
+from .gtfs.repository import route_ids_for_trips, routes_for_stop, trip_terminals
 from .realtime.client import PTVRealtimeClient
 from .realtime.vehicle_positions import (
     VehiclePosition,
@@ -90,6 +90,7 @@ from .vehicle_fleet import (
     FleetUpdate,
     MAX_VEHICLES_PER_ENTRY,
     feed_is_stale,
+    matched_trip_ids,
     update_fleet,
     vehicle_state,
 )
@@ -312,6 +313,13 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
 
         route_by_trip_id = await self._route_lookup(positions)
 
+        # Destination enrichment: fetch terminals only for vehicles that will
+        # actually be tracked (their resolved route is watched).
+        trip_ids = matched_trip_ids(
+            positions, watched_routes, route_by_trip_id, {}
+        )
+        terminals = await self._terminal_lookup(trip_ids)
+
         update = update_fleet(
             self._tracked,
             positions,
@@ -319,10 +327,21 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
             route_by_trip_id,
             {},  # trip-updates route fallback not fetched here (see docstring)
             now,
+            terminals=terminals,
         )
         self._tracked = update.vehicles
         self._last_update = update
         return update.vehicles
+
+    async def _terminal_lookup(self, trip_ids: set[str]) -> dict:
+        """Return ``trip_id`` → terminal info for the matched trips (executor).
+
+        Recomputed each reconcile (the query is small — at most the fleet cap of
+        30 trips — and stays current with the live schedule).
+        """
+        if not trip_ids:
+            return {}
+        return await self._run_sync(trip_terminals, self._db_path, sorted(trip_ids))
 
     async def _route_lookup(self, positions: list[VehiclePosition]) -> dict[str, str]:
         """Return (and cache) trip_id → route_id for positions lacking a feed route.
@@ -354,8 +373,9 @@ class PTVFleetVehicleTracker(
     Keyed by the feed's ``vehicle.id`` (stable within a feed).  The entity is
     added when the vehicle first appears on a watched route and removed by the
     platform once it has been absent for the grace window.  ``has_entity_name``
-    is False so the name is the full entity name (no device prefix), and the
-    name is derived from the stable ``vehicle_id`` suffix so it never renames.
+    is False so the name is the full entity name (no device prefix); the name is
+    ``"Vehicle {id suffix}"`` plus the live destination ("to {terminal}") when
+    the trip's terminal is known (updates live when the trip changes).
     """
 
     _attr_has_entity_name = False
@@ -375,8 +395,17 @@ class PTVFleetVehicleTracker(
 
     @property
     def name(self) -> str:
-        """A stable name from the vehicle id suffix (never renames)."""
+        """Vehicle id suffix, plus the destination when known (updates live).
+
+        The terminal is read from the current coordinator data each poll, so a
+        vehicle that changes trips mid-day gets its name updated to the new
+        destination ("Vehicle {suffix} → {terminal}").  Falls back to just the
+        suffix when the terminal is unknown (trip not in the local schedule).
+        """
         suffix = self.vehicle_id[-4:] if len(self.vehicle_id) >= 4 else self.vehicle_id
+        vehicle = self._vehicle()
+        if vehicle is not None and vehicle.terminal_stop_name:
+            return f"Vehicle {suffix} → {vehicle.terminal_stop_name}"
         return f"Vehicle {suffix}"
 
     def _vehicle(self) -> FleetVehicle | None:
@@ -413,10 +442,15 @@ class PTVFleetVehicleTracker(
         vehicle = self._vehicle()
         if vehicle is None:
             return {}
+        # GTFS-RT VehiclePosition has no headsign field, so the human-readable
+        # "which direction" signal is the trip's terminal stop ("destination").
         return {
             "route": vehicle.route_id,
             "trip_id": vehicle.trip_id,
             "direction_id": vehicle.direction_id,
+            "destination": vehicle.terminal_stop_name,
+            "terminal_stop_id": vehicle.terminal_stop_id,
+            "trip_terminal_direction_id": vehicle.trip_terminal_direction_id,
             "bearing": vehicle.bearing,
             "speed_kmh": vehicle.speed_kmh,
             "vehicle_id": vehicle.vehicle_id,
