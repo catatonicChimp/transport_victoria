@@ -19,6 +19,25 @@ from types import SimpleNamespace
 
 import pytest
 
+try:
+    # ``homeassistant.data_entry_flow`` exists only in the real HA package (the
+    # light-env conftest stubs ``homeassistant`` but not this submodule).
+    from homeassistant.data_entry_flow import FlowResultType  # noqa: F401
+
+    _REAL_HA = True
+except ImportError:  # pragma: no cover - light env
+    _REAL_HA = False
+
+if _REAL_HA:
+    # These tests are light-env stub tests: the options-flow cases assign
+    # ``flow.config_entry`` directly, which the real ``OptionsFlow`` exposes as
+    # a read-only property.  The same guarantees are exercised against the real
+    # runtime in ``test_board_subentry_flow.py`` (classic harness).
+    pytest.skip(
+        "light-env stub tests (real-runtime coverage in test_board_subentry_flow.py)",
+        allow_module_level=True,
+    )
+
 from custom_components.transport_victoria import config_flow as cf
 from custom_components.transport_victoria.board import PinData
 from custom_components.transport_victoria.const import (
@@ -165,16 +184,16 @@ async def test_board_menu_direct_routing(monkeypatch):
     monkeypatch.setattr(flow, "async_show_form", fake_show_form)
 
     # No input → a single form (not a menu).
-    result = await flow._step_board_menu(None)
+    result = await flow.async_step_board_menu(None)
     assert result["type"] == "form"
     assert shown["step_id"] == "board_menu"
 
     # Each selection routes straight to its sub-step (single hop).
-    await flow._step_board_menu({"board_action": "reorder"})
+    await flow.async_step_board_menu({"board_action": "reorder"})
     assert called["reorder"] is True
-    await flow._step_board_menu({"board_action": "remove"})
+    await flow.async_step_board_menu({"board_action": "remove"})
     assert called["remove"] is True
-    await flow._step_board_menu({"board_action": "settings"})
+    await flow.async_step_board_menu({"board_action": "settings"})
     assert called["settings"] is True
 
 

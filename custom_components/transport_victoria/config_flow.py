@@ -2253,7 +2253,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
         if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
             return await self._step_vehicle_tracker(user_input)
         if entry_type == ENTRY_TYPE_BOARD:
-            return await self._step_board_menu(user_input)
+            return await self.async_step_board_menu(user_input)
         return await self._step_watch(user_input)
 
     # ------------------------------------------------------------------
@@ -2270,7 +2270,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
         )
         return [(sid, self.config_entry.subentries[sid]) for sid in order]
 
-    async def _step_board_menu(
+    async def async_step_board_menu(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Single-screen board options: one dropdown routes to the sub-step.
