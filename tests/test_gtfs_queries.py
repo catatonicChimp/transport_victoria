@@ -176,14 +176,16 @@ class TestTramPlatforms:
         assert [r.stop_sequence for r in rows] == [1, 4]
         assert [r.actual_stop_id for r in rows] == ["T96_TERM", "T96_TERM"]
 
-        # Existing limitation: the destination filter keys origin sequence by
-        # trip_id, so a repeated stop on one trip collapses to the last
-        # sequence and the filter drops the row (flagged for T7/T8).
+        # After the T7 fix, the destination filter keys the origin sequence by
+        # (trip_id, stop_sequence), so the loop's seq-1 boarding (10:00) is kept
+        # because the same trip reaches T96_TERM again at seq 4 (10:40); the
+        # seq-4 row has no later T96_TERM occurrence and is dropped.
         ambiguous = next_departures(
             tram_db, "T96_TERM", datetime(2026, 6, 1, 9, 30), limit=10,
             direction_stop_id="T96_TERM",
         )
-        assert ambiguous == []
+        assert [r.trip_id for r in ambiguous] == ["T_TRAM_LOOP"]
+        assert [r.stop_sequence for r in ambiguous] == [1]
 
 
 # ---------------------------------------------------------------------------

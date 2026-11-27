@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
@@ -258,12 +258,20 @@ def _filter_by_destination(
     rows: list[DepartureRow],
     destination_stop_id: str,
 ) -> list[DepartureRow]:
-    """Keep only trips that also call at destination_stop_id after the origin."""
+    """Keep only trips that also call at destination_stop_id after the origin.
+
+    Keys the origin sequence by ``(trip_id, stop_sequence)`` so a loop trip
+    (whose origin stop repeats at a later sequence) is kept when the same trip
+    calls at the destination *after* that specific boarding occurrence, rather
+    than being collapsed to the trip's last occurrence and dropped.
+    """
     if not rows:
         return rows
 
-    trip_ids = [r.trip_id for r in rows]
-    origin_seq_by_trip = {r.trip_id: r.stop_sequence for r in rows}
+    trip_ids = sorted({r.trip_id for r in rows})
+    origin_seqs_by_trip: dict[str, set[int]] = {}
+    for r in rows:
+        origin_seqs_by_trip.setdefault(r.trip_id, set()).add(r.stop_sequence)
 
     placeholders = ", ".join("?" * len(trip_ids))
     sql = f"""
@@ -273,12 +281,15 @@ def _filter_by_destination(
 
     conn = sqlite3.connect(str(_resolve(db_path)))
     try:
-        qualifying: set[str] = set()
+        qualifying: set[tuple[str, int]] = set()
         for db_row in conn.execute(sql, [destination_stop_id] + trip_ids):
             trip_id, dest_seq = db_row
-            if dest_seq > origin_seq_by_trip.get(trip_id, 0):
-                qualifying.add(trip_id)
-        return [r for r in rows if r.trip_id in qualifying]
+            for origin_seq in origin_seqs_by_trip.get(trip_id, ()):
+                if dest_seq > origin_seq:
+                    qualifying.add((trip_id, origin_seq))
+        return [
+            r for r in rows if (r.trip_id, r.stop_sequence) in qualifying
+        ]
     except sqlite3.Error as exc:
         _LOGGER.error("Destination filter query failed: %s", exc)
         return rows
@@ -878,3 +889,420 @@ def get_stop_lat_lon(
         return None
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Destination / terminus derivation (T7)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class Destination:
+    """A terminal destination candidate derived from actual trip patterns.
+
+    ``via_hint`` names a disambiguating intermediate stop (set when a terminus
+    is reached by more than one routing, or when a loop trip's terminus is also
+    its origin so its turn-around stop distinguishes the "direction").  Empty
+    ``via_hint`` means the terminal name alone is unambiguous.
+    """
+
+    direction_id: int | None
+    terminal_stop_id: str
+    terminal_stop_name: str
+    headsign: str | None = None
+    via_hint: str | None = None
+    pattern_trip_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class LineCandidate:
+    """A route+direction candidate serving an origin→destination stop pair.
+
+    Used by the T8 group flow's multi-select (TripView-style) resolver.
+    """
+
+    route_id: str
+    route_short_name: str
+    route_long_name: str
+    direction_id: int | None
+    terminal_stop_id: str
+    terminal_stop_name: str
+    via_hint: str | None = None
+    route_color: str | None = None
+
+
+def _destination_sort_key(d: Destination) -> tuple:
+    """Deterministic ordering for destination candidates."""
+    return (
+        d.direction_id if d.direction_id is not None else -1,
+        (d.terminal_stop_name or "").lower(),
+        (d.via_hint or "").lower(),
+        d.terminal_stop_id,
+    )
+
+
+def _line_sort_key(c: LineCandidate) -> tuple:
+    """Deterministic ordering for line candidates."""
+    return (
+        (c.route_short_name or c.route_long_name or c.route_id).lower(),
+        c.direction_id if c.direction_id is not None else -1,
+        (c.terminal_stop_name or "").lower(),
+        (c.via_hint or "").lower(),
+        c.terminal_stop_id,
+    )
+
+
+def load_trip_shapes(
+    db_path: Path,
+    *,
+    route_id: str | None = None,
+    trip_ids: list[str] | None = None,
+) -> list[dict]:
+    """Load trips with their ordered ``(stop_id, stop_name)`` stop sequence.
+
+    Returns a list of dicts with keys: ``trip_id``, ``route_id``,
+    ``direction_id``, ``headsign``, ``route_short_name``, ``route_long_name``,
+    ``route_color`` and ``stops`` (a list of ``(stop_id, stop_name)`` tuples in
+    ``stop_sequence`` order).  Exactly one of ``route_id`` / ``trip_ids`` selects
+    which trips are loaded.
+    """
+    if route_id is not None:
+        where = "t.route_id = ?"
+        params: list[object] = [route_id]
+    elif trip_ids:
+        placeholders = ", ".join("?" * len(trip_ids))
+        where = f"t.trip_id IN ({placeholders})"
+        params = list(trip_ids)
+    else:
+        return []
+
+    sql = f"""
+        SELECT t.trip_id, t.route_id, t.direction_id, t.trip_headsign,
+               r.route_short_name, r.route_long_name, r.route_color,
+               st.stop_id, st.stop_sequence, s.stop_name
+        FROM trips t
+        JOIN routes r ON r.route_id = t.route_id
+        JOIN stop_times st ON st.trip_id = t.trip_id
+        JOIN stops s ON s.stop_id = st.stop_id
+        WHERE {where}
+        ORDER BY t.trip_id, st.stop_sequence
+    """
+    conn = sqlite3.connect(str(_resolve(db_path)))
+    try:
+        trips: dict[str, dict] = {}
+        for row in conn.execute(sql, params):
+            tid = row[0]
+            entry = trips.get(tid)
+            if entry is None:
+                entry = {
+                    "trip_id": tid,
+                    "route_id": row[1],
+                    "direction_id": row[2],
+                    "headsign": row[3] or "",
+                    "route_short_name": row[4] or "",
+                    "route_long_name": row[5] or "",
+                    "route_color": row[6] or None,
+                    "stops": [],
+                }
+                trips[tid] = entry
+            entry["stops"].append((row[7], row[9] or row[7]))
+        return list(trips.values())
+    except sqlite3.Error as exc:
+        _LOGGER.error("load_trip_shapes failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def reaching_trip_ids(
+    db_path: Path,
+    origin_stop_id: str,
+    destination_stop_id: str,
+    *,
+    route_id: str | None = None,
+    route_types: list[int] | None = None,
+) -> list[str]:
+    """Return trip_ids that serve ``origin`` then ``destination`` in order.
+
+    Sequence-aware: the destination must be served at a later ``stop_sequence``
+    than the origin occurrence (so a loop trip passing the origin again later is
+    not mistaken for a reversed service).  Optionally restricted to one route or
+    a set of route_types.
+    """
+    clauses: list[str] = []
+    params: list[object] = [destination_stop_id, origin_stop_id]
+    if route_id is not None:
+        clauses.append("t.route_id = ?")
+        params.append(route_id)
+    if route_types:
+        rt = ", ".join("?" * len(route_types))
+        clauses.append(f"r.route_type IN ({rt})")
+        params.extend(route_types)
+    where = (" AND " + " AND ".join(clauses)) if clauses else ""
+
+    sql = f"""
+        SELECT DISTINCT so.trip_id
+        FROM stop_times so
+        JOIN trips t ON t.trip_id = so.trip_id
+        JOIN routes r ON r.route_id = t.route_id
+        JOIN stop_times sd ON sd.trip_id = so.trip_id AND sd.stop_id = ?
+        WHERE so.stop_id = ?{where}
+          AND sd.stop_sequence > so.stop_sequence
+    """
+    conn = sqlite3.connect(str(_resolve(db_path)))
+    try:
+        return [row[0] for row in conn.execute(sql, params)]
+    except sqlite3.Error as exc:
+        _LOGGER.error("reaching_trip_ids failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def _most_common_headsign(headsigns: dict[str, int]) -> str | None:
+    nonempty = {h: c for h, c in headsigns.items() if h}
+    if not nonempty:
+        return None
+    return max(nonempty, key=lambda h: nonempty[h])
+
+
+def build_destination_candidates(trips: list[dict]) -> list[Destination]:
+    """Collapse ordered trips into distinct destination (terminus) candidates.
+
+    Candidates are keyed by ``(direction_id, terminal_stop_id)``.  Trips whose
+    *intermediate* stop signature matches collapse into one candidate; when a
+    terminus is reached by more than one distinct intermediate signature (e.g.
+    "City" via Footscray vs via Kensington) each signature becomes its own
+    candidate with a ``via_hint`` naming the penultimate stop.  A loop trip
+    (first stop == last stop) additionally yields a second candidate carrying the
+    loop's turn-around stop as ``via_hint``, surfacing the two "directions" of the
+    loop as separate, labelled choices.
+    """
+    groups: dict[tuple, dict] = {}
+    for tr in trips:
+        stops = tr["stops"]
+        if not stops:
+            continue
+        terminal = stops[-1]
+        intermediate = stops[1:-1]
+        key = (tr["direction_id"], terminal[0])
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "direction_id": tr["direction_id"],
+                "terminal_stop_id": terminal[0],
+                "terminal_stop_name": terminal[1],
+                "headsigns": {},
+                "sigs": {},
+                "loop_turnarounds": set(),
+            }
+            groups[key] = g
+        g["headsigns"][tr["headsign"]] = g["headsigns"].get(tr["headsign"], 0) + 1
+        sig = tuple(s[0] for s in intermediate)
+        rec = g["sigs"].setdefault(sig, {"trip_ids": [], "via": None})
+        rec["trip_ids"].append(tr["trip_id"])
+        if sig:
+            rec["via"] = intermediate[-1][1]
+        if len(stops) >= 2 and stops[0][0] == terminal[0]:
+            g["loop_turnarounds"].add(stops[-2][1])
+
+    candidates: list[Destination] = []
+    for (direction_id, term_id), g in groups.items():
+        headsign = _most_common_headsign(g["headsigns"])
+        sigs = g["sigs"]
+        if len(sigs) == 1:
+            rec = next(iter(sigs.values()))
+            candidates.append(
+                Destination(
+                    direction_id=direction_id,
+                    terminal_stop_id=term_id,
+                    terminal_stop_name=g["terminal_stop_name"],
+                    headsign=headsign,
+                    via_hint=None,
+                    pattern_trip_ids=rec["trip_ids"],
+                )
+            )
+        else:
+            for rec in sigs.values():
+                candidates.append(
+                    Destination(
+                        direction_id=direction_id,
+                        terminal_stop_id=term_id,
+                        terminal_stop_name=g["terminal_stop_name"],
+                        headsign=headsign,
+                        via_hint=rec["via"],
+                        pattern_trip_ids=rec["trip_ids"],
+                    )
+                )
+        for turn_around in sorted(g["loop_turnarounds"]):
+            candidates.append(
+                Destination(
+                    direction_id=direction_id,
+                    terminal_stop_id=term_id,
+                    terminal_stop_name=g["terminal_stop_name"],
+                    headsign=headsign,
+                    via_hint=turn_around,
+                    pattern_trip_ids=[],
+                )
+            )
+
+    candidates.sort(key=_destination_sort_key)
+    return candidates
+
+
+def collapse_direction_candidates(
+    trips: list[dict],
+    destination_stop_id: str,
+) -> list[Destination]:
+    """Derive direction candidates for a chosen destination from trip evidence.
+
+    Unlike :func:`build_destination_candidates` this collapses to ONE candidate
+    per ``direction_id`` (multiple patterns / intermediate-vs-terminus reachings
+    of the same destination share a direction).  A loop trip (first == last)
+    adds a via-labelled second candidate for its self-returning direction.
+    """
+    groups: dict[int | None, dict] = {}
+    for tr in trips:
+        stops = tr["stops"]
+        if not stops:
+            continue
+        terminal = stops[-1]
+        dir_id = tr["direction_id"]
+        g = groups.get(dir_id)
+        if g is None:
+            g = {"headsigns": {}, "terminals": {}, "loop_turnarounds": set()}
+            groups[dir_id] = g
+        g["headsigns"][tr["headsign"]] = g["headsigns"].get(tr["headsign"], 0) + 1
+        name, count = g["terminals"].get(terminal[0], (terminal[1], 0))
+        g["terminals"][terminal[0]] = (name, count + 1)
+        if len(stops) >= 2 and stops[0][0] == terminal[0]:
+            g["loop_turnarounds"].add(stops[-2][1])
+
+    candidates: list[Destination] = []
+    for dir_id in sorted(groups, key=lambda d: d if d is not None else -1):
+        g = groups[dir_id]
+        headsign = _most_common_headsign(g["headsigns"])
+        if any(tid == destination_stop_id for tid in g["terminals"]):
+            terminal_stop_id = destination_stop_id
+            terminal_stop_name = g["terminals"][destination_stop_id][0]
+        else:
+            terminal_stop_id, (terminal_stop_name, _count) = max(
+                g["terminals"].items(), key=lambda kv: kv[1][1]
+            )
+        candidates.append(
+            Destination(
+                direction_id=dir_id,
+                terminal_stop_id=terminal_stop_id,
+                terminal_stop_name=terminal_stop_name,
+                headsign=headsign,
+                via_hint=None,
+                pattern_trip_ids=[],
+            )
+        )
+        for turn_around in sorted(g["loop_turnarounds"]):
+            candidates.append(
+                Destination(
+                    direction_id=dir_id,
+                    terminal_stop_id=terminal_stop_id,
+                    terminal_stop_name=terminal_stop_name,
+                    headsign=headsign,
+                    via_hint=turn_around,
+                    pattern_trip_ids=[],
+                )
+            )
+
+    candidates.sort(key=_destination_sort_key)
+    return candidates
+
+
+def get_terminals_for_route(db_path: Path, route_id: str) -> list[Destination]:
+    """Return distinct destination candidates (termini) for a route.
+
+    Derived from the ordered ``stop_sequences`` of the route's trips, with
+    headsign/via disambiguation (see :func:`build_destination_candidates`).
+    Deterministically ordered by (direction, terminal name, via, stop_id).
+    """
+    trips = load_trip_shapes(db_path, route_id=route_id)
+    if not trips:
+        return []
+    return build_destination_candidates(trips)
+
+
+def get_lines_between(
+    db_path: Path,
+    origin_stop_id: str,
+    destination_stop_id: str,
+    route_types: list[int] | None = None,
+) -> list[LineCandidate]:
+    """Return distinct (route, direction, via) candidates serving a stop pair.
+
+    T8 plumbing: the group flow uses this to list every route+direction that
+    carries a passenger from ``origin_stop_id`` to ``destination_stop_id`` in
+    order, collapsing multiple patterns to a terminus into a single candidate
+    (with a ``via_hint`` when a terminus has distinct intermediate routings).
+    """
+    trip_ids = reaching_trip_ids(
+        db_path, origin_stop_id, destination_stop_id, route_types=route_types
+    )
+    if not trip_ids:
+        return []
+    trips = load_trip_shapes(db_path, trip_ids=trip_ids)
+
+    groups: dict[tuple, dict] = {}
+    for tr in trips:
+        stops = tr["stops"]
+        if not stops:
+            continue
+        terminal = stops[-1]
+        intermediate = stops[1:-1]
+        key = (tr["route_id"], tr["direction_id"], terminal[0])
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "route_id": tr["route_id"],
+                "route_short_name": tr["route_short_name"],
+                "route_long_name": tr["route_long_name"],
+                "route_color": tr["route_color"],
+                "direction_id": tr["direction_id"],
+                "terminal_stop_id": terminal[0],
+                "terminal_stop_name": terminal[1],
+                "sigs": {},
+            }
+            groups[key] = g
+        sig = tuple(s[0] for s in intermediate)
+        rec = g["sigs"].setdefault(sig, {"via": None})
+        if sig:
+            rec["via"] = intermediate[-1][1]
+
+    candidates: list[LineCandidate] = []
+    for _key, g in groups.items():
+        sigs = g["sigs"]
+        if len(sigs) == 1:
+            candidates.append(
+                LineCandidate(
+                    route_id=g["route_id"],
+                    route_short_name=g["route_short_name"],
+                    route_long_name=g["route_long_name"],
+                    direction_id=g["direction_id"],
+                    terminal_stop_id=g["terminal_stop_id"],
+                    terminal_stop_name=g["terminal_stop_name"],
+                    via_hint=None,
+                    route_color=g["route_color"],
+                )
+            )
+        else:
+            for rec in sigs.values():
+                candidates.append(
+                    LineCandidate(
+                        route_id=g["route_id"],
+                        route_short_name=g["route_short_name"],
+                        route_long_name=g["route_long_name"],
+                        direction_id=g["direction_id"],
+                        terminal_stop_id=g["terminal_stop_id"],
+                        terminal_stop_name=g["terminal_stop_name"],
+                        via_hint=rec["via"],
+                        route_color=g["route_color"],
+                    )
+                )
+
+    candidates.sort(key=_line_sort_key)
+    return candidates
