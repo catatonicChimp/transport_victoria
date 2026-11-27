@@ -1105,6 +1105,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 },
                 options={
                     CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
+                    CONF_REALTIME_ENABLED: True,
                     CONF_SUBENTRY_ORDER: [],
                     CONF_SHOW_RUN_NUMBERS: DEFAULT_SHOW_RUN_NUMBERS,
                     CONF_SHOW_VEHICLE_TYPE: DEFAULT_SHOW_VEHICLE_TYPE,
@@ -1899,7 +1900,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
     async def async_step_board_settings(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Board settings: name, departure count, and display prefs."""
+        """Board settings: name, departure count, realtime, and display prefs."""
         if user_input is not None:
             board_name = user_input.get(CONF_BOARD_NAME, "").strip()
             data_updates = {}
@@ -1908,6 +1909,9 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
             options = dict(self.config_entry.options)
             options[CONF_DEPARTURE_COUNT] = int(
                 user_input.get(CONF_DEPARTURE_COUNT, options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT))
+            )
+            options[CONF_REALTIME_ENABLED] = bool(
+                user_input.get(CONF_REALTIME_ENABLED, options.get(CONF_REALTIME_ENABLED, True))
             )
             options[CONF_SHOW_RUN_NUMBERS] = bool(user_input.get(CONF_SHOW_RUN_NUMBERS, options.get(CONF_SHOW_RUN_NUMBERS, DEFAULT_SHOW_RUN_NUMBERS)))
             options[CONF_SHOW_VEHICLE_TYPE] = bool(user_input.get(CONF_SHOW_VEHICLE_TYPE, options.get(CONF_SHOW_VEHICLE_TYPE, DEFAULT_SHOW_VEHICLE_TYPE)))
@@ -1921,6 +1925,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
         data = self.config_entry.data
         current_name = data.get(CONF_BOARD_NAME, self.config_entry.title)
         current_count = int(options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT))
+        current_realtime = bool(options.get(CONF_REALTIME_ENABLED, True))
         current_runs = bool(options.get(CONF_SHOW_RUN_NUMBERS, DEFAULT_SHOW_RUN_NUMBERS))
         current_vehicle = bool(options.get(CONF_SHOW_VEHICLE_TYPE, DEFAULT_SHOW_VEHICLE_TYPE))
 
@@ -1936,6 +1941,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
                         mode=selector.NumberSelectorMode.BOX,
                     )
                 ),
+                vol.Required(CONF_REALTIME_ENABLED, default=current_realtime): selector.BooleanSelector(),
                 vol.Required(CONF_SHOW_RUN_NUMBERS, default=current_runs): selector.BooleanSelector(),
                 vol.Required(CONF_SHOW_VEHICLE_TYPE, default=current_vehicle): selector.BooleanSelector(),
             }),
