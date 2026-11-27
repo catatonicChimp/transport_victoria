@@ -35,6 +35,7 @@ from .const import (
     PICTOGRAM_URL_BASE,
 )
 from .board import PinData, board_bundles, validate_pin
+from .board_coordinator import BoardCoordinator
 from .coordinator import PTVDataUpdateCoordinator
 from .device_tracker import RouteVehicleCoordinator, VehicleTrackerCoordinator
 from .gtfs.downloader import check_for_remote_changes, download_zip
@@ -54,6 +55,10 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # Platforms registered for departure watch entries
 _WATCH_PLATFORMS: list[str] = ["sensor", "binary_sensor"]
+
+# Platforms registered for trip-group board entries (T10 adds the direction
+# select; sensor + binary_sensor carry the ranked departures + disruption).
+_BOARD_PLATFORMS: list[str] = ["sensor", "binary_sensor", "select"]
 
 # Platforms registered for vehicle tracker entries
 _TRACKER_PLATFORMS: list[str] = ["device_tracker"]
@@ -346,7 +351,20 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     Departure count changes require a full reload to add/remove sensor entities.
     All other changes (poll interval, realtime toggle, name) are applied live.
     """
+    entry_type = entry.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH)
     stored = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+
+    if entry_type == ENTRY_TYPE_BOARD:
+        prev_count = stored.get("departure_count", BOARD_DEFAULT_DEPARTURE_COUNT)
+        new_count = int(
+            entry.options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT)
+        )
+        if new_count != prev_count:
+            await hass.config_entries.async_reload(entry.entry_id)
+            return
+        # realtime toggle is read live from entry.options on each board poll.
+        return
+
     prev_count = stored.get("departure_count", DEFAULT_DEPARTURE_COUNT)
     new_count = int(entry.options.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT))
 
@@ -697,12 +715,11 @@ async def _async_setup_watch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_setup_board(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a trip-group board config entry.
 
-    T8 models the board only — no entities yet (T9 aggregation, T10 entities).
-    This registers the board as a schedule consumer with the union of its pins'
-    bundle folders (so the shared manager keeps every pin's schedule fresh),
-    triggers a refresh of that union, and revalidates each pin against the
-    current generation (marking — not deleting — pins whose combination became
-    impossible).
+    Registers the board as a schedule consumer with the union of its pins'
+    bundle folders, triggers a refresh of that union, revalidates each pin
+    against the current generation (marking — not deleting — pins whose
+    combination became impossible), and creates a :class:`BoardCoordinator`
+    (T10) that exposes the merged board as entities.
     """
     # Ensure the data directory exists (blocking I/O → executor).
     await hass.async_add_executor_job(
@@ -726,7 +743,7 @@ async def _async_setup_board(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             pin = PinData.from_dict(sub.data)
             result = await hass.async_add_executor_job(validate_pin, db_path, pin)
             if not result.ok:
-                invalid.add(sub.subentry_id)
+                invalid.add(pin.pin_key)
                 _LOGGER.warning(
                     "Board '%s' pin '%s' no longer resolves (%s) — marked invalid",
                     entry.title,
@@ -734,12 +751,23 @@ async def _async_setup_board(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     result.reason,
                 )
 
+        coordinator = BoardCoordinator(
+            hass, entry, db_path, invalid_pins=invalid
+        )
+        await coordinator.async_config_entry_first_refresh()
+        entry.runtime_data = coordinator
+
+        cancel_options = entry.add_update_listener(_async_options_updated)
+
         hass.data[DOMAIN][entry.entry_id] = {
+            "cancel_options": cancel_options,
             "invalid_pins": invalid,
             "departure_count": int(
                 entry.options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT)
             ),
         }
+
+        await hass.config_entries.async_forward_entry_setups(entry, _BOARD_PLATFORMS)
     except BaseException:
         await manager.consumer_unloaded(entry.entry_id)
         raise
@@ -809,8 +837,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     is_board = entry_type == ENTRY_TYPE_BOARD
 
     if is_board:
-        # No platforms to unload yet (T8 has no board entities).
-        unload_ok = True
+        unload_ok = await hass.config_entries.async_unload_platforms(
+            entry, _BOARD_PLATFORMS
+        )
     else:
         platforms = _TRACKER_PLATFORMS if is_tracker else _WATCH_PLATFORMS
         unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)

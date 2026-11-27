@@ -150,6 +150,25 @@
           "departure_count": "Number of next services",
           "max_vehicles": "Number of vehicles to track"
         }
+      },
+      "board_settings": {
+        "title": "Board Settings",
+        "description": "Adjust settings for this board.",
+        "data": {
+          "board_name": "Name",
+          "departure_count": "Number of next services",
+          "realtime_enabled": "Enable real-time data",
+          "show_run_numbers": "Show run numbers",
+          "show_vehicle_type": "Show vehicle type"
+        }
+      }
+    }
+  },
+  "entity": {
+    "board_direction": {
+      "state": {
+        "configured": "Configured directions",
+        "opposite": "Opposite directions"
       }
     }
   }

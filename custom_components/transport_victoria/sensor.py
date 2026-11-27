@@ -4,6 +4,9 @@ Each watch (config entry) produces three departure sensors, one per slot.
 The sensor state is the actual departure datetime (timezone-aware), displayed
 by HA as a local time. The `minutes_until` attribute carries the integer minutes
 value for automations.
+
+Board entries (T10) instead produce ``departure_1..N`` ranked sensors over the
+merged board's rows, plus one diagnostics sensor per watch.
 """
 
 from __future__ import annotations
@@ -24,17 +27,24 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
+from .board_aggregation import BoardDeparture, BoardResult
+from .board_coordinator import BoardCoordinator
 from .const import (
     ATTRIBUTION,
+    BOARD_ROLE_DEPARTURE,
+    CONF_BOARD_NAME,
     CONF_DEPARTURE_COUNT,
+    CONF_ENTRY_TYPE,
     CONF_MODE,
     CONF_STOP_NAME,
     CONF_WATCH_NAME,
     DEFAULT_DEPARTURE_COUNT,
     DOMAIN,
+    ENTRY_TYPE_BOARD,
     MODE_MDI_ICON,
     MODE_PICTOGRAM,
     PICTOGRAM_URL_BASE,
+    board_entity_unique_id,
 )
 from .coordinator import PTVDataUpdateCoordinator
 from .models import CoordinatorData, Departure
@@ -56,6 +66,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up departure sensor entities for a config entry."""
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD:
+        await _async_setup_board_entries(hass, entry, async_add_entities)
+        return
+
     coordinator: PTVDataUpdateCoordinator = entry.runtime_data
     count = int(entry.options.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT))
     entities: list[SensorEntity] = [
@@ -63,6 +77,134 @@ async def async_setup_entry(
     ]
     entities.append(PTVDiagnosticsSensor(coordinator, entry))
     async_add_entities(entities)
+
+
+async def _async_setup_board_entries(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up ranked board departure sensors (departure_1..N)."""
+    coordinator: BoardCoordinator = entry.runtime_data
+    count = coordinator.departure_count
+    entities: list[SensorEntity] = [
+        BoardDepartureSensor(coordinator, entry, slot) for slot in range(1, count + 1)
+    ]
+    async_add_entities(entities)
+
+
+class BoardDepartureSensor(CoordinatorEntity[BoardCoordinator], SensorEntity):  # type: ignore[misc]
+    """One ranked departure slot on a merged board (departure_1..N).
+
+    State is the expected departure (realtime) else the scheduled departure, as
+    a timezone-aware datetime (TIMESTAMP device class).  When fewer than N rows
+    exist the sensor is ``unknown``; when the coordinator fails it is
+    ``unavailable`` (via the coordinator's ``last_update_success``).
+    """
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_attribution = ATTRIBUTION
+
+    def __init__(
+        self,
+        coordinator: BoardCoordinator,
+        entry: ConfigEntry,
+        slot: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._slot = slot
+        self._entry = entry
+        self._attr_unique_id = board_entity_unique_id(
+            entry.entry_id, BOARD_ROLE_DEPARTURE, slot
+        )
+        self._attr_name = f"Departure {slot}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Group all board entities under one device (the board entry)."""
+        board_name = self._entry.data.get(CONF_BOARD_NAME, self._entry.entry_id)
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=board_name,
+            manufacturer="Transport Victoria",
+            model="Departure board",
+        )
+
+    @property
+    def _data(self) -> BoardResult | None:
+        return self.coordinator.data
+
+    @property
+    def _row(self) -> BoardDeparture | None:
+        data = self._data
+        if data is None or len(data.rows) < self._slot:
+            return None
+        return data.rows[self._slot - 1]
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Expected (realtime) else scheduled departure, as an aware datetime."""
+        row = self._row
+        if row is None:
+            return None
+        departure = row.expected_departure or row.scheduled_departure
+        return departure.replace(tzinfo=self.coordinator.local_tz)
+
+    @property
+    def icon(self) -> str:
+        row = self._row
+        if row is None:
+            return "mdi:clock-outline"
+        if row.is_cancelled:
+            return "mdi:cancel"
+        if row.delay_seconds and row.delay_seconds > 60:
+            return "mdi:clock-alert-outline"
+        return "mdi:clock-outline"
+
+    @property
+    def available(self) -> bool:
+        """Unavailable only when the coordinator has not successfully updated."""
+        return bool(self.coordinator.last_update_success)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self._data
+        row = self._row
+        if data is None or row is None:
+            return {}
+
+        pin = self.coordinator.pin_by_key.get(row.pin_key)
+        attrs: dict[str, Any] = {
+            "route": row.route_short_name or row.route_long_name,
+            "route_number": row.route_short_name,
+            "destination": row.destination_label,
+            "headsign": row.headsign,
+            "boarding_stop": row.boarding_stop_name,
+            "platform": row.platform,
+            "trip_id": row.trip_id,
+            "scheduled": row.scheduled_departure.isoformat(),
+            "expected": (
+                row.expected_departure.isoformat()
+                if row.expected_departure is not None
+                else None
+            ),
+            "delay_seconds": row.delay_seconds,
+            "cancelled": row.is_cancelled,
+            "skipped": row.is_skipped,
+            "skipped_stops_count": row.skipped_stops_count,
+            "realtime_state": row.realtime_state,
+            "direction_id": row.direction_id,
+            "pin_order": row.pin_order_index,
+            "pin_label_from": pin.label_from if pin is not None else None,
+            "pin_label_to": (
+                pin.label_to if pin is not None else row.destination_label
+            ),
+        }
+        # sync_index surfaces once, on departure_1 only (compact, documented).
+        if self._slot == 1:
+            attrs["sync_index"] = data.sync_index
+        return attrs
 
 
 class PTVDepartureSensor(CoordinatorEntity[PTVDataUpdateCoordinator], SensorEntity):  # type: ignore[misc]

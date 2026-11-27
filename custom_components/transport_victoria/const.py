@@ -249,6 +249,23 @@ def board_entity_unique_id(parent_entry_id: str, role: str, rank: int) -> str:
     """Build the stable unique id for a board entity (see T10 contract)."""
     return BOARD_ENTITY_SEPARATOR.join((parent_entry_id, role, str(rank)))
 
+
+# Board entity roles (the "role" slot of ``board_entity_unique_id``).  ``rank``
+# is 1-based for per-slot entities (departure 1..N) and 0 for board-level
+# singletons (disruption, direction), which have no pin position to anchor to.
+BOARD_ROLE_DEPARTURE = "departure"
+BOARD_ROLE_DISRUPTION = "disruption"
+BOARD_ROLE_DIRECTION = "direction"
+
+# Board direction-select runtime values (in-memory only — never persisted to
+# options, so they reset to ``BOARD_DIRECTION_CONFIGURED`` on restart).
+BOARD_DIRECTION_CONFIGURED = "configured"
+BOARD_DIRECTION_OPPOSITE = "opposite"
+
+# Default for the board's realtime toggle (added in T10; watches already use
+# ``CONF_REALTIME_ENABLED`` with the same default).
+DEFAULT_BOARD_REALTIME_ENABLED = True
+
 # -------------------------------------------------------------------
 # Coordinator / polling
 # -------------------------------------------------------------------

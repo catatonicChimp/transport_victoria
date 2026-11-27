@@ -3,6 +3,10 @@
 One binary sensor per watch — on when there is at least one active service
 alert affecting the configured stop or route. Attributes carry the first
 alert's details for use in HA notifications.
+
+Board entries (T10) instead get a single ``disruptions`` binary sensor over the
+merged board's matched alerts, with a trustworthy OFF (unavailable when the
+service-alert feed failed, so OFF never means "confidently no disruption").
 """
 
 from __future__ import annotations
@@ -21,7 +25,23 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import ATTRIBUTION, CONF_MODE, CONF_STOP_NAME, CONF_WATCH_NAME, DOMAIN, MODE_PICTOGRAM, PICTOGRAM_URL_BASE
+from .board_aggregation import FEED_FAILED, BoardResult
+from .board_coordinator import BoardCoordinator
+from .const import (
+    ATTRIBUTION,
+    BOARD_ROLE_DISRUPTION,
+    CONF_BOARD_NAME,
+    CONF_ENTRY_TYPE,
+    CONF_MODE,
+    CONF_STOP_NAME,
+    CONF_WATCH_NAME,
+    DOMAIN,
+    ENTRY_TYPE_BOARD,
+    FEED_SERVICE_ALERTS,
+    MODE_PICTOGRAM,
+    PICTOGRAM_URL_BASE,
+    board_entity_unique_id,
+)
 from .coordinator import PTVDataUpdateCoordinator
 from .models import Alert, CoordinatorData
 
@@ -34,8 +54,93 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the disruption binary sensor for a config entry."""
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD:
+        coordinator: BoardCoordinator = entry.runtime_data
+        async_add_entities([BoardDisruptionBinarySensor(coordinator, entry)])
+        return
+
     coordinator: PTVDataUpdateCoordinator = entry.runtime_data
     async_add_entities([PTVDisruptionBinarySensor(coordinator, entry)])
+
+
+class BoardDisruptionBinarySensor(
+    CoordinatorEntity[BoardCoordinator], BinarySensorEntity  # type: ignore[misc]
+):
+    """Binary sensor: on when an active alert matches any enabled board pin.
+
+    OFF is trustworthy: when the service-alert feed for any mode failed, the
+    sensor is marked unavailable (not confidently-off), because a missing alert
+    feed cannot certify "no disruption".
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Disruptions"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_attribution = ATTRIBUTION
+
+    def __init__(
+        self,
+        coordinator: BoardCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = board_entity_unique_id(
+            entry.entry_id, BOARD_ROLE_DISRUPTION, 0
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        board_name = self._entry.data.get(CONF_BOARD_NAME, self._entry.entry_id)
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=board_name,
+            manufacturer="Transport Victoria",
+            model="Departure board",
+        )
+
+    @property
+    def _data(self) -> BoardResult | None:
+        return self.coordinator.data
+
+    def _alert_feed_failed(self, data: BoardResult) -> bool:
+        """True when any service-alert feed failed (OFF would be dishonest)."""
+        return any(
+            key[1] == FEED_SERVICE_ALERTS and health.state == FEED_FAILED
+            for key, health in data.feed_health.items()
+        )
+
+    @property
+    def available(self) -> bool:
+        """Unavailable when the coordinator failed OR an alert feed failed."""
+        if not self.coordinator.last_update_success:
+            return False
+        data = self._data
+        if data is None:
+            return False
+        return not self._alert_feed_failed(data)
+
+    @property
+    def is_on(self) -> bool:
+        data = self._data
+        return bool(data and data.alerts)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self._data
+        if not data or not data.alerts:
+            return {}
+        # Compact: alert ids + first 120 chars of header + matched pin keys.
+        alerts: list[dict[str, Any]] = []
+        for alert in data.alerts:
+            alerts.append(
+                {
+                    "id": alert.alert_id,
+                    "header": (alert.header or "")[:120],
+                    "pins": [m.pin_key for m in alert.matches],
+                }
+            )
+        return {"alerts": alerts, "alert_count": len(alerts)}
 
 
 class PTVDisruptionBinarySensor(

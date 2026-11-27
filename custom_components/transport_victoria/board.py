@@ -53,6 +53,7 @@ from .gtfs.repository import (
     RouteResult,
     get_lines_between,
     get_routes_for_stop,
+    get_terminals_for_route,
 )
 from .routing.destination import destination_label, resolve_destination
 
@@ -383,6 +384,96 @@ def validate_pin(db_path: Path, pin: PinData) -> PinValidation:
         direction_id=pin.direction_id,
         candidates=resolution.candidates,
     )
+
+
+# ---------------------------------------------------------------------------
+# Opposite-direction runtime transform (T10)
+#
+# The board's direction select (see select.py) toggles between the configured
+# direction and the OPPOSITE direction of each pin at runtime.  This mapping
+# lives here (pure, no homeassistant) so the coordinator adapter can apply it
+# inside its executor offload and the light-env tests can exercise it directly
+# against the T6 fixtures.
+#
+# Semantics (chosen for T10):
+#   * A pin with ``all_destinations`` True ignores the toggle (there is no
+#     "configured direction" to invert) and is returned unchanged.
+#   * A specific-destination pin is flipped to the OTHER direction of its route
+#     (from :func:`get_terminals_for_route`: the first terminal whose
+#     ``direction_id`` differs from the stored one).  ``destination_stop_id`` is
+#     set to None — the *destination filter is turned off* — so the schedule
+#     query returns every service at the boarding stop, and ``label_to`` is set
+#     to the opposite terminal's name so the row's destination label reads as
+#     "that direction's terminal".  ``direction_id`` is flipped too (used only
+#     for alert matching; the aggregation's schedule query has no direction
+#     filter).
+#   * A route with only ONE direction (loops, single-terminus routes) leaves the
+#     pin unchanged.
+#
+# The transform returns NEW PinData copies; it never mutates or rewrites the
+# pin's config data, and ``pin_key`` is preserved so board provenance (dedupe,
+# alert matching, pin-order index) stays stable across the toggle.
+# ---------------------------------------------------------------------------
+
+OPPOSITE_NO_OPPOSITE = "no_opposite_direction"
+
+
+def opposite_direction_pin(db_path: Path, pin: PinData) -> PinData:
+    """Return a copy of ``pin`` with its direction flipped, or ``pin`` itself
+    when there is nothing to flip (all-destinations or single-direction route)."""
+    if pin.all_destinations:
+        return pin
+
+    terminals = get_terminals_for_route(db_path, pin.route_id)
+    opposite = _opposite_terminal(terminals, pin.direction_id)
+    if opposite is None:
+        return pin
+
+    return PinData(
+        pin_key=pin.pin_key,
+        route_type=pin.route_type,
+        route_id=pin.route_id,
+        boarding_stop_id=pin.boarding_stop_id,
+        boarding_stop_name=pin.boarding_stop_name,
+        route_short_name=pin.route_short_name,
+        route_long_name=pin.route_long_name,
+        all_destinations=False,
+        # Destination filter OFF: no destination_stop_id, so the aggregation
+        # queries every service at the boarding stop (no terminal EXISTS clause).
+        destination_stop_id=None,
+        destination_stop_name=opposite.terminal_stop_name,
+        direction_id=opposite.direction_id,
+        via_hint=None,
+        label_from=pin.label_from,
+        label_to=destination_label(opposite),
+        platform_filter=pin.platform_filter,
+        colour_override=pin.colour_override,
+        include=pin.include,
+    )
+
+
+def opposite_direction_pins(db_path: Path, pins: list[PinData]) -> list[PinData]:
+    """Return the opposite-direction transform of a board's pins (see above)."""
+    return [opposite_direction_pin(db_path, pin) for pin in pins]
+
+
+def _opposite_terminal(
+    terminals: list[Destination], stored_direction: int | None
+) -> Destination | None:
+    """Return the first terminal whose direction differs from ``stored_direction``.
+
+    ``None`` when the route has no other direction (or no terminals at all).
+    Grouped so several terminals sharing the opposite direction collapse to one
+    deterministic pick (ordered by ``_destination_sort_key`` in the repository).
+    """
+    if stored_direction is None:
+        # A specific-destination pin without a stored direction cannot be
+        # inverted reliably — leave it alone (caller treats None as no-op).
+        return None
+    for terminal in terminals:
+        if terminal.direction_id is not None and terminal.direction_id != stored_direction:
+            return terminal
+    return None
 
 
 # ---------------------------------------------------------------------------

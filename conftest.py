@@ -32,7 +32,15 @@ def _real_homeassistant() -> bool:
 
 if not _real_homeassistant():  # pragma: no cover - only reached in the light env
 
-    class _Stub:
+    class _StubMeta(type):
+        """Metaclass so class-level attribute access (e.g. ``SensorDeviceClass.
+        TIMESTAMP``, ``BinarySensorDeviceClass.PROBLEM``) also returns a sentinel."""
+
+        def __getattr__(cls, name):
+            return _Stub()
+
+
+    class _Stub(metaclass=_StubMeta):
         """Universal stub: callable, iterable, usable as base class, returns itself."""
         def __init__(self, *a, **kw): pass
         def __call__(self, *a, **kw): return _Stub()
@@ -57,6 +65,7 @@ if not _real_homeassistant():  # pragma: no cover - only reached in the light en
         "homeassistant.components.http",
         "homeassistant.components.binary_sensor",
         "homeassistant.components.sensor",
+        "homeassistant.components.select",
         "homeassistant.components.device_tracker",
         "homeassistant.components.device_tracker.config_entry",
         "homeassistant.config_entries",
@@ -126,11 +135,18 @@ if not _real_homeassistant():  # pragma: no cover - only reached in the light en
 
     _coord.UpdateFailed = _UpdateFailed  # type: ignore[attr-defined]
     class _CoordinatorEntityBase:
-        """Distinct base for CoordinatorEntity (must not alias TrackerEntity)."""
+        """Distinct base for CoordinatorEntity (must not alias TrackerEntity).
+
+        Stores the coordinator (like the real CoordinatorEntity.__init__) so the
+        light-env entity tests can instantiate board/watch entities directly.
+        """
 
         @classmethod
         def __class_getitem__(cls, item):
             return cls
+
+        def __init__(self, coordinator=None, *args, **kwargs):
+            self.coordinator = coordinator
 
 
     _coord.CoordinatorEntity = _CoordinatorEntityBase  # type: ignore[attr-defined]
@@ -158,6 +174,8 @@ if not _real_homeassistant():  # pragma: no cover - only reached in the light en
         utcnow=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
         # now() returns a naive local datetime (as HA's dt_util.now() does).
         now=lambda: __import__("datetime").datetime.now(),
+        # get_time_zone(name) → a real zoneinfo.ZoneInfo (as HA's dt_util does).
+        get_time_zone=lambda name: __import__("zoneinfo").ZoneInfo(name or "UTC"),
     )
 
     _bs = sys.modules["homeassistant.components.binary_sensor"]
@@ -167,6 +185,9 @@ if not _real_homeassistant():  # pragma: no cover - only reached in the light en
     _se = sys.modules["homeassistant.components.sensor"]
     _se.SensorDeviceClass = _Stub  # type: ignore[attr-defined]
     _se.SensorEntity = _Stub  # type: ignore[attr-defined]
+
+    _select = sys.modules["homeassistant.components.select"]
+    _select.SelectEntity = _Stub  # type: ignore[attr-defined]
 
     _const = sys.modules["homeassistant.const"]
     _const.EntityCategory = _Stub  # type: ignore[attr-defined]
