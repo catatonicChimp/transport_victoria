@@ -43,7 +43,6 @@ from .const import (
     CONF_MAX_VEHICLES,
     CONF_MIN_TRANSFER_MINUTES,
     CONF_MODE,
-    CONF_PARENT_ENTRY_ID,
     CONF_PLATFORM_FILTER,
     CONF_DEPARTURE_COUNT,
     CONF_POLL_INTERVAL,
@@ -63,6 +62,7 @@ from .const import (
     CONF_STOP_ID,
     CONF_STOP_NAME,
     CONF_SUBENTRY_ORDER,
+    CONF_TRACK_VEHICLES,
     CONF_TRANSFER_STOP_ID,
     CONF_TRANSFER_STOP_NAME,
     CONF_WATCH_NAME,
@@ -1090,6 +1090,11 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 return self.async_create_entry(
                     title=watch_name,
                     data=self._config,
+                    options={
+                        CONF_TRACK_VEHICLES: bool(
+                            user_input.get(CONF_TRACK_VEHICLES, False)
+                        )
+                    },
                 )
 
         # Auto-suggest a name
@@ -1137,6 +1142,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             step_id="confirm",
             data_schema=vol.Schema({
                 vol.Required(CONF_WATCH_NAME, default=suggested): selector.TextSelector(),
+                vol.Required(CONF_TRACK_VEHICLES, default=False): selector.BooleanSelector(),
             }),
             description_placeholders={
                 "stop_name": stop_name,
@@ -1168,22 +1174,23 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             return ""
 
     # ------------------------------------------------------------------
-    # Vehicle tracker sub-flow (branched from Step 1 via entry type choice)
+    # Entry type choice (departure watch / route tracker / board)
     # ------------------------------------------------------------------
 
     async def async_step_entry_type(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose between a Departure Watch, Vehicle Tracker, Route Tracker, or Board.
+        """Choose between a Departure Watch, Route Tracker, or Board.
 
         The board name is collected on this same screen (no separate naming
         step): picking "Trip-Group Board" and submitting creates the board with
         the name entered here.
+
+        (The legacy linked-vehicle-tracker entry type is no longer offered — it
+        was deprecated as a no-op by T16; existing entries still load.)
         """
         if user_input is not None:
             entry_type = user_input.get("entry_type", ENTRY_TYPE_WATCH)
-            if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
-                return await self.async_step_vehicle_tracker()
             if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
                 return await self.async_step_route_tracker_mode()
             if entry_type == ENTRY_TYPE_BOARD:
@@ -1209,10 +1216,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                         selector.SelectOptionDict(
                             value=ENTRY_TYPE_WATCH,
                             label="Station Departures",
-                        ),
-                        selector.SelectOptionDict(
-                            value=ENTRY_TYPE_VEHICLE_TRACKER,
-                            label="Vehicle Tracker (linked to Station)",
                         ),
                         selector.SelectOptionDict(
                             value=ENTRY_TYPE_ROUTE_TRACKER,
@@ -1482,76 +1485,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         if config_entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD:
             return {SUBENTRY_TYPE_PIN: PTVBoardSubentryFlow}
         return {}
-
-    async def async_step_vehicle_tracker(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Configure a vehicle tracker linked to an existing departure watch."""
-        errors: dict[str, str] = {}
-
-        # Get existing departure watch entries
-        existing_watches = [
-            e for e in self.hass.config_entries.async_entries(DOMAIN)
-            if e.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH) == ENTRY_TYPE_WATCH
-        ]
-
-        if not existing_watches:
-            return self.async_abort(reason="no_watches")
-
-        if user_input is not None:
-            parent_id = user_input.get("parent_entry_id", "")
-            if not parent_id:
-                errors["parent_entry_id"] = "required"
-            else:
-                # Store selected parent and move to name step
-                self._config[CONF_PARENT_ENTRY_ID] = parent_id
-                return await self.async_step_vehicle_tracker_name()
-
-        watch_options = [
-            selector.SelectOptionDict(
-                value=e.entry_id,
-                label=e.data.get(CONF_WATCH_NAME, e.entry_id),
-            )
-            for e in existing_watches
-        ]
-
-        return self.async_show_form(
-            step_id="vehicle_tracker",
-            data_schema=vol.Schema({
-                vol.Required("parent_entry_id", default=existing_watches[0].entry_id): _select_selector(watch_options),
-            }),
-            errors=errors,
-        )
-
-    async def async_step_vehicle_tracker_name(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Name the vehicle tracker (auto-populated from the selected station)."""
-        parent_id: str = self._config.get(CONF_PARENT_ENTRY_ID, "")
-        parent_entry = self.hass.config_entries.async_get_entry(parent_id)
-        parent_name = parent_entry.data.get(CONF_WATCH_NAME, parent_id) if parent_entry else parent_id
-        parent_mode = parent_entry.data.get(CONF_MODE, "") if parent_entry else ""
-        suggested_name = f"{parent_name} Vehicle" if parent_name else "PTV Vehicle"
-
-        if user_input is not None:
-            watch_name = user_input.get(CONF_WATCH_NAME, "").strip() or suggested_name
-            return self.async_create_entry(
-                title=watch_name,
-                data={
-                    CONF_ENTRY_TYPE: ENTRY_TYPE_VEHICLE_TRACKER,
-                    CONF_PARENT_ENTRY_ID: parent_id,
-                    CONF_WATCH_NAME: watch_name,
-                    CONF_MODE: parent_mode,
-                },
-            )
-
-        return self.async_show_form(
-            step_id="vehicle_tracker_name",
-            data_schema=vol.Schema({
-                vol.Required(CONF_WATCH_NAME, default=suggested_name): selector.TextSelector(),
-            }),
-            description_placeholders={"station_name": parent_name},
-        )
 
     # ------------------------------------------------------------------
     # Route tracker sub-flow
@@ -2308,9 +2241,6 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
         """Board settings: name, departure count, realtime, and display prefs."""
         if user_input is not None:
             board_name = user_input.get(CONF_BOARD_NAME, "").strip()
-            data_updates = {}
-            if board_name:
-                data_updates[CONF_BOARD_NAME] = board_name
             options = dict(self.config_entry.options)
             options[CONF_DEPARTURE_COUNT] = int(
                 user_input.get(CONF_DEPARTURE_COUNT, options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT))
@@ -2320,10 +2250,13 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
             )
             options[CONF_SHOW_RUN_NUMBERS] = bool(user_input.get(CONF_SHOW_RUN_NUMBERS, options.get(CONF_SHOW_RUN_NUMBERS, DEFAULT_SHOW_RUN_NUMBERS)))
             options[CONF_SHOW_VEHICLE_TYPE] = bool(user_input.get(CONF_SHOW_VEHICLE_TYPE, options.get(CONF_SHOW_VEHICLE_TYPE, DEFAULT_SHOW_VEHICLE_TYPE)))
+            options[CONF_TRACK_VEHICLES] = bool(user_input.get(CONF_TRACK_VEHICLES, options.get(CONF_TRACK_VEHICLES, False)))
             # Persist the name change (data) + options.
-            self.hass.config_entries.async_update_entry(
-                self.config_entry, **data_updates
-            )
+            if board_name:
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry,
+                    data={**self.config_entry.data, CONF_BOARD_NAME: board_name},
+                )
             return self.async_create_entry(data=options)
 
         options = self.config_entry.options
@@ -2333,6 +2266,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
         current_realtime = bool(options.get(CONF_REALTIME_ENABLED, True))
         current_runs = bool(options.get(CONF_SHOW_RUN_NUMBERS, DEFAULT_SHOW_RUN_NUMBERS))
         current_vehicle = bool(options.get(CONF_SHOW_VEHICLE_TYPE, DEFAULT_SHOW_VEHICLE_TYPE))
+        current_track = bool(options.get(CONF_TRACK_VEHICLES, False))
 
         return self.async_show_form(
             step_id="board_settings",
@@ -2349,6 +2283,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
                 vol.Required(CONF_REALTIME_ENABLED, default=current_realtime): selector.BooleanSelector(),
                 vol.Required(CONF_SHOW_RUN_NUMBERS, default=current_runs): selector.BooleanSelector(),
                 vol.Required(CONF_SHOW_VEHICLE_TYPE, default=current_vehicle): selector.BooleanSelector(),
+                vol.Required(CONF_TRACK_VEHICLES, default=current_track): selector.BooleanSelector(),
             }),
         )
 
@@ -2468,6 +2403,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
             CONF_DEPARTURE_COUNT,
             data.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT),
         ))
+        current_track = bool(current.get(CONF_TRACK_VEHICLES, False))
 
         return self.async_show_form(
             step_id="init",
@@ -2492,6 +2428,7 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
                         mode=selector.NumberSelectorMode.SLIDER,
                     )
                 ),
+                vol.Required(CONF_TRACK_VEHICLES, default=current_track): selector.BooleanSelector(),
             }),
         )
 

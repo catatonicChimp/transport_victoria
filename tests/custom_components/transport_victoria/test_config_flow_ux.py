@@ -48,9 +48,16 @@ from custom_components.transport_victoria.const import (
     CONF_INCLUDE,
     CONF_LABEL_FROM,
     CONF_LABEL_TO,
+    CONF_POLL_INTERVAL,
+    CONF_REALTIME_ENABLED,
+    CONF_SHOW_RUN_NUMBERS,
+    CONF_SHOW_VEHICLE_TYPE,
     CONF_SUBENTRY_ORDER,
+    CONF_TRACK_VEHICLES,
+    CONF_WATCH_NAME,
     DOMAIN,
     ENTRY_TYPE_BOARD,
+    ENTRY_TYPE_WATCH,
     SUBENTRY_TYPE_PIN,
 )
 
@@ -362,3 +369,129 @@ async def test_add_another_line_commits_and_restarts(monkeypatch):
     # Add-flow state is reset for the next pin.
     assert flow._pending_pin is None
     assert flow._boarding_stop_id == ""
+
+
+# ---------------------------------------------------------------------------
+# Fleet tracking opt-in (CONF_TRACK_VEHICLES) wiring
+# ---------------------------------------------------------------------------
+
+
+def _options_flow(entry_type: str, options: dict, data: dict | None = None):
+    entry = SimpleNamespace(
+        entry_id="entry1",
+        title="Entry",
+        data={CONF_ENTRY_TYPE: entry_type, **(data or {})},
+        options=options,
+    )
+    flow = cf.PTVOptionsFlow()
+    flow.config_entry = entry
+    flow.hass = SimpleNamespace(
+        config=SimpleNamespace(config_dir="/unused"),
+        config_entries=SimpleNamespace(
+            async_update_entry=lambda entry, **kw: None,
+        ),
+    )
+    return flow
+
+
+async def test_board_settings_track_vehicles_round_trip(monkeypatch):
+    """The board settings toggle persists into entry options."""
+    flow = _options_flow(ENTRY_TYPE_BOARD, {CONF_DEPARTURE_COUNT: 5})
+    created = {}
+
+    def fake_create_entry(**kwargs):
+        created.update(kwargs)
+        return {"type": "create_entry"}
+
+    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
+
+    await flow.async_step_board_settings({
+        CONF_BOARD_NAME: "Board",
+        CONF_DEPARTURE_COUNT: 5,
+        CONF_REALTIME_ENABLED: True,
+        CONF_SHOW_RUN_NUMBERS: True,
+        CONF_SHOW_VEHICLE_TYPE: True,
+        CONF_TRACK_VEHICLES: True,
+    })
+
+    assert created["data"][CONF_TRACK_VEHICLES] is True
+
+
+async def test_board_settings_track_vehicles_defaults_false(monkeypatch):
+    """Leaving the toggle off keeps it off (no accidental enable)."""
+    flow = _options_flow(ENTRY_TYPE_BOARD, {CONF_DEPARTURE_COUNT: 5})
+    created = {}
+
+    def fake_create_entry(**kwargs):
+        created.update(kwargs)
+        return {"type": "create_entry"}
+
+    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
+
+    await flow.async_step_board_settings({
+        CONF_BOARD_NAME: "Board",
+        CONF_DEPARTURE_COUNT: 5,
+        CONF_REALTIME_ENABLED: True,
+        CONF_SHOW_RUN_NUMBERS: True,
+        CONF_SHOW_VEHICLE_TYPE: True,
+        CONF_TRACK_VEHICLES: False,
+    })
+
+    assert created["data"][CONF_TRACK_VEHICLES] is False
+
+
+async def test_watch_confirm_track_vehicles_stored_in_options(monkeypatch):
+    """The watch creation confirm step stores the toggle in entry options."""
+    flow = cf.PTVConfigFlow()
+    flow.hass = SimpleNamespace(config=SimpleNamespace(config_dir="/unused"))
+    flow._config = {}
+    created = {}
+
+    def fake_create_entry(**kwargs):
+        created.update(kwargs)
+        return {"type": "create_entry"}
+
+    async def fake_summary():
+        return ""
+
+    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
+    monkeypatch.setattr(flow, "_get_disruption_summary", fake_summary)
+
+    await flow.async_step_confirm({
+        CONF_WATCH_NAME: "My Watch",
+        CONF_TRACK_VEHICLES: True,
+    })
+
+    assert created["title"] == "My Watch"
+    assert created["options"][CONF_TRACK_VEHICLES] is True
+
+
+async def test_watch_options_track_vehicles_round_trip(monkeypatch):
+    """The watch options flow persists the toggle (no silent loss on edit)."""
+    flow = _options_flow(
+        ENTRY_TYPE_WATCH,
+        {
+            CONF_WATCH_NAME: "W",
+            CONF_POLL_INTERVAL: 30,
+            CONF_REALTIME_ENABLED: True,
+            CONF_DEPARTURE_COUNT: 5,
+        },
+        data={CONF_WATCH_NAME: "W"},
+    )
+    created = {}
+
+    def fake_create_entry(**kwargs):
+        created.update(kwargs)
+        return {"type": "create_entry"}
+
+    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
+
+    await flow._step_watch({
+        CONF_WATCH_NAME: "W",
+        CONF_POLL_INTERVAL: "30",
+        CONF_REALTIME_ENABLED: True,
+        CONF_DEPARTURE_COUNT: 5,
+        CONF_TRACK_VEHICLES: True,
+    })
+
+    assert created["data"][CONF_TRACK_VEHICLES] is True

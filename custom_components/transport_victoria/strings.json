@@ -60,7 +60,8 @@
         "title": "Name This Watch",
         "description": "Tracking **{mode}** from **{stop_name}** to **{destination}**.\n\n{disruption}{city_loop_note}",
         "data": {
-          "watch_name": "Name"
+          "watch_name": "Name",
+          "track_vehicles": "Track vehicles (fleet)"
         }
       },
       "entry_type": {
@@ -255,7 +256,8 @@
           "poll_interval": "Update interval",
           "realtime_enabled": "Enable real-time data",
           "departure_count": "Number of next services",
-          "max_vehicles": "Number of vehicles to track"
+          "max_vehicles": "Number of vehicles to track",
+          "track_vehicles": "Track vehicles (fleet)"
         }
       },
       "board_menu": {
@@ -273,7 +275,8 @@
           "departure_count": "Number of next services",
           "realtime_enabled": "Enable real-time data",
           "show_run_numbers": "Show run numbers",
-          "show_vehicle_type": "Show vehicle type"
+          "show_vehicle_type": "Show vehicle type",
+          "track_vehicles": "Track vehicles (fleet)"
         }
       },
       "board_reorder": {

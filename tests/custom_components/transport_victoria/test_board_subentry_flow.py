@@ -53,9 +53,13 @@ from custom_components.transport_victoria.const import (  # noqa: E402
     CONF_LABEL_TO,
     CONF_PIN_KEY,
     CONF_PLATFORM_FILTER,
+    CONF_REALTIME_ENABLED,
     CONF_ROUTE_ID,
+    CONF_SHOW_RUN_NUMBERS,
+    CONF_SHOW_VEHICLE_TYPE,
     CONF_STOP_ID,
     CONF_SUBENTRY_ORDER,
+    CONF_TRACK_VEHICLES,
     DOMAIN,
     ENTRY_TYPE_BOARD,
     SUBENTRY_TYPE_PIN,
@@ -346,3 +350,35 @@ async def test_board_options_remove_deletes_subentry(hass, board_entry):
     assert first not in entry.subentries
     assert first not in entry.options[CONF_SUBENTRY_ORDER]
     assert len(entry.subentries) == 1
+
+
+async def test_board_options_settings_track_vehicles(hass, board_entry):
+    """The board settings screen exposes and persists the fleet-tracking toggle."""
+    result = await hass.config_entries.options.async_init(board_entry.entry_id)
+    assert result["step_id"] == "board_menu"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"board_action": "settings"}
+    )
+    assert result["step_id"] == "board_settings"
+    # The toggle is present in the rendered form schema.
+    schema = result["data_schema"].schema
+    assert any(
+        getattr(key, "schema", None) == CONF_TRACK_VEHICLES for key in schema
+    )
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            CONF_BOARD_NAME: "Test Board",
+            CONF_DEPARTURE_COUNT: 5,
+            CONF_REALTIME_ENABLED: True,
+            CONF_SHOW_RUN_NUMBERS: True,
+            CONF_SHOW_VEHICLE_TYPE: True,
+            CONF_TRACK_VEHICLES: True,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    entry = hass.config_entries.async_get_entry(board_entry.entry_id)
+    assert entry.options[CONF_TRACK_VEHICLES] is True
