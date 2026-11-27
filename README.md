@@ -1,8 +1,8 @@
 # Transport Victoria for Home Assistant
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/catatonicChimp/ha_transport_victoria/tests.yaml?branch=main&label=tests&logo=github)](https://github.com/catatonicChimp/ha_transport_victoria/actions/workflows/tests.yaml)
-[![HACS](https://img.shields.io/github/actions/workflow/status/catatonicChimp/ha_transport_victoria/hacs.yaml?branch=main&label=HACS&logo=github)](https://github.com/catatonicChimp/ha_transport_victoria/actions/workflows/hacs.yaml)
-[![Hassfest](https://img.shields.io/github/actions/workflow/status/catatonicChimp/ha_transport_victoria/hassfest.yaml?branch=main&label=hassfest&logo=github)](https://github.com/catatonicChimp/ha_transport_victoria/actions/workflows/hassfest.yaml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/catatonicChimp/transport_victoria/tests.yaml?branch=main&label=tests&logo=github)](https://github.com/catatonicChimp/transport_victoria/actions/workflows/tests.yaml)
+[![HACS](https://img.shields.io/github/actions/workflow/status/catatonicChimp/transport_victoria/hacs.yaml?branch=main&label=HACS&logo=github)](https://github.com/catatonicChimp/transport_victoria/actions/workflows/hacs.yaml)
+[![Hassfest](https://img.shields.io/github/actions/workflow/status/catatonicChimp/transport_victoria/hassfest.yaml?branch=main&label=hassfest&logo=github)](https://github.com/catatonicChimp/transport_victoria/actions/workflows/hassfest.yaml)
 
 A [Home Assistant](https://www.home-assistant.io/) custom integration for **[Transport Victoria](https://www.transport.vic.gov.au/)** data published on the **[Transport Victoria Open Data Portal](https://opendata.transport.vic.gov.au/)** (GTFS schedule and GTFS Realtime). It shows upcoming departures at a chosen stop (metro trains, trams, buses, regional buses, V/Line) and merges **GTFS schedule** data with **GTFS Realtime** delays and service alerts.
 
@@ -141,7 +141,7 @@ scripts/dev.sh                            # Podman-focused dev helpers
 
 ## Issues & contributions
 
-Bug reports and pull requests are welcome: [Issues](https://github.com/catatonicChimp/ha_transport_victoria/issues).
+Bug reports and pull requests are welcome: [Issues](https://github.com/catatonicChimp/transport_victoria/issues).
 
 ---
 
