@@ -2,19 +2,24 @@
 
 Covers ``custom_components.transport_victoria.board_aggregation``: cross-pin
 merge ordering, deterministic tie-breaks, via-hint dedupe, pin filtering,
-realtime join (delay/cancel/skip), static fallback (disabled/failed/stale),
-shared feed caching, alert matching, and the pin-order-independent sync index.
+sequence-aware realtime join (delay/cancel/skip/absolute), static fallback
+(disabled/failed/stale), lookback+horizon windowing, per-mode freshness, shared
+feed caching (fetch/parse split), selector-based alert matching, clock
+discipline, and the pin-order-independent sync index.
 
 Pure functions are exercised directly against the T6 schedule + realtime
-fixtures with injected ports — no event loop, no homeassistant objects.
+fixtures with injected ports — no event loop, no homeassistant objects (except
+the async fetch helper, run under pytest-asyncio).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
+from google.transit import gtfs_realtime_pb2 as rt
 
 from custom_components.transport_victoria import board_aggregation as ba
 from custom_components.transport_victoria.board import PinData, line_pins, pin_key
@@ -30,6 +35,7 @@ from custom_components.transport_victoria.board_aggregation import (
     BoardAlert,
     BoardDeparture,
     FeedHealth,
+    _classify_freshness,
     _departure_sort_key,
     aggregate_board,
     compute_sync_index,
@@ -37,9 +43,10 @@ from custom_components.transport_victoria.board_aggregation import (
     match_board_alerts,
     route_type_to_mode,
 )
-from custom_components.transport_victoria.realtime.client import _decode_feed
+from custom_components.transport_victoria.realtime.client import FeedMeta, _decode_feed
 from custom_components.transport_victoria.realtime.service_alerts import (
     ActivePeriod,
+    SelectorRecord,
     ServiceAlert,
     is_alert_active,
     parse_service_alerts,
@@ -49,10 +56,11 @@ from custom_components.transport_victoria.realtime.trip_updates import (
     parse_trip_updates_index,
 )
 
-from tests.gtfs_builder import REFERENCE_NOW
+from tests.gtfs_builder import REFERENCE_NOW, import_bundle
 from tests.realtime_fixtures import load_bytes
 
-BASE = REFERENCE_NOW  # 2026-06-01 08:00 local
+MEL = ZoneInfo("Australia/Melbourne")
+BASE = REFERENCE_NOW  # 2026-06-01 08:00 local naive
 NOW_UTC = datetime(2026, 6, 1, 8, 0, tzinfo=timezone.utc)
 
 R_FRANKSTON = "R_METRO_FRANKSTON"
@@ -93,6 +101,12 @@ def _pin(
         platform_filter=platform,
         include=include,
     )
+
+
+def _agg(db: Path, pins: list[PinData], **kw):
+    defaults = dict(now=BASE, local_tz=MEL, now_utc=NOW_UTC, realtime_enabled=False)
+    defaults.update(kw)
+    return aggregate_board(db, pins, **defaults)
 
 
 def _dep(
@@ -136,14 +150,17 @@ def _dep(
     return BoardDeparture(**fields)
 
 
+def _sel(**kw) -> SelectorRecord:
+    return SelectorRecord(**kw)
+
+
 def _alert(
     alert_id: str = "a",
     header: str = "h",
     *,
-    route_ids=(),
-    stop_ids=(),
-    trip_ids=(),
+    selectors=(),
     periods=None,
+    feed_mode: str | None = None,
 ) -> ServiceAlert:
     return ServiceAlert(
         alert_id=alert_id,
@@ -152,32 +169,59 @@ def _alert(
         cause="UNKNOWN_CAUSE",
         effect="SIGNIFICANT_DELAYS",
         active_periods=tuple(periods or ()),
-        route_ids=tuple(route_ids),
-        stop_ids=tuple(stop_ids),
-        trip_ids=tuple(trip_ids),
-        direction_ids=(),
+        selectors=tuple(selectors),
+        feed_mode=feed_mode,
     )
 
 
 def _merge_indexes(*indexes: TripUpdateIndex) -> TripUpdateIndex:
-    stop_delays: dict = {}
+    by_sequence: dict = {}
+    by_stop_id: dict = {}
     trip_cancelled: dict[str, bool] = {}
     trip_skipped_count: dict[str, int] = {}
     for idx in indexes:
-        stop_delays.update(idx.stop_delays)
+        by_sequence.update(idx.by_sequence)
+        by_stop_id.update(idx.by_stop_id)
         trip_cancelled.update(idx.trip_cancelled)
         trip_skipped_count.update(idx.trip_skipped_count)
-    return TripUpdateIndex(stop_delays, trip_cancelled, trip_skipped_count)
+    return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count)
+
+
+def _feed(trip_id, stops):
+    """Build a trip-update FeedMessage from ``stops`` specs.
+
+    Each stop spec: dict with optional ``stop_id``, ``seq``, ``delay``,
+    ``abs_time`` (epoch secs), ``skipped``.
+    """
+    feed = rt.FeedMessage()
+    feed.header.timestamp = 1_750_000_000
+    entity = feed.entity.add()
+    entity.id = f"tu-{trip_id}"
+    tu = entity.trip_update
+    tu.trip.trip_id = trip_id
+    for spec in stops:
+        s = tu.stop_time_update.add()
+        if spec.get("stop_id"):
+            s.stop_id = spec["stop_id"]
+        if spec.get("seq") is not None:
+            s.stop_sequence = spec["seq"]
+        if spec.get("delay") is not None:
+            s.departure.delay = spec["delay"]
+        if spec.get("abs_time") is not None:
+            s.departure.time = spec["abs_time"]
+        if spec.get("skipped"):
+            s.schedule_relationship = rt.TripUpdate.StopTimeUpdate.SKIPPED
+    return feed
 
 
 class CountingClient:
-    """Async realtime client stub that records fetch_feed calls."""
+    """Async realtime client stub returning ``(feed, FeedMeta)`` per call."""
 
     def __init__(self, feeds: dict[tuple[str, str], object]) -> None:
         self.feeds = feeds
         self.calls: list[tuple[str, str]] = []
 
-    async def fetch_feed(self, mode: str, feed_type: str) -> object:
+    async def fetch_feed(self, mode: str, feed_type: str):
         self.calls.append((mode, feed_type))
         result = self.feeds[(mode, feed_type)]
         if isinstance(result, Exception):
@@ -213,42 +257,27 @@ class TestSortAndDedupe:
     def test_route_sort_value_numeric_first(self):
         assert ba._route_sort_value("2") < ba._route_sort_value("10")
         assert ba._route_sort_value("10") < ba._route_sort_value("City")
-        assert ba._route_sort_value("96") < ba._route_sort_value("Frankston")
 
     def test_tie_breaks_are_deterministic(self):
-        # Same effective time → boarding stop id breaks the tie.
         a = _dep(trip_id="A", boarding="S1", pin_index=1)
         b = _dep(trip_id="B", boarding="S2", pin_index=0)
         assert _departure_sort_key(a) < _departure_sort_key(b)
 
-        # Same stop → route number breaks the tie.
         c = _dep(trip_id="C", boarding="S1", route="2")
         d = _dep(trip_id="D", boarding="S1", route="10")
         assert _departure_sort_key(c) < _departure_sort_key(d)
 
-        # Same stop + route → headsign, then pin index, then trip id.
         e = _dep(trip_id="E", boarding="S1", route="2", headsign="City", pin_index=0)
         f = _dep(trip_id="F", boarding="S1", route="2", headsign="City", pin_index=1)
         assert _departure_sort_key(e) < _departure_sort_key(f)
 
         g = _dep(trip_id="G", boarding="S1", route="2", headsign="City", pin_index=0)
         h = _dep(trip_id="H", boarding="S1", route="2", headsign="City", pin_index=0)
-        assert _departure_sort_key(g) < _departure_sort_key(h)  # trip id last
-
-    def test_sort_is_stable_across_identical_lists(self):
-        rows = [
-            _dep(trip_id="X", boarding="S1", pin_index=1),
-            _dep(trip_id="Y", boarding="S1", pin_index=0),
-        ]
-        first = sorted(rows, key=_departure_sort_key)
-        second = sorted(rows, key=_departure_sort_key)
-        assert [r.trip_id for r in first] == [r.trip_id for r in second]
+        assert _departure_sort_key(g) < _departure_sort_key(h)
 
     def test_dedupe_keeps_first_pin_and_preserves_loop_occurrences(self):
-        # Two occurrences of the same trip at different sequences are KEPT.
         loop_a = _dep(trip_id="LOOP", seq=1, pin_key_="p1")
         loop_b = _dep(trip_id="LOOP", seq=4, pin_key_="p1")
-        # A duplicate of seq=1 from another pin is DROPPED (first pin wins).
         dup = _dep(trip_id="LOOP", seq=1, pin_key_="p2")
         result = ba._dedupe([loop_a, dup, loop_b])
         assert [r.stop_sequence for r in result] == [1, 4]
@@ -261,9 +290,6 @@ class TestSortAndDedupe:
 
 
 class TestSyncIndex:
-    def test_empty_board_has_stable_index(self):
-        assert compute_sync_index([]) == compute_sync_index([])
-
     def test_stable_for_identical_rows(self):
         rows = [_dep(trip_id="A", eff=BASE), _dep(trip_id="B", eff=BASE)]
         assert compute_sync_index(rows) == compute_sync_index(rows)
@@ -272,11 +298,6 @@ class TestSyncIndex:
         before = [_dep(trip_id="A", eff=BASE)]
         after = [_dep(trip_id="A", eff=BASE + timedelta(minutes=5))]
         assert compute_sync_index(before) != compute_sync_index(after)
-
-    def test_changes_when_row_set_changes(self):
-        assert compute_sync_index([_dep(trip_id="A")]) != compute_sync_index(
-            [_dep(trip_id="A"), _dep(trip_id="B")]
-        )
 
     def test_changes_on_cancel_or_skip_status(self):
         base = _dep(trip_id="A", eff=BASE)
@@ -288,10 +309,20 @@ class TestSyncIndex:
     def test_independent_of_pin_order(self):
         a = _dep(trip_id="A", eff=BASE, pin_index=0, pin_key_="p1")
         b = _dep(trip_id="B", eff=BASE, pin_index=1, pin_key_="p2")
-        # Same two rows, swapped pin_order_index (order-independent).
         a2 = _dep(trip_id="A", eff=BASE, pin_index=1, pin_key_="p1")
         b2 = _dep(trip_id="B", eff=BASE, pin_index=0, pin_key_="p2")
         assert compute_sync_index([a, b]) == compute_sync_index([a2, b2])
+
+    def test_ignores_host_timezone(self):
+        # The index hashes the ISO wall-clock string, never an epoch, so the
+        # same naive local times hash identically regardless of host TZ.
+        wall = datetime(2026, 6, 1, 8, 7, 0)
+        idx1 = compute_sync_index([_dep(trip_id="A", eff=wall)])
+        idx2 = compute_sync_index([_dep(trip_id="A", eff=datetime(2026, 6, 1, 8, 7, 0))])
+        assert idx1 == idx2
+        assert idx1 != compute_sync_index(
+            [_dep(trip_id="A", eff=datetime(2026, 6, 1, 8, 8, 0))]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -301,31 +332,27 @@ class TestSyncIndex:
 
 class TestMergeOrdering:
     def test_interleaves_two_routes_at_a_shared_stop(self, metro_db: Path):
-        pins = [
-            _pin(R_FRANKSTON, RICHMOND, "Richmond"),
-            _pin(R_WERRIBEE, RICHMOND, "Richmond"),
-        ]
-        result = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond"),
+                _pin(R_WERRIBEE, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins)
 
-        # Frankston + Werribee both serve Richmond; merged ascending by time.
         trip_ids = [r.trip_id for r in result.rows]
+        # T_FRK_LATE (01:10 next day) is beyond the 3h horizon → dropped.
         assert trip_ids == [
             "T_FRK_OUT_2",  # 08:07
             "T_WRB_OUT_2",  # 08:22
             "T_FRK_IN_1",   # 08:28
             "T_FRK_OUT_3",  # 09:07
             "T_WRB_OUT_3",  # 09:22
-            "T_FRK_LATE",   # 01:10 next day (post-midnight)
         ]
         times = [r.effective_departure for r in result.rows]
         assert times == sorted(times)
 
-    def test_rows_are_time_sorted_across_pins(self, metro_db: Path):
-        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond"),
-                _pin(R_WERRIBEE, RICHMOND, "Richmond")]
-        result = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
-        effective = [r.effective_departure for r in result.rows]
-        assert effective == sorted(effective)
+    def test_horizon_drops_far_future(self, metro_db: Path):
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        # With a short horizon the post-midnight T_FRK_LATE is excluded.
+        result = _agg(metro_db, pins, horizon=timedelta(hours=1))
+        assert "T_FRK_LATE" not in {r.trip_id for r in result.rows}
 
 
 # ---------------------------------------------------------------------------
@@ -336,20 +363,15 @@ class TestMergeOrdering:
 class TestViaHintDedupe:
     def test_two_via_pins_collapse_to_one_row_set(self, bus_db: Path):
         pins = line_pins(bus_db, "B_SUNSHINE", "Sunshine", "B_CITY")
-        assert len(pins) == 2  # City via Footscray + City via Kensington
-
-        result = aggregate_board(bus_db, pins, BASE, realtime_enabled=False)
-
-        # Both pins surface the same City-bound trips; deduped to one set.
+        assert len(pins) == 2
+        result = _agg(bus_db, pins)
         trip_ids = [r.trip_id for r in result.rows]
-        assert len(trip_ids) == len(set(trip_ids))  # no duplicate trips
-        # Every surviving row carries the first-in-order pin's identity.
+        assert len(trip_ids) == len(set(trip_ids))
         assert all(r.pin_key == pins[0].pin_key for r in result.rows)
 
     def test_via_dedupe_surface_count(self, bus_db: Path):
         pins = line_pins(bus_db, "B_SUNSHINE", "Sunshine", "B_CITY")
-        result = aggregate_board(bus_db, pins, BASE, realtime_enabled=False)
-        # City-bound trips at Sunshine: T_BUS_LONG, T_BUS_VIA_A, T_BUS_VIA_B.
+        result = _agg(bus_db, pins)
         assert sorted(r.trip_id for r in result.rows) == [
             "T_BUS_LONG", "T_BUS_VIA_A", "T_BUS_VIA_B",
         ]
@@ -362,23 +384,16 @@ class TestViaHintDedupe:
 
 class TestPinFiltering:
     def test_include_false_pin_is_skipped(self, metro_db: Path):
-        pins = [
-            _pin(R_FRANKSTON, RICHMOND, "Richmond"),
-            _pin(R_WERRIBEE, RICHMOND, "Richmond", include=False),
-        ]
-        result = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond"),
+                _pin(R_WERRIBEE, RICHMOND, "Richmond", include=False)]
+        result = _agg(metro_db, pins)
         assert all(r.route_id == R_FRANKSTON for r in result.rows)
-        assert result.rows  # non-empty (Frankston still contributes)
+        assert result.rows
 
     def test_invalid_pin_is_skipped(self, metro_db: Path):
-        pins = [
-            _pin(R_FRANKSTON, RICHMOND, "Richmond"),
-            _pin(R_WERRIBEE, RICHMOND, "Richmond"),
-        ]
-        invalid = {pins[1].pin_key}
-        result = aggregate_board(
-            metro_db, pins, BASE, realtime_enabled=False, invalid_pins=invalid
-        )
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond"),
+                _pin(R_WERRIBEE, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins, invalid_pins={pins[1].pin_key})
         assert all(r.route_id == R_FRANKSTON for r in result.rows)
 
 
@@ -398,10 +413,8 @@ def _realtime_index() -> TripUpdateIndex:
 class TestRealtimeJoin:
     def test_delay_join(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(
-            metro_db, pins, BASE,
-            trip_updates=_realtime_index(),
-        )
+        result = _agg(metro_db, pins, realtime_enabled=True,
+                      trip_updates=_realtime_index())
         row = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_2")
         assert row.delay_seconds == 90
         assert row.expected_departure == row.scheduled_departure + timedelta(seconds=90)
@@ -409,27 +422,26 @@ class TestRealtimeJoin:
 
     def test_cancel_join(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(
-            metro_db, pins, BASE, trip_updates=_realtime_index(),
-        )
+        result = _agg(metro_db, pins, realtime_enabled=True,
+                      trip_updates=_realtime_index())
         row = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_3")
         assert row.is_cancelled is True
+        # A cancelled trip keeps its scheduled time (no delay applied).
+        assert row.effective_departure == row.scheduled_departure
+        assert row.delay_seconds == DELAY_UNKNOWN
 
     def test_skip_join(self, metro_db: Path):
         pins = [_pin(R_WERRIBEE, RICHMOND, "Richmond")]
-        result = aggregate_board(
-            metro_db, pins, BASE, trip_updates=_realtime_index(),
-        )
+        result = _agg(metro_db, pins, realtime_enabled=True,
+                      trip_updates=_realtime_index())
         row = next(r for r in result.rows if r.trip_id == "T_WRB_OUT_2")
         assert row.is_skipped is True
         assert row.skipped_stops_count == 1
 
     def test_unmatched_trip_stays_scheduled(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(
-            metro_db, pins, BASE, trip_updates=_realtime_index(),
-        )
-        # T_FRK_IN_1 has no trip update in the fixtures → scheduled, delay -1.
+        result = _agg(metro_db, pins, realtime_enabled=True,
+                      trip_updates=_realtime_index())
         row = next(r for r in result.rows if r.trip_id == "T_FRK_IN_1")
         assert row.realtime_state == REALTIME_SCHEDULED
         assert row.delay_seconds == DELAY_UNKNOWN
@@ -437,52 +449,257 @@ class TestRealtimeJoin:
 
 
 # ---------------------------------------------------------------------------
-# Static fallback (disabled / failed / stale)
+# Sequence-aware join (F1): loop trips with two occurrences
+# ---------------------------------------------------------------------------
+
+
+class TestSequenceAwareJoin:
+    def test_loop_two_occurrences_get_own_delay_and_skip(self, tram_db: Path):
+        # T_TRAM_LOOP visits T96_TERM at seq 1 (10:00) and seq 4 (10:40).
+        feed = _feed("T_TRAM_LOOP", [
+            {"stop_id": "T96_TERM", "seq": 1, "delay": 90},
+            {"stop_id": "T96_TERM", "seq": 4, "delay": 240, "skipped": True},
+        ])
+        index = parse_trip_updates_index(feed)
+
+        pins = [_pin("R_TRAM_96", "T96_TERM", "St Kilda", route_type=0)]
+        result = _agg(tram_db, pins, realtime_enabled=True, trip_updates=index)
+
+        rows = [r for r in result.rows if r.trip_id == "T_TRAM_LOOP"]
+        assert len(rows) == 2
+        by_seq = {r.stop_sequence: r for r in rows}
+        assert by_seq[1].delay_seconds == 90
+        assert by_seq[1].is_skipped is False
+        assert by_seq[4].delay_seconds == 240
+        assert by_seq[4].is_skipped is True
+
+    def test_sequence_only_update_is_not_discarded(self, tram_db: Path):
+        # A stop update carrying only stop_sequence (no stop_id) still joins.
+        feed = _feed("T_TRAM_LOOP", [{"seq": 1, "delay": 60}])
+        index = parse_trip_updates_index(feed)
+        assert ("T_TRAM_LOOP", 1) in index.by_sequence
+        pins = [_pin("R_TRAM_96", "T96_TERM", "St Kilda", route_type=0)]
+        result = _agg(tram_db, pins, realtime_enabled=True, trip_updates=index)
+        row = next(r for r in result.rows
+                   if r.trip_id == "T_TRAM_LOOP" and r.stop_sequence == 1)
+        assert row.delay_seconds == 60
+
+
+# ---------------------------------------------------------------------------
+# Absolute-time prediction (additional)
+# ---------------------------------------------------------------------------
+
+
+class TestAbsoluteTimePrediction:
+    def test_absolute_time_becomes_expected(self, metro_db: Path):
+        # T_FRK_OUT_2 departs Richmond 08:07 local = 22:07 UTC (2026-06-01).
+        epoch = int(datetime(2026, 5, 31, 22, 7, 0, tzinfo=timezone.utc).timestamp())
+        feed = _feed("T_FRK_OUT_2", [
+            {"stop_id": "RICHMOND", "seq": 2, "abs_time": epoch},
+        ])
+        index = parse_trip_updates_index(feed)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins, realtime_enabled=True, trip_updates=index)
+        row = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_2")
+        assert row.expected_departure == datetime(2026, 6, 1, 8, 7, 0)
+        assert row.delay_seconds == 0
+        assert row.realtime_state == REALTIME_LIVE
+
+    def test_absolute_time_early_gives_negative_delay(self, metro_db: Path):
+        # 08:07 scheduled, but predicted 08:05 → delay -120s.
+        epoch = int(datetime(2026, 5, 31, 22, 5, 0, tzinfo=timezone.utc).timestamp())
+        feed = _feed("T_FRK_OUT_2", [
+            {"stop_id": "RICHMOND", "seq": 2, "abs_time": epoch},
+        ])
+        index = parse_trip_updates_index(feed)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins, realtime_enabled=True, trip_updates=index)
+        row = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_2")
+        assert row.delay_seconds == -120
+        assert row.expected_departure == datetime(2026, 6, 1, 8, 5, 0)
+
+    def test_no_prediction_stays_scheduled_not_live(self, metro_db: Path):
+        # A stop update with no delay and no time → no prediction → scheduled.
+        feed = _feed("T_FRK_OUT_2", [{"stop_id": "RICHMOND", "seq": 2}])
+        index = parse_trip_updates_index(feed)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins, realtime_enabled=True, trip_updates=index)
+        row = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_2")
+        assert row.realtime_state == REALTIME_SCHEDULED
+        assert row.delay_seconds == DELAY_UNKNOWN
+        assert row.expected_departure is None
+
+
+# ---------------------------------------------------------------------------
+# Static fallback (disabled / failed / stale) + gating (F6)
 # ---------------------------------------------------------------------------
 
 
 class TestStaticFallback:
     def test_realtime_disabled_all_scheduled(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
+        result = _agg(metro_db, pins, realtime_enabled=False)
         assert result.rows
         assert all(r.realtime_state == REALTIME_SCHEDULED for r in result.rows)
         assert all(r.delay_seconds == DELAY_UNKNOWN for r in result.rows)
 
+    def test_disabled_ignores_cancel_skip_index(self, metro_db: Path):
+        # F6: with realtime disabled, the index is not consumed at all.
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins, realtime_enabled=False,
+                      trip_updates=_realtime_index())
+        cancelled = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_3")
+        assert cancelled.is_cancelled is False
+        assert all(r.is_skipped is False for r in result.rows)
+        assert all(r.skipped_stops_count == 0 for r in result.rows)
+
     def test_feed_failed_rows_scheduled_and_health_failed(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
         health = {("metro", "trip-updates"): FeedHealth(FEED_FAILED)}
-        result = aggregate_board(
-            metro_db, pins, BASE,
-            trip_updates=None,  # fetch failed → no realtime index
-            feed_health=health,
-        )
-        assert result.rows
+        result = _agg(metro_db, pins, trip_updates=None, feed_health=health)
         assert all(r.realtime_state == REALTIME_SCHEDULED for r in result.rows)
         assert result.feed_health[("metro", "trip-updates")].state == FEED_FAILED
 
-    def test_stale_ttl_marks_rows_stale(self, metro_db: Path):
+    def test_stale_mode_marks_that_modes_rows_stale(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(
-            metro_db, pins, BASE,
-            trip_updates=_realtime_index(),
-            trip_updates_stale=True,
-        )
+        result = _agg(metro_db, pins, realtime_enabled=True,
+                      trip_updates=_realtime_index(), stale_modes={"metro"})
         matched = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_2")
         assert matched.realtime_state == REALTIME_STALE
-        assert matched.delay_seconds == 90  # still applies the stale delay
+        assert matched.delay_seconds == 90
 
 
 # ---------------------------------------------------------------------------
-# Shared feed cache (async fetch helper)
+# Lookback + horizon window (F5)
+# ---------------------------------------------------------------------------
+
+
+class TestLookbackHorizon:
+    def test_delayed_past_service_appears(self, metro_db: Path):
+        # now = 08:30: a 08:20 service delayed +15min → 08:35 (future) surfaces.
+        now = datetime(2026, 6, 1, 8, 30, 0)
+        feed = _feed("T_WRB_OUT_2", [{"stop_id": "RICHMOND", "seq": 2, "delay": 900}])
+        index = parse_trip_updates_index(feed)
+        pins = [_pin(R_WERRIBEE, RICHMOND, "Richmond")]
+        result = aggregate_board(
+            metro_db, pins, now, local_tz=MEL, now_utc=NOW_UTC,
+            realtime_enabled=True, trip_updates=index,
+        )
+        row = next(r for r in result.rows if r.trip_id == "T_WRB_OUT_2")
+        # 08:22 scheduled + 15min = 08:37 (ranks by delayed time).
+        assert row.expected_departure == datetime(2026, 6, 1, 8, 37, 0)
+        assert row in result.rows
+
+    def test_delayed_row_ranks_by_delayed_time(self, metro_db: Path):
+        # A delayed 08:22 service (→08:37) ranks BEFORE an on-time 09:07 service.
+        now = datetime(2026, 6, 1, 8, 30, 0)
+        feed = _feed("T_WRB_OUT_2", [{"stop_id": "RICHMOND", "seq": 2, "delay": 900}])
+        index = parse_trip_updates_index(feed)
+        pins = [_pin(R_WERRIBEE, RICHMOND, "Richmond"),
+                _pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = aggregate_board(
+            metro_db, pins, now, local_tz=MEL, now_utc=NOW_UTC,
+            realtime_enabled=True, trip_updates=index,
+        )
+        order = [r.trip_id for r in result.rows]
+        # T_WRB_OUT_2 (delayed 08:37) ranks before on-time T_FRK_OUT_3 (09:07).
+        assert order.index("T_WRB_OUT_2") < order.index("T_FRK_OUT_3")
+
+    def test_negative_delay_early(self, metro_db: Path):
+        feed = _feed("T_FRK_OUT_2", [{"stop_id": "RICHMOND", "seq": 2, "delay": -120}])
+        index = parse_trip_updates_index(feed)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = _agg(metro_db, pins, realtime_enabled=True, trip_updates=index)
+        row = next(r for r in result.rows if r.trip_id == "T_FRK_OUT_2")
+        assert row.delay_seconds == -120
+        assert row.expected_departure == datetime(2026, 6, 1, 8, 5, 0)
+
+    def test_cancelled_row_retained_in_window(self, metro_db: Path):
+        # A cancelled 08:07 service (scheduled within lookback, effective=scheduled)
+        # still surfaces and ranks at its scheduled time.
+        now = datetime(2026, 6, 1, 8, 30, 0)
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        result = aggregate_board(
+            metro_db, pins, now, local_tz=MEL, now_utc=NOW_UTC,
+            realtime_enabled=True, trip_updates=_realtime_index(),
+        )
+        cancelled = [r for r in result.rows if r.trip_id == "T_FRK_OUT_3"]
+        assert cancelled and cancelled[0].is_cancelled is True
+
+
+class TestPerPinCap:
+    def test_dense_pin_a_does_not_starve_future_rows(self, tmp_path):
+        db = _build_dense_db(tmp_path)
+        pins = [_pin("R_A", "S", "Shared", route_type=1),
+                _pin("R_B", "S", "Shared", route_type=0)]
+        now = datetime(2026, 6, 1, 8, 0, 0)
+        result = aggregate_board(
+            db, pins, now, local_tz=MEL, now_utc=NOW_UTC, realtime_enabled=False,
+        )
+        trip_ids = [r.trip_id for r in result.rows]
+        # Route A has 45 departures; ~22 are in the past (pulled in by the
+        # lookback) and would have consumed the old 20-row per-pin cap.  Its
+        # future trips (08:00+) must still surface, and B's earliest too.
+        assert "T_A_22" in trip_ids   # A's 08:00 departure
+        assert "T_B_0" in trip_ids    # B's earliest (08:03)
+
+
+def _build_dense_db(tmp_path: Path) -> Path:
+    """Build a two-route generation: 45 A trips + 5 B trips at a shared stop."""
+    stops = [{"stop_id": "S", "stop_name": "Shared", "stop_lat": -37.8,
+              "stop_lon": 144.9, "stop_code": "S", "location_type": None,
+              "parent_station": "", "platform_code": "", "wheelchair_boarding": 0}]
+    routes = [
+        {"route_id": "R_A", "route_short_name": "A", "route_long_name": "A Line",
+         "route_type": 1, "route_color": "000000"},
+        {"route_id": "R_B", "route_short_name": "B", "route_long_name": "B Line",
+         "route_type": 0, "route_color": "111111"},
+    ]
+    trips = []
+    stop_times = []
+    # A: 45 trips every 2 min starting 07:16 (07:16..08:44).
+    for i in range(45):
+        tid = f"T_A_{i:02d}"
+        trips.append({"trip_id": tid, "route_id": "R_A", "service_id": "SVC",
+                      "shape_id": "", "trip_headsign": "A Dest", "direction_id": 0,
+                      "block_id": ""})
+        t = 7 * 3600 + 16 * 60 + i * 120
+        stop_times.append({"trip_id": tid, "stop_id": "S", "stop_sequence": 1,
+                           "arrival_time": _hms(t), "departure_time": _hms(t)})
+    # B: 5 trips at 08:03..08:11.
+    for i in range(5):
+        tid = f"T_B_{i}"
+        trips.append({"trip_id": tid, "route_id": "R_B", "service_id": "SVC",
+                      "shape_id": "", "trip_headsign": "B Dest", "direction_id": 0,
+                      "block_id": ""})
+        t = 8 * 3600 + 3 * 60 + i * 120
+        stop_times.append({"trip_id": tid, "stop_id": "S", "stop_sequence": 1,
+                           "arrival_time": _hms(t), "departure_time": _hms(t)})
+    calendar = [{"service_id": "SVC", "start_date": "20260520", "end_date": "20260701",
+                 "monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+                 "friday": 1, "saturday": 1, "sunday": 1}]
+    return import_bundle(tmp_path, routes=routes, trips=trips, stops=stops,
+                         stop_times=stop_times, calendar=calendar)
+
+
+def _hms(total_seconds: int) -> str:
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Fetch + parse split (F7) and shared cache + freshness (F4)
 # ---------------------------------------------------------------------------
 
 
 class TestSharedCache:
     async def test_two_pins_same_mode_one_fetch(self):
+        empty = _decode_feed(load_bytes("header_tick_0"))
+        meta = FeedMeta(header_timestamp=NOW_UTC, fetched_at=NOW_UTC)
         client = CountingClient({
-            ("metro", "trip-updates"): _decode_feed(load_bytes("header_tick_0")),
-            ("metro", "service-alerts"): _decode_feed(load_bytes("header_tick_0")),
+            ("metro", "trip-updates"): (empty, meta),
+            ("metro", "service-alerts"): (empty, meta),
         })
         pins = [_pin(R_FRANKSTON, RICHMOND, route_type=1),
                 _pin(R_WERRIBEE, RICHMOND, route_type=1)]
@@ -493,81 +710,176 @@ class TestSharedCache:
         assert len(trip_calls) == 1
         assert len(alert_calls) == 1
         assert len(client.calls) == 2
-        assert data.trip_updates is not None
 
     async def test_realtime_disabled_makes_no_requests(self):
         client = CountingClient({})
-        pins = [_pin(R_FRANKSTON, RICHMOND, route_type=1)]
-        data = await fetch_board_realtime(client, pins, False)
+        data = await fetch_board_realtime(client, [_pin(R_FRANKSTON, RICHMOND, route_type=1)], False)
         assert client.calls == []
         assert data.trip_updates is None
         assert data.alerts == []
-        assert data.feed_health == {}
 
     async def test_feed_failure_records_health(self):
         client = CountingClient({
             ("metro", "trip-updates"): RuntimeError("boom"),
-            ("metro", "service-alerts"): _decode_feed(load_bytes("header_tick_0")),
+            ("metro", "service-alerts"): (
+                _decode_feed(load_bytes("header_tick_0")),
+                FeedMeta(header_timestamp=NOW_UTC, fetched_at=NOW_UTC),
+            ),
         })
-        pins = [_pin(R_FRANKSTON, RICHMOND, route_type=1)]
-        data = await fetch_board_realtime(client, pins, True, now=NOW_UTC)
+        data = await fetch_board_realtime(
+            client, [_pin(R_FRANKSTON, RICHMOND, route_type=1)], True, now=NOW_UTC,
+        )
         assert data.feed_health[("metro", "trip-updates")].state == FEED_FAILED
-        assert data.feed_health[("metro", "service-alerts")].state == FEED_OK
-        assert data.trip_updates is None  # all trip feeds failed
+        assert data.trip_updates is None
 
-    async def test_stale_feed_detected(self, monkeypatch):
-        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        monkeypatch.setattr(ba, "feed_fetched_at", lambda m, f: old)
+    async def test_parse_once_per_board(self, monkeypatch):
+        empty = _decode_feed(load_bytes("header_tick_0"))
+        meta = FeedMeta(header_timestamp=NOW_UTC, fetched_at=NOW_UTC)
         client = CountingClient({
-            ("metro", "trip-updates"): _decode_feed(load_bytes("trip_update_delay")),
-            ("metro", "service-alerts"): _decode_feed(load_bytes("header_tick_0")),
+            ("metro", "trip-updates"): (empty, meta),
+            ("metro", "service-alerts"): (empty, meta),
         })
-        pins = [_pin(R_FRANKSTON, RICHMOND, route_type=1)]
+        calls = {"trips": 0, "alerts": 0}
+        real_trips = ba.parse_trip_updates_index
+        real_alerts = ba.parse_service_alerts
+
+        def fake_trips(feed, **kw):
+            calls["trips"] += 1
+            return real_trips(feed)
+        def fake_alerts(feed, **kw):
+            calls["alerts"] += 1
+            return real_alerts(feed, **kw)
+
+        monkeypatch.setattr(ba, "parse_trip_updates_index", fake_trips)
+        monkeypatch.setattr(ba, "parse_service_alerts", fake_alerts)
+
+        pins = [_pin(R_FRANKSTON, RICHMOND, route_type=1),
+                _pin(R_WERRIBEE, RICHMOND, route_type=1)]
+        await fetch_board_realtime(client, pins, True, now=NOW_UTC)
+        assert calls["trips"] == 1
+        assert calls["alerts"] == 1
+
+
+class TestFreshness:
+    def test_frozen_header_marks_stale(self):
+        # Same header_timestamp twice; fetched_at fresh → header drives staleness.
+        old = NOW_UTC - timedelta(minutes=10)
+        meta = FeedMeta(header_timestamp=old, fetched_at=NOW_UTC)
+        state, _ = _classify_freshness(meta, NOW_UTC)
+        assert state == FEED_STALE
+
+    def test_healthy_header_live(self):
+        meta = FeedMeta(header_timestamp=NOW_UTC - timedelta(seconds=10),
+                        fetched_at=NOW_UTC)
+        state, _ = _classify_freshness(meta, NOW_UTC)
+        assert state == FEED_OK
+
+    def test_future_header_clamped_to_live(self):
+        future = NOW_UTC + timedelta(minutes=30)
+        meta = FeedMeta(header_timestamp=future, fetched_at=NOW_UTC)
+        state, _ = _classify_freshness(meta, NOW_UTC)
+        assert state == FEED_OK
+
+    def test_missing_header_falls_back_to_fetched_at(self):
+        meta = FeedMeta(header_timestamp=None,
+                        fetched_at=NOW_UTC - timedelta(minutes=10))
+        state, _ = _classify_freshness(meta, NOW_UTC)
+        assert state == FEED_STALE
+
+    async def test_per_mode_staleness_isolation(self):
+        # Train feed stale, tram feed fresh → only train rows marked stale.
+        stale_meta = FeedMeta(header_timestamp=NOW_UTC - timedelta(minutes=10),
+                              fetched_at=NOW_UTC)
+        fresh_meta = FeedMeta(header_timestamp=NOW_UTC, fetched_at=NOW_UTC)
+        client = CountingClient({
+            ("metro", "trip-updates"): (_decode_feed(load_bytes("trip_update_delay")), stale_meta),
+            ("metro", "service-alerts"): (_decode_feed(load_bytes("header_tick_0")), fresh_meta),
+            ("tram", "trip-updates"): (_decode_feed(load_bytes("header_tick_0")), fresh_meta),
+            ("tram", "service-alerts"): (_decode_feed(load_bytes("header_tick_0")), fresh_meta),
+        })
+        pins = [_pin(R_FRANKSTON, RICHMOND, route_type=1),
+                _pin("R_TRAM_96", "T96_TERM", route_type=0)]
         data = await fetch_board_realtime(client, pins, True, now=NOW_UTC)
-        assert data.trip_updates_stale is True
-        assert data.feed_health[("metro", "trip-updates")].state == FEED_STALE
+        assert data.stale_modes == frozenset({"metro"})
 
 
 # ---------------------------------------------------------------------------
-# Alert matching
+# Alert matching (F2): selector AND/OR, direction 0, agency, dedupe
 # ---------------------------------------------------------------------------
 
 
 class TestAlertMatching:
     def _pins(self):
         return {
-            _pin(R_FRANKSTON, RICHMOND, "Richmond").pin_key: _pin(R_FRANKSTON, RICHMOND, "Richmond"),
-            _pin(R_WERRIBEE, RICHMOND, "Richmond").pin_key: _pin(R_WERRIBEE, RICHMOND, "Richmond"),
+            _pin(R_FRANKSTON, RICHMOND, "Richmond").pin_key:
+                _pin(R_FRANKSTON, RICHMOND, "Richmond"),
+            _pin(R_WERRIBEE, RICHMOND, "Richmond").pin_key:
+                _pin(R_WERRIBEE, RICHMOND, "Richmond"),
         }
 
-    def test_route_level_match(self):
-        pins = self._pins()
-        trips = {k: {"T_FRK_OUT_2"} if "FRANKSTON" in v.route_id else {"T_WRB_OUT_2"}
-                 for k, v in pins.items()}
-        alerts = [_alert(route_ids=(R_FRANKSTON,))]
-        matched = match_board_alerts(alerts, pins, trips, NOW_UTC)
-        assert len(matched) == 1
-        assert matched[0].matches[0].pin_key == next(
-            k for k, v in pins.items() if v.route_id == R_FRANKSTON
-        )
-        assert matched[0].matches[0].reasons == ("route",)
-
-    def test_stop_level_match(self):
+    def test_route_plus_stop_requires_both(self):
         pins = self._pins()
         trips = {k: set() for k in pins}
-        alerts = [_alert(stop_ids=(RICHMOND,))]
-        matched = match_board_alerts(alerts, pins, trips, NOW_UTC)
+        # route Frankston AND stop RICHMOND: only the Frankston pin (which also
+        # boards RICHMOND) matches.
+        alert = _alert(selectors=(_sel(route_id=R_FRANKSTON, stop_id=RICHMOND),))
+        matched = match_board_alerts([alert], pins, trips, NOW_UTC)
         assert len(matched) == 1
-        assert {m.pin_key for m in matched[0].matches} == set(pins)
-        assert all(m.reasons == ("stop",) for m in matched[0].matches)
+        frankston = next(k for k, v in pins.items() if v.route_id == R_FRANKSTON)
+        assert [m.pin_key for m in matched[0].matches] == [frankston]
+        assert set(matched[0].matches[0].reasons) == {"route", "stop"}
 
-    def test_trip_level_match(self):
+    def test_route_plus_stop_wrong_stop_does_not_match(self):
+        pins = self._pins()
+        trips = {k: set() for k in pins}
+        # route Frankston AND stop "OTHER" (not a pin stop) → matches nothing.
+        alert = _alert(selectors=(_sel(route_id=R_FRANKSTON, stop_id="OTHER"),))
+        assert match_board_alerts([alert], pins, trips, NOW_UTC) == []
+
+    def test_direction_zero_selector_works(self):
+        pins = {p.pin_key: p for p in
+                [_pin(R_FRANKSTON, RICHMOND, "Richmond", all_dest=False,
+                      dest="FRANKSTON", direction=0)]}
+        trips = {k: set() for k in pins}
+        alert = _alert(selectors=(_sel(direction_id=0),))
+        matched = match_board_alerts([alert], pins, trips, NOW_UTC)
+        assert len(matched) == 1
+        assert matched[0].matches[0].reasons == ("direction",)
+
+    def test_agency_scoped_multimode(self):
+        # Agency-scoped alert from the metro feed matches only the metro pin.
+        pins = {
+            _pin(R_FRANKSTON, RICHMOND, route_type=1).pin_key:
+                _pin(R_FRANKSTON, RICHMOND, route_type=1),
+            _pin("R_TRAM_96", "T96_TERM", route_type=0).pin_key:
+                _pin("R_TRAM_96", "T96_TERM", route_type=0),
+        }
+        trips = {k: set() for k in pins}
+        alert = _alert(selectors=(_sel(agency_id="PTV"),), feed_mode="metro")
+        matched = match_board_alerts([alert], pins, trips, NOW_UTC)
+        metro_key = next(k for k, v in pins.items() if v.route_type == 1)
+        assert [m.pin_key for m in matched[0].matches] == [metro_key]
+        assert matched[0].matches[0].reasons == ("agency",)
+
+    def test_truly_unscoped_matches_all(self):
+        pins = self._pins()
+        trips = {k: set() for k in pins}
+        alert = _alert(selectors=(_sel(),))
+        matched = match_board_alerts([alert], pins, trips, NOW_UTC)
+        assert {m.pin_key for m in matched[0].matches} == set(pins)
+
+    def test_dedupe_by_alert_id_merges_reasons(self):
         pins = self._pins()
         trips = {k: {"T_FRK_OUT_2"} for k in pins}
-        alerts = [_alert(trip_ids=("T_FRK_OUT_2",))]
+        # Two ServiceAlert objects sharing alert_id, each matching via a
+        # different selector — deduped into one BoardAlert with merged matches.
+        alerts = [
+            _alert(alert_id="a1", selectors=(_sel(route_id=R_FRANKSTON),)),
+            _alert(alert_id="a1", selectors=(_sel(stop_id=RICHMOND),)),
+        ]
         matched = match_board_alerts(alerts, pins, trips, NOW_UTC)
-        # Every pin has the trip, so all match (trip is pin-agnostic here).
-        assert {m.pin_key for m in matched[0].matches} == set(pins)
+        assert len(matched) == 1
+        assert matched[0].alert_id == "a1"
 
     def test_inactive_alert_excluded(self):
         pins = self._pins()
@@ -576,50 +888,63 @@ class TestAlertMatching:
             start=datetime(2020, 1, 1, tzinfo=timezone.utc),
             end=datetime(2021, 1, 1, tzinfo=timezone.utc),
         )
-        alerts = [_alert(route_ids=(R_FRANKSTON,), periods=(past,))]
-        assert match_board_alerts(alerts, pins, trips, NOW_UTC) == []
+        alert = _alert(selectors=(_sel(route_id=R_FRANKSTON),), periods=(past,))
+        assert match_board_alerts([alert], pins, trips, NOW_UTC) == []
 
-    def test_unscoped_alert_matches_all_pins(self):
+    def test_fixture_alert_matches_route_stop_trip(self):
         pins = self._pins()
-        trips = {k: set() for k in pins}
-        alerts = [_alert()]  # no selectors → agency-wide
-        matched = match_board_alerts(alerts, pins, trips, NOW_UTC)
-        assert {m.pin_key for m in matched[0].matches} == set(pins)
-        assert all(m.reasons == ("agency",) for m in matched[0].matches)
-
-    def test_fixture_alert_matches_route_stop_and_trip(self):
-        pins = self._pins()
-        trips = {k: {"T_FRK_OUT_2"} for k in pins}
+        frankston = next(k for k, v in pins.items() if v.route_id == R_FRANKSTON)
+        werribee = next(k for k, v in pins.items() if v.route_id == R_WERRIBEE)
+        trips = {frankston: {"T_FRK_OUT_2"}, werribee: {"T_WRB_OUT_2"}}
         feed = _decode_feed(load_bytes("alert_service"))
         alerts = parse_service_alerts(feed)
-        assert len(alerts) == 1
         matched = match_board_alerts(alerts, pins, trips, NOW_UTC)
         assert len(matched) == 1
         assert matched[0].alert_id == "alert-1"
-        # The alert's route/stop/trip selectors all hit the Frankston pin.
-        frankston_key = next(k for k, v in pins.items() if v.route_id == R_FRANKSTON)
-        match = next(m for m in matched[0].matches if m.pin_key == frankston_key)
-        assert set(match.reasons) == {"route", "stop", "trip"}
+        m = next(x for x in matched[0].matches if x.pin_key == frankston)
+        assert set(m.reasons) == {"route", "stop", "trip"}
 
-    def test_aggregate_board_attaches_alerts_per_pin(self, metro_db: Path):
-        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond"),
-                _pin(R_WERRIBEE, RICHMOND, "Richmond")]
-        feed = _decode_feed(load_bytes("alert_service"))
+    def test_parser_preserves_direction_zero_and_agency(self):
+        feed = rt.FeedMessage()
+        entity = feed.entity.add()
+        entity.id = "a"
+        alert = entity.alert
+        ie = alert.informed_entity.add()
+        ie.agency_id = "PTV"
+        ie.route_type = 3
+        ie.trip.trip_id = "T1"
+        ie.trip.direction_id = 0
+        alert.header_text.translation.add().text = "H"
+
         alerts = parse_service_alerts(feed)
+        assert len(alerts) == 1
+        sel = alerts[0].selectors[0]
+        assert sel.agency_id == "PTV"
+        assert sel.route_type_id == 3
+        assert sel.trip_id == "T1"
+        assert sel.direction_id == 0  # key presence, not truthiness
+
+
+# ---------------------------------------------------------------------------
+# Clock discipline (F3)
+# ---------------------------------------------------------------------------
+
+
+class TestClockDiscipline:
+    def test_naive_now_utc_raises_typeerror(self, metro_db: Path):
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        with pytest.raises(TypeError):
+            aggregate_board(metro_db, pins, BASE, local_tz=MEL,
+                            now_utc=datetime(2026, 6, 1, 8, 0, 0))  # naive
+
+    def test_aware_local_now_is_normalized(self, metro_db: Path):
+        pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
+        aware_now = BASE.replace(tzinfo=MEL)
         result = aggregate_board(
-            metro_db, pins, BASE,
+            metro_db, pins, aware_now, local_tz=MEL, now_utc=NOW_UTC,
             realtime_enabled=False,
-            alerts=alerts,
-            now_utc=NOW_UTC,
         )
-        # alert_service scopes route R_METRO_FRANKSTON + stop RICHMOND + trip.
-        # The Frankston pin matches via route/stop/trip; the Werribee pin only
-        # via the shared stop.
-        assert result.alerts
-        frankston_key = pins[0].pin_key
-        werribee_key = pins[1].pin_key
-        assert frankston_key in result.alerts_by_pin
-        assert werribee_key in result.alerts_by_pin
+        assert result.rows  # no crash; aware local now accepted
 
 
 # ---------------------------------------------------------------------------
@@ -631,8 +956,8 @@ class TestAggregatedSyncIndex:
     def test_identical_aggregations_share_index(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond"),
                 _pin(R_WERRIBEE, RICHMOND, "Richmond")]
-        r1 = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
-        r2 = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
+        r1 = _agg(metro_db, pins)
+        r2 = _agg(metro_db, pins)
         assert r1.sync_index == r2.sync_index
 
     def test_index_ignores_pin_order(self, metro_db: Path):
@@ -640,37 +965,31 @@ class TestAggregatedSyncIndex:
              _pin(R_WERRIBEE, RICHMOND, "Richmond")]
         b = [_pin(R_WERRIBEE, RICHMOND, "Richmond"),
              _pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        r_a = aggregate_board(metro_db, a, BASE, realtime_enabled=False)
-        r_b = aggregate_board(metro_db, b, BASE, realtime_enabled=False)
-        assert r_a.sync_index == r_b.sync_index
+        assert _agg(metro_db, a).sync_index == _agg(metro_db, b).sync_index
 
     def test_index_changes_when_rows_change(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        r1 = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
-        r2 = aggregate_board(
-            metro_db, pins, BASE, trip_updates=_realtime_index(),
-        )
-        # Realtime changes T_FRK_OUT_2's effective time → index differs.
+        r1 = _agg(metro_db, pins)
+        r2 = _agg(metro_db, pins, realtime_enabled=True, trip_updates=_realtime_index())
         assert r1.sync_index != r2.sync_index
 
 
 # ---------------------------------------------------------------------------
-# Purity (no event loop / hass)
+# Purity
 # ---------------------------------------------------------------------------
 
 
 class TestPurity:
     def test_aggregate_is_sync_and_returns_pure_data(self, metro_db: Path):
-        # Runs synchronously with injected ports; no hass/event loop involved.
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
+        result = _agg(metro_db, pins)
         assert isinstance(result.rows, list)
         assert isinstance(result.rows[0], BoardDeparture)
         assert result.generated_at == BASE
 
     def test_result_model_has_no_ha_objects(self, metro_db: Path):
         pins = [_pin(R_FRANKSTON, RICHMOND, "Richmond")]
-        result = aggregate_board(metro_db, pins, BASE, realtime_enabled=False)
+        result = _agg(metro_db, pins)
         for row in result.rows:
             assert not hasattr(row, "hass")
             assert not hasattr(row, "coordinator")

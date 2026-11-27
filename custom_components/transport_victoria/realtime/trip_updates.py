@@ -1,15 +1,32 @@
-"""Parse GTFS Realtime trip-update feeds into per-stop delay maps.
+"""Parse GTFS Realtime trip-update feeds into delay/skip indexes.
 
-The trip-updates feed carries delay and cancellation information keyed by
-trip_id + stop_id. This module converts raw FeedMessage objects into a simple
-dict so the coordinator can merge realtime data into scheduled departures
-without touching protobuf objects outside this module.
+The trip-updates feed carries delay, cancellation, skip and (optionally)
+absolute-time predictions keyed by trip descriptor + stop.  This module exposes
+two surfaces:
+
+* :func:`parse_trip_updates_index` — a **sequence-aware** index for board
+  consumers (T9).  Loop trips that call at the same stop twice are disambiguated
+  by ``stop_sequence``; updates carrying no sequence fall back to a
+  ``(trip_id, stop_id)`` secondary index.
+* :func:`parse_trip_updates` — the legacy flat ``"<trip_id>:<stop_id>"`` map the
+  watch coordinator consumes.  Unchanged in shape; it is rebuilt from the same
+  parsed data so the two surfaces never drift.
+
+Prediction semantics (T9):
+
+* ``delay`` (relative seconds) and ``time`` (absolute epoch seconds) are
+  alternatives within an arrival/departure; ``delay`` is preferred, then
+  ``time``.  Departure is preferred over arrival.
+* A stop update with **neither** a delay nor an absolute time carries *no*
+  prediction — the caller must NOT read it as "on time / live" (see the
+  ``TripStopUpdate`` fields, all ``None`` in that case).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,8 +37,29 @@ _STU_SKIPPED = 1
 
 
 @dataclass(slots=True, frozen=True)
+class TripStopUpdate:
+    """One parsed ``stop_time_update`` (sequence-aware, richer than StopDelay).
+
+    ``delay_seconds`` and ``absolute_time`` are both ``None`` when the update
+    carries no prediction at all (a scheduled/cancelled trip with no published
+    time) — distinct from a genuine ``delay_seconds == 0`` ("on time").
+    ``absolute_time`` is an aware UTC datetime converted from the protobuf epoch
+    ``departure.time``/``arrival.time`` field; the caller converts it to local.
+    """
+
+    delay_seconds: int | None
+    absolute_time: datetime | None
+    is_skipped: bool
+    # Trip-descriptor provenance (NOT part of the join key — see module note).
+    start_date: str | None = None
+    start_time: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class StopDelay:
-    """Realtime delay information for one trip at one stop."""
+    """Realtime delay information for one trip at one stop (legacy coordinator
+    surface).  ``delay_seconds`` is 0 when no delay field was present (the
+    coordinator cannot represent "no prediction")."""
 
     delay_seconds: int
     is_cancelled: bool
@@ -34,24 +72,24 @@ class StopDelay:
 class TripUpdateIndex:
     """Parsed trip-updates feed, indexed for board aggregation (T9).
 
-    ``stop_delays`` is the flat ``"<trip_id>:<stop_id>"`` delay map the
-    coordinator already consumes.  ``trip_cancelled`` carries trip-level
-    cancellation (including trips with *no* stop_time_updates, which the flat
-    map cannot represent) and ``trip_skipped_count`` the per-trip number of
-    ``SKIPPED`` stop updates — both surfaced so a board can flag a trip that
-    skips its boarding stop while still applying delays to the stops it serves.
+    * ``by_sequence`` maps ``(trip_id, stop_sequence)`` → update for updates
+      that carry a ``stop_sequence`` (the primary, unambiguous join key).
+    * ``by_stop_id`` maps ``(trip_id, stop_id)`` → a tuple of updates that
+      carry a ``stop_id`` but NO ``stop_sequence`` (the fallback; a tuple so a
+      multi-occurrence stop is recognisably ambiguous).
+    * ``trip_cancelled`` / ``trip_skipped_count`` carry trip-level facts,
+      including trips whose update has *no* stop_time_updates at all (which the
+      per-stop maps cannot represent).
     """
 
-    stop_delays: dict[str, StopDelay]
+    by_sequence: dict[tuple[str, int], TripStopUpdate]
+    by_stop_id: dict[tuple[str, str], tuple[TripStopUpdate, ...]]
     trip_cancelled: dict[str, bool]
     trip_skipped_count: dict[str, int]
 
 
 def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
-    """Parse a TripUpdates FeedMessage into a full index (delays + cancel/skip).
-
-    See :class:`TripUpdateIndex` for the shape.  The flat delay map is available
-    as ``.stop_delays`` (identical to :func:`parse_trip_updates`'s return).
+    """Parse a TripUpdates FeedMessage into a sequence-aware index.
 
     Args:
         feed: A decoded ``gtfs_realtime_pb2.FeedMessage`` instance.
@@ -59,7 +97,8 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
     Returns:
         A :class:`TripUpdateIndex` (empty when the feed is malformed/empty).
     """
-    stop_delays: dict[str, StopDelay] = {}
+    by_sequence: dict[tuple[str, int], TripStopUpdate] = {}
+    by_stop_id: dict[tuple[str, str], tuple[TripStopUpdate, ...]] = {}
     trip_cancelled: dict[str, bool] = {}
     trip_skipped_count: dict[str, int] = {}
 
@@ -70,7 +109,7 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
             "parse_trip_updates_index received unexpected feed type: %s",
             type(feed),
         )
-        return TripUpdateIndex(stop_delays, trip_cancelled, trip_skipped_count)
+        return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count)
 
     for entity in entities:
         if not entity.HasField("trip_update"):
@@ -86,43 +125,94 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
         if is_cancelled:
             trip_cancelled[trip_id] = True
 
+        start_date = _string_field(trip_update.trip, "start_date")
+        start_time = _string_field(trip_update.trip, "start_time")
+
         for stu in trip_update.stop_time_update:
             stop_id: str = stu.stop_id
-            if not stop_id:
-                continue
+            stop_sequence: int = stu.stop_sequence
+            has_seq = _has_int_field(stu, "stop_sequence")
 
             is_skipped = stu.schedule_relationship == _STU_SKIPPED
             if is_skipped:
                 trip_skipped_count[trip_id] = trip_skipped_count.get(trip_id, 0) + 1
 
-            delay = 0
-            if stu.HasField("departure") and stu.departure.HasField("delay"):
-                delay = stu.departure.delay
-            elif stu.HasField("arrival") and stu.arrival.HasField("delay"):
-                delay = stu.arrival.delay
+            delay, absolute = _prediction(stu)
 
-            key = f"{trip_id}:{stop_id}"
-            stop_delays[key] = StopDelay(
+            update = TripStopUpdate(
                 delay_seconds=delay,
-                is_cancelled=is_cancelled,
+                absolute_time=absolute,
                 is_skipped=is_skipped,
+                start_date=start_date,
+                start_time=start_time,
             )
 
-    _LOGGER.debug("Parsed %d stop-level trip updates", len(stop_delays))
-    return TripUpdateIndex(stop_delays, trip_cancelled, trip_skipped_count)
+            if has_seq and stop_sequence:
+                # Primary key: unambiguous even for a loop trip.
+                by_sequence[(trip_id, stop_sequence)] = update
+            elif stop_id and not has_seq:
+                # Secondary fallback: keyed by stop_id, may be ambiguous.
+                by_stop_id[(trip_id, stop_id)] = by_stop_id.get(
+                    (trip_id, stop_id), ()
+                ) + (update,)
+            # Updates with neither a sequence nor a stop_id are dropped.
+
+    _LOGGER.debug(
+        "Parsed %d sequence + %d stop-id trip updates",
+        len(by_sequence), len(by_stop_id),
+    )
+    return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count)
+
+
+def _prediction(stu: object) -> tuple[int | None, datetime | None]:
+    """Return ``(delay_seconds | None, absolute_time | None)`` for a stop update.
+
+    Departure is preferred over arrival; within an event, ``delay`` is preferred
+    over ``time``.  ``(None, None)`` means no prediction is published.
+    """
+    for event_name in ("departure", "arrival"):
+        if not _has_msg_field(stu, event_name):
+            continue
+        event = getattr(stu, event_name)
+        if _has_int_field(event, "delay"):
+            return int(event.delay), None
+        if _has_int_field(event, "time"):
+            return None, datetime.fromtimestamp(int(event.time), tz=timezone.utc)
+    return None, None
+
+
+def _has_msg_field(obj: object, name: str) -> bool:
+    has = getattr(obj, "HasField", None)
+    if has is None:
+        return False
+    try:
+        return bool(has(name))
+    except (ValueError, TypeError):
+        return False
+
+
+def _has_int_field(obj: object, name: str) -> bool:
+    """True if a scalar protobuf field is explicitly set (key presence, not
+    truthiness — so ``direction_id == 0`` and ``stop_sequence == 0`` count)."""
+    return _has_msg_field(obj, name)
+
+
+def _string_field(obj: object, name: str) -> str | None:
+    """Return a string field's value, or None when absent/empty."""
+    try:
+        value = getattr(obj, name)
+    except AttributeError:
+        return None
+    return value or None
 
 
 def parse_trip_updates(feed: object) -> dict[str, StopDelay]:
-    """Parse a TripUpdates FeedMessage into a delay lookup dict.
+    """Parse a TripUpdates FeedMessage into the legacy flat delay map.
 
-    The returned dict is keyed by ``"<trip_id>:<stop_id>"`` so the coordinator
-    can do an O(1) lookup for each scheduled departure.  Each :class:`StopDelay`
-    now also carries the stop-level ``is_skipped`` flag (T9), default ``False``
-    for feeds that carry no SKIPPED relationship.
-
-    When a stop_time_update carries both arrival and departure delays, the
-    departure delay is preferred (it's what passengers care about). If only
-    arrival is present, that value is used instead.
+    Keyed ``"<trip_id>:<stop_id>"`` for O(1) coordinator lookups.  Updates
+    without a ``stop_id`` (sequence-only) are omitted; for a loop trip the last
+    occurrence of a stop wins (the legacy coordinator does not handle loops).
+    Each :class:`StopDelay` carries the stop-level ``is_skipped`` flag (T9).
 
     Args:
         feed: A decoded ``gtfs_realtime_pb2.FeedMessage`` instance.
@@ -130,4 +220,33 @@ def parse_trip_updates(feed: object) -> dict[str, StopDelay]:
     Returns:
         Dict mapping "trip_id:stop_id" → StopDelay.
     """
-    return parse_trip_updates_index(feed).stop_delays
+    result: dict[str, StopDelay] = {}
+
+    try:
+        entities = feed.entity  # type: ignore[attr-defined]
+    except AttributeError:
+        _LOGGER.warning(
+            "parse_trip_updates received unexpected feed type: %s", type(feed)
+        )
+        return result
+
+    for entity in entities:
+        if not entity.HasField("trip_update"):
+            continue
+        trip_update = entity.trip_update
+        trip_id = trip_update.trip.trip_id
+        if not trip_id:
+            continue
+        is_cancelled = trip_update.trip.schedule_relationship == _SR_CANCELED
+        for stu in trip_update.stop_time_update:
+            stop_id = stu.stop_id
+            if not stop_id:
+                continue
+            delay, _ = _prediction(stu)
+            result[f"{trip_id}:{stop_id}"] = StopDelay(
+                delay_seconds=delay if delay is not None else 0,
+                is_cancelled=is_cancelled,
+                is_skipped=stu.schedule_relationship == _STU_SKIPPED,
+            )
+
+    return result

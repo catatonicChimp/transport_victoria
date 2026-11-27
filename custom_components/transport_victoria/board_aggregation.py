@@ -6,24 +6,31 @@ departure board, plus a thin async realtime-fetch helper.  Nothing here imports
 
 The core :func:`aggregate_board` is a plain synchronous function whose ports are
 all injected — the schedule DB path, the parsed realtime index/alerts, the feed
-health map, and the clock — so the light-env unit tests exercise every merge,
-join, sort, dedupe, alert and sync-index rule against the T6 fixtures with no
-event loop.
-
-Realtime is joined by *trip id only* (see :ref:`join rule <join-rule>`); a row
-without a match falls back to its scheduled time.  A failed feed never sinks the
-board: the row stays scheduled, the failure is recorded in ``feed_health``.
+health map, and BOTH clocks (local ``now`` + aware UTC ``now_utc``) — so the
+light-env unit tests exercise every merge, join, sort, dedupe, alert and
+sync-index rule against the T6 fixtures with no event loop.
 
 .. _join-rule:
 
 **Join rule.**  A GTFS-RT ``TripUpdate`` is matched to a scheduled departure by
-the GTFS ``trip_id`` string only (keyed ``"<trip_id>:<stop_id>"`` against the
-row's ``actual_stop_id``).  The trip descriptor's ``start_date`` / ``start_time``
-are ignored: PTV trip ids are unique per run in the static schedule, so no date
-disambiguation is required, and the existing coordinator parser already ignores
-them (this package preserves that behaviour).  Failure mode: a scheduled trip
-with no matching ``TripUpdate`` (or with realtime disabled / the feed failed) is
-emitted with ``realtime_state="scheduled"`` and ``delay_seconds=-1``.
+the GTFS ``trip_id`` string + ``stop_sequence`` (keyed ``(trip_id, stop_sequence)``
+in the sequence-aware index).  When an update carries no ``stop_sequence`` the
+join falls back to ``(trip_id, stop_id)`` — but only when exactly ONE such update
+matches that stop (a loop trip visiting one stop twice without sequence numbers
+is therefore treated as unmatched, never guessed).  The trip descriptor's
+``start_date`` / ``start_time`` are captured on each update for provenance but are
+**not** part of the join key: the scheduled rows carry no ``start_date``, and PTV
+trip ids are unique per run within a feed's service window, so the trip-id +
+sequence key is unambiguous in practice.  Failure mode: a scheduled trip with no
+matching update (or realtime disabled / the feed failed) is emitted with
+``realtime_state="scheduled"`` and ``delay_seconds=-1``.
+
+**Prediction.**  A stop update with a ``delay`` yields ``expected = scheduled +
+delay`` (delay may be negative).  One with an absolute ``time`` (and no delay)
+yields ``expected = time`` converted from UTC to the board's ``local_tz`` and
+``delay = expected - scheduled``.  One with neither carries **no** prediction:
+the row stays ``realtime_state="scheduled"`` (never ``live``), even though its
+cancellation/skip flags may still be set from trip/stop level.
 
 **Dedupe.**  Identical departures surfaced by more than one pin (the
 via-hint-duplicate case: two pins on the same route/direction/terminal) collapse
@@ -36,9 +43,23 @@ tie-broken by boarding stop id → route number → headsign → pin order index
 trip id.  The pin order index participates near the end, so TripView's
 "order by time across all pins" holds and pin order only decides exact ties.
 
+**Clock discipline.**  ``now`` is the local clock (naive; drives the schedule
+query and the effective-time window).  ``now_utc`` is a REQUIRED aware-UTC
+datetime (alerts + freshness); passing a naive one raises ``TypeError``.
+``local_tz`` (a ``zoneinfo``) is REQUIRED and is how absolute RT times are
+converted to local and how a naive ``now`` is interpreted.
+
+**Freshness.**  A feed is classified fresh/stale from its GTFS-RT
+``header.timestamp`` (primary) or, when that is absent, its ``fetched_at``
+(fallback) — both carried on the ``FeedMeta`` returned by the fetch port, never
+read from the production module cache.  Staleness is applied PER MODE: a stale
+trip-updates feed marks only that mode's pins' rows stale, and service-alert
+staleness never affects a departure's ``realtime_state``.
+
 **Sync index.**  :func:`compute_sync_index` fingerprints the rows' identity +
-effective time + cancel/skip status (but not pin order or ``realtime_state``),
-so dashboard scroll stays stable across polls and pin reordering.
+effective wall-clock time (ISO, never an epoch) + cancel/skip status — but not
+pin order or ``realtime_state`` — so dashboard scroll stays stable across polls
+and pin reordering, and is independent of the host timezone.
 
 Result model (all pure data):
 
@@ -50,10 +71,11 @@ Result model (all pure data):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Iterable
 
@@ -66,12 +88,16 @@ from .const import (
     MODE_REGIONAL_BUS,
     MODE_TRAM,
     MODE_VLINE,
-    REALTIME_CACHE_TTL_SECONDS,
 )
 from .gtfs.repository import DepartureRow, next_departures
-from .realtime.client import feed_fetched_at
-from .realtime.service_alerts import ServiceAlert, is_alert_active, parse_service_alerts
-from .realtime.trip_updates import TripUpdateIndex, parse_trip_updates_index
+from .realtime.client import FeedMeta
+from .realtime.service_alerts import (
+    SelectorRecord,
+    ServiceAlert,
+    is_alert_active,
+    parse_service_alerts,
+)
+from .realtime.trip_updates import TripStopUpdate, TripUpdateIndex, parse_trip_updates_index
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,8 +106,7 @@ REALTIME_SCHEDULED = "scheduled"   # no realtime data (disabled / no match / fai
 REALTIME_LIVE = "live"             # a fresh TripUpdate was applied
 REALTIME_STALE = "stale"           # a TripUpdate matched but the feed is old
 # Reserved (not emitted by T9): a trip is known to realtime but no stop-level
-# prediction is published yet.  T10/T13 finalise its exact trigger once the
-# trip-update parser distinguishes "delay 0" from "no delay field present".
+# prediction is published yet.  T10/T13 finalise its exact trigger.
 REALTIME_PENDING = "pending"
 
 # Feed health states (``FeedHealth.state``).
@@ -89,13 +114,29 @@ FEED_OK = "ok"
 FEED_STALE = "stale"
 FEED_FAILED = "failed"
 
-# ``delay_seconds`` sentinel for a row with no realtime data at all.
+# ``delay_seconds`` sentinel for a row with no realtime prediction at all.
 DELAY_UNKNOWN = -1
 
-# How many scheduled departures to fetch per pin.  Over-fetched on purpose so
-# cross-pin dedupe (and a board-wide ``limit``) never under-fill the merged
-# result when several pins share trips.
-_PER_PIN_LIMIT = 20
+# --- Scheduling window ----------------------------------------------------
+# A delayed-in-past departure (scheduled slightly before ``now`` but pushed into
+# the future by realtime) must still surface, so the schedule query runs a
+# bounded lookback behind ``now``.
+SCHEDULE_LOOKBACK = timedelta(minutes=45)
+# Upper bound on how far ahead the board looks (replaces an unbounded LIMIT-only
+# query so a sparse stop cannot spill arbitrarily far into the future).
+SCHEDULE_HORIZON = timedelta(hours=3)
+# Candidates fetched per pin, before cross-pin dedupe + effective-time windowing.
+# Over-fetched so significant realtime reordering cannot starve the top-N rows.
+_PER_PIN_LIMIT = 40
+
+# --- Freshness thresholds -------------------------------------------------
+# A feed whose header/fetch timestamp is older than this is "stale".
+_FEED_STALE_AFTER = timedelta(seconds=180)
+# A header timestamp more than this far in the FUTURE is clock skew → fresh.
+_FEED_FUTURE_SKEW = timedelta(minutes=5)
+
+# Cap + deterministic ordering for board alerts (drop order = alert_id).
+MAX_BOARD_ALERTS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +174,7 @@ class FeedHealth:
     """Health of one realtime feed ``(mode, feed_type)``."""
 
     state: str                       # "ok" | "stale" | "failed"
-    age: timedelta | None = None     # for failed: time since last success
+    age: timedelta | None = None     # data age when classifiable; None for failed
 
 
 @dataclass(slots=True)
@@ -155,10 +196,10 @@ class BoardDeparture:
     boarding_stop_name: str
     platform: str | None
 
-    scheduled_departure: datetime    # absolute local time
+    scheduled_departure: datetime    # absolute local time (naive)
     scheduled_seconds: int           # departure_seconds (service-day offset)
     expected_departure: datetime | None   # scheduled + delay (None when no RT)
-    delay_seconds: int               # realtime delay, or DELAY_UNKNOWN (-1)
+    delay_seconds: int               # realtime delay (may be negative), or -1
     is_cancelled: bool
     is_skipped: bool                 # this stop is SKIPPED for the trip
     skipped_stops_count: int         # trip-level SKIPPED stop count
@@ -202,7 +243,7 @@ class BoardResult:
     """The merged board: time-sorted rows, alerts, feed health, sync index."""
 
     rows: list[BoardDeparture]
-    alerts: list[BoardAlert]                        # deduped, board-wide
+    alerts: list[BoardAlert]                        # deduped, capped, board-wide
     alerts_by_pin: dict[str, list[BoardAlert]]      # pin_key → matched alerts
     feed_health: dict[tuple[str, str], FeedHealth]
     sync_index: str
@@ -216,11 +257,11 @@ class RealtimeBoardData:
     trip_updates: TripUpdateIndex | None
     alerts: list[ServiceAlert]
     feed_health: dict[tuple[str, str], FeedHealth]
-    trip_updates_stale: bool = False
+    stale_modes: frozenset[str] = frozenset()   # modes w/ stale trip-updates
 
 
 # ---------------------------------------------------------------------------
-# Realtime fetch (async, thin; T10 wires this into the coordinator)
+# Realtime fetch (async I/O) + parse (sync, offloaded)
 # ---------------------------------------------------------------------------
 
 
@@ -230,87 +271,150 @@ async def fetch_board_realtime(
     realtime_enabled: bool,
     *,
     now: datetime | None = None,
+    run_sync=None,
 ) -> RealtimeBoardData:
     """Fetch + parse realtime feeds for a board, one request per (mode, feed).
 
-    ``client`` is any object exposing ``async fetch_feed(mode, feed_type)``
-    (the production ``PTVRealtimeClient``, or a stub in tests).  Pins sharing a
-    mode are deduplicated, so N pins on one mode make exactly one request per
-    feed type — no request multiplication.  A per-feed failure is recorded in
-    ``feed_health`` and never raised; the board stays healthy and falls back
-    to scheduled data.
+    Runs in two phases:
+
+    * **I/O (on the event loop):** ``client.fetch_feed(mode, feed_type)`` is
+      awaited once per distinct ``(mode, feed_type)`` — N pins on one mode make
+      exactly one request per feed type, no multiplication.  The port MUST
+      return ``(feed, FeedMeta)`` so freshness is classified from the fetched
+      data itself (production: ``PTVRealtimeClient.fetch_feed_with_meta``).
+    * **Parse (offloaded):** all protobuf parsing runs inside
+      :func:`_parse_fetched` via ``run_sync`` — by default ``asyncio.to_thread``
+      so the blocking C-extension decode never touches the event loop (matching
+      the realtime client's decode-in-executor pattern and T2's sqlite pattern).
+      The T10 coordinator adapter must keep this offload in place.
+
+    A per-feed failure is recorded in ``feed_health`` and never raised; the
+    board stays healthy and falls back to scheduled data.
 
     Args:
-        client: Realtime client (``fetch_feed`` port).
+        client: Realtime client exposing ``async fetch_feed(mode, feed_type)
+            -> (feed, FeedMeta)``.
         pins: The board's pins (order-independent here).
         realtime_enabled: False short-circuits all fetches (empty result).
-        now: Clock for staleness classification (defaults to UTC now).
+        now: Aware UTC clock for freshness classification (defaults to now).
+        run_sync: Callable ``(fn, *args) -> awaitable`` that runs ``fn`` off the
+            event loop (defaults to ``asyncio.to_thread``).
 
     Returns:
         :class:`RealtimeBoardData` (all-empty when realtime is disabled).
     """
     if not realtime_enabled:
-        return RealtimeBoardData(trip_updates=None, alerts=[], feed_health={})
+        return RealtimeBoardData(
+            trip_updates=None, alerts=[], feed_health={}, stale_modes=frozenset()
+        )
 
     now = now or datetime.now(tz=timezone.utc)
     if now.tzinfo is None:
-        # Normalise naive (UTC) clocks for age arithmetic against cache times.
-        now = now.replace(tzinfo=timezone.utc)
+        raise TypeError("fetch_board_realtime requires an aware (UTC) `now`")
+    now = now.astimezone(timezone.utc)
 
     modes = _distinct_modes(pins)
 
+    # --- I/O phase ---------------------------------------------------------
+    fetched: dict[tuple[str, str], object] = {}
+    for mode in modes:
+        for feed_type in (FEED_TRIP_UPDATES, FEED_SERVICE_ALERTS):
+            try:
+                fetched[(mode, feed_type)] = await client.fetch_feed(mode, feed_type)
+            except Exception as exc:  # noqa: BLE001 - per-feed isolation
+                fetched[(mode, feed_type)] = exc
+
+    # --- Parse phase (offloaded) -------------------------------------------
+    run_sync = run_sync or asyncio.to_thread
+    return await run_sync(_parse_fetched, fetched, modes, now)
+
+
+def _parse_fetched(
+    fetched: dict[tuple[str, str], object],
+    modes: list[str],
+    now: datetime,
+) -> RealtimeBoardData:
+    """Pure sync: parse fetched feeds into a :class:`RealtimeBoardData`.
+
+    Runs off the event loop (see :func:`fetch_board_realtime`).  Each
+    ``(mode, feed_type)`` is parsed exactly once.
+    """
     feed_health: dict[tuple[str, str], FeedHealth] = {}
 
-    stop_delays: dict = {}
+    by_sequence: dict[tuple[str, int], TripStopUpdate] = {}
+    by_stop_id: dict[tuple[str, str], tuple[TripStopUpdate, ...]] = {}
     trip_cancelled: dict[str, bool] = {}
     trip_skipped_count: dict[str, int] = {}
-    trip_updates_stale = False
     any_trip_feed = False
+    stale_modes: set[str] = set()
+    alerts: list[ServiceAlert] = []
 
     for mode in modes:
-        key = (mode, FEED_TRIP_UPDATES)
-        try:
-            feed = await client.fetch_feed(mode, FEED_TRIP_UPDATES)
-            index = parse_trip_updates_index(feed)
-            stop_delays.update(index.stop_delays)
-            trip_cancelled.update(index.trip_cancelled)
-            trip_skipped_count.update(index.trip_skipped_count)
-            any_trip_feed = True
-            fetched_at = feed_fetched_at(mode, FEED_TRIP_UPDATES)
-            if _is_stale(fetched_at, now):
-                feed_health[key] = FeedHealth(FEED_STALE)
-                trip_updates_stale = True
-            else:
-                feed_health[key] = FeedHealth(FEED_OK)
-        except Exception as exc:  # noqa: BLE001 - per-feed isolation
-            _LOGGER.warning("trip-updates fetch failed for %s: %s", mode, exc)
-            feed_health[key] = FeedHealth(FEED_FAILED, age=_feed_age(mode, FEED_TRIP_UPDATES, now))
+        for feed_type in (FEED_TRIP_UPDATES, FEED_SERVICE_ALERTS):
+            key = (mode, feed_type)
+            result = fetched[key]
+            if isinstance(result, BaseException):
+                feed_health[key] = FeedHealth(FEED_FAILED)
+                continue
+
+            feed, meta = result  # type: ignore[misc]
+            state, age = _classify_freshness(meta, now)
+            feed_health[key] = FeedHealth(state, age)
+
+            if feed_type == FEED_TRIP_UPDATES:
+                index = parse_trip_updates_index(feed)
+                by_sequence.update(index.by_sequence)
+                by_stop_id.update(index.by_stop_id)
+                trip_cancelled.update(index.trip_cancelled)
+                trip_skipped_count.update(index.trip_skipped_count)
+                any_trip_feed = True
+                if state == FEED_STALE:
+                    stale_modes.add(mode)
+            else:  # service alerts
+                # Alerts never affect a departure's realtime_state.
+                alerts.extend(parse_service_alerts(feed, feed_mode=mode))
 
     trip_updates: TripUpdateIndex | None = None
     if any_trip_feed:
         trip_updates = TripUpdateIndex(
-            stop_delays=stop_delays,
+            by_sequence=by_sequence,
+            by_stop_id=by_stop_id,
             trip_cancelled=trip_cancelled,
             trip_skipped_count=trip_skipped_count,
         )
-
-    alerts: list[ServiceAlert] = []
-    for mode in modes:
-        key = (mode, FEED_SERVICE_ALERTS)
-        try:
-            feed = await client.fetch_feed(mode, FEED_SERVICE_ALERTS)
-            alerts.extend(parse_service_alerts(feed))
-            feed_health[key] = FeedHealth(FEED_OK)
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("service-alerts fetch failed for %s: %s", mode, exc)
-            feed_health[key] = FeedHealth(FEED_FAILED, age=_feed_age(mode, FEED_SERVICE_ALERTS, now))
 
     return RealtimeBoardData(
         trip_updates=trip_updates,
         alerts=alerts,
         feed_health=feed_health,
-        trip_updates_stale=trip_updates_stale,
+        stale_modes=frozenset(stale_modes),
     )
+
+
+def _classify_freshness(
+    meta: FeedMeta, now: datetime
+) -> tuple[str, timedelta | None]:
+    """Classify a feed's freshness from its header (primary) or fetch time.
+
+    Returns ``(state, age)`` where state is ``FEED_OK`` or ``FEED_STALE`` and
+    age is the data age (None when unclassifiable).  A header timestamp more
+    than ``_FEED_FUTURE_SKEW`` in the future is treated as clock skew → fresh.
+    """
+    ts = meta.header_timestamp
+    if ts is not None:
+        age = now - ts
+        if age < -_FEED_FUTURE_SKEW:
+            return FEED_OK, None  # future beyond skew → clock skew
+        if age > _FEED_STALE_AFTER:
+            return FEED_STALE, age
+        return FEED_OK, age
+    fetched_at = meta.fetched_at
+    if fetched_at is not None:
+        age = now - fetched_at
+        if age > _FEED_STALE_AFTER:
+            return FEED_STALE, age
+        return FEED_OK, age
+    return FEED_OK, None  # no signal → assume fresh (documented policy)
 
 
 def _distinct_modes(pins: list[PinData]) -> list[str]:
@@ -327,20 +431,6 @@ def _distinct_modes(pins: list[PinData]) -> list[str]:
     return modes
 
 
-def _is_stale(fetched_at: datetime | None, now: datetime) -> bool:
-    """True if a cached feed is older than the realtime TTL."""
-    if fetched_at is None:
-        return False
-    return (now - fetched_at) > timedelta(seconds=REALTIME_CACHE_TTL_SECONDS)
-
-
-def _feed_age(mode: str, feed_type: str, now: datetime) -> timedelta | None:
-    fetched_at = feed_fetched_at(mode, feed_type)
-    if fetched_at is None:
-        return None
-    return now - fetched_at
-
-
 # ---------------------------------------------------------------------------
 # Core aggregation (pure, synchronous)
 # ---------------------------------------------------------------------------
@@ -351,14 +441,17 @@ def aggregate_board(
     pins: list[PinData],
     now: datetime,
     *,
+    local_tz: tzinfo,
+    now_utc: datetime,
     realtime_enabled: bool = True,
     trip_updates: TripUpdateIndex | None = None,
-    trip_updates_stale: bool = False,
+    stale_modes: Iterable[str] = (),
     alerts: list[ServiceAlert] | None = None,
     feed_health: dict[tuple[str, str], FeedHealth] | None = None,
-    now_utc: datetime | None = None,
     invalid_pins: Iterable[str] = (),
     limit: int | None = None,
+    horizon: timedelta | None = None,
+    lookback: timedelta | None = None,
 ) -> BoardResult:
     """Merge ``pins`` into one time-sorted departure board.
 
@@ -366,39 +459,56 @@ def aggregate_board(
 
     1. Skip disabled pins (``include`` False) and pins in ``invalid_pins``.
     2. Query each remaining pin's scheduled departures via
-       :func:`~.gtfs.repository.next_departures` (``direction_stop_id`` is the
-       pin's destination unless ``all_destinations``; route/platform filters
-       honoured).
-    3. Join realtime (delay/cancel/skip) onto each scheduled departure by trip
-       id (see :ref:`join rule <join-rule>`); rows without a match (or with
-       realtime disabled / failed) stay ``realtime_state="scheduled"``.
-    4. Dedupe identical departures across pins — keyed by
-       ``(trip_id, stop_sequence)`` so a loop trip's distinct occurrences are
-       kept while via-hint-duplicate pins collapse to one row (first pin in
-       order wins).
-    5. Sort ascending by effective time, tie-broken by
-       boarding stop id → route number → headsign → pin order index → trip id.
-    6. Match active service alerts to pins by route/stop/trip selector.
-    7. Compute the :func:`sync_index` fingerprint (pin-order independent).
+       :func:`~.gtfs.repository.next_departures` with a bounded lookback
+       (``direction_stop_id`` is the pin's destination unless
+       ``all_destinations``; route/platform filters honoured).
+    3. Join realtime (delay / absolute-time / cancel / skip) onto each scheduled
+       departure by trip id + stop sequence (see :ref:`join rule <join-rule>`);
+       rows without a prediction stay ``realtime_state="scheduled"``.
+    4. Apply the *effective-time* window: non-cancelled rows must land in
+       ``[now, now + horizon]``; cancelled rows are retained across the lookback
+       window (effective = scheduled) so a recent cancellation still shows.
+    5. Dedupe by ``(trip_id, stop_sequence)``, then sort ascending by effective
+       time with the deterministic tie-breaks, then cap at ``limit``.
+    6. Match active service alerts to pins (selector AND/OR semantics, deduped by
+       ``alert_id`` and capped).
+    7. Compute the :func:`sync_index` fingerprint (pin-order + TZ independent).
 
     Args:
         db_path: GTFS generation anchor (resolved via ``store.resolve``).
         pins: Pins in canonical display order (order index = list position).
         now: Local naive datetime (drives the schedule query + sort).
-        realtime_enabled: False → all rows scheduled, no realtime join.
+        local_tz: tzinfo for converting absolute RT times to local (and a naive
+            ``now`` when one is passed aware).
+        now_utc: REQUIRED aware-UTC datetime (alerts + freshness); a naive value
+            raises ``TypeError``.
+        realtime_enabled: False → all rows scheduled, realtime index ignored.
         trip_updates: Parsed realtime index (from ``fetch_board_realtime``).
-        trip_updates_stale: True marks matched rows ``realtime_state="stale"``.
+        stale_modes: Modes whose trip-updates feed is stale → their rows stale.
         alerts: Parsed service alerts (unfiltered; active-window checked here).
         feed_health: Per-feed health (passed through to the result).
-        now_utc: Aware UTC clock for alert active-window checks.
         invalid_pins: pin_keys considered unresolvable (skipped).
         limit: Cap the returned rows (None → uncapped).
+        horizon: Override the default ``SCHEDULE_HORIZON``.
+        lookback: Override the default ``SCHEDULE_LOOKBACK``.
 
     Returns:
         :class:`BoardResult`.
     """
+    if now_utc.tzinfo is None:
+        raise TypeError(
+            "aggregate_board requires an aware (UTC) `now_utc`; got a naive "
+            "datetime. Pass e.g. dt_util.utcnow() from the coordinator."
+        )
+    now_utc = now_utc.astimezone(timezone.utc)
+
+    if now.tzinfo is not None:
+        now = now.astimezone(local_tz).replace(tzinfo=None)
+
+    horizon = horizon or SCHEDULE_HORIZON
+    lookback = lookback or SCHEDULE_LOOKBACK
+    stale_modes = frozenset(stale_modes)
     invalid = set(invalid_pins)
-    now_utc = now_utc or _to_utc(now)
     feed_health = dict(feed_health) if feed_health else {}
 
     # Kept pins in canonical order (order index = position in this list).
@@ -408,12 +518,16 @@ def aggregate_board(
             continue
         kept.append((idx, pin))
 
-    # --- Build raw rows (pin order), then dedupe + sort --------------------
+    # --- Build raw rows (pin order), then window + dedupe + sort ----------
     trips_by_pin: dict[str, set[str]] = {}
     raw_rows: list[BoardDeparture] = []
+    horizon_dt = now + horizon
 
     for pin_index, pin in kept:
         destination = None if pin.all_destinations else pin.destination_stop_id
+        pin_mode = route_type_to_mode(pin.route_type)
+        pin_stale = pin_mode in stale_modes
+
         departure_rows = next_departures(
             db_path,
             pin.boarding_stop_id,
@@ -422,15 +536,18 @@ def aggregate_board(
             direction_stop_id=destination,
             route_id_filter=pin.route_id,
             platform_filter=pin.platform_filter,
+            lookback_seconds=int(lookback.total_seconds()),
         )
 
         pin_trips: set[str] = set()
         for row in departure_rows:
             pin_trips.add(row.trip_id)
-            raw_rows.append(
-                _build_departure(pin, pin_index, row, trip_updates, realtime_enabled,
-                                 trip_updates_stale)
+            dep = _build_departure(
+                pin, pin_index, row, trip_updates, realtime_enabled, pin_stale,
+                local_tz,
             )
+            if _in_window(dep, now, horizon_dt, lookback):
+                raw_rows.append(dep)
         trips_by_pin[pin.pin_key] = pin_trips
 
     rows = _dedupe(raw_rows)
@@ -457,36 +574,75 @@ def aggregate_board(
     )
 
 
+def _in_window(
+    row: BoardDeparture, now: datetime, horizon_dt: datetime, lookback: timedelta
+) -> bool:
+    """Return True if a departure belongs on the board (effective-time window).
+
+    Non-cancelled rows must be at or after ``now`` (already-departed services are
+    dropped once their delay is applied) and before the horizon.  Cancelled rows
+    are retained back through the lookback window (their effective time is their
+    scheduled time), so a recently-cancelled service still surfaces.
+    """
+    eff = row.effective_departure
+    if eff > horizon_dt:
+        return False
+    if row.is_cancelled:
+        return eff >= now - lookback
+    return eff >= now
+
+
+def _lookup_update(
+    trip_updates: TripUpdateIndex | None,
+    trip_id: str,
+    stop_sequence: int,
+    actual_stop_id: str,
+) -> TripStopUpdate | None:
+    """Join a scheduled departure to its stop update (sequence-aware)."""
+    if trip_updates is None:
+        return None
+    seq_key = (trip_id, stop_sequence)
+    if seq_key in trip_updates.by_sequence:
+        return trip_updates.by_sequence[seq_key]
+    fallback = trip_updates.by_stop_id.get((trip_id, actual_stop_id))
+    if fallback is not None and len(fallback) == 1:
+        return fallback[0]
+    return None
+
+
 def _build_departure(
     pin: PinData,
     pin_index: int,
     row: DepartureRow,
     trip_updates: TripUpdateIndex | None,
     realtime_enabled: bool,
-    stale_flag: bool,
+    pin_stale: bool,
+    local_tz: tzinfo,
 ) -> BoardDeparture:
-    """Join realtime onto one scheduled departure row."""
-    key = f"{row.trip_id}:{row.actual_stop_id}"
-    stop_delay = trip_updates.stop_delays.get(key) if trip_updates else None
-
+    """Join realtime onto one scheduled departure row (all RT gated on enabled)."""
     is_cancelled = False
     skipped_count = 0
     is_skipped = False
-    if trip_updates is not None:
+    delay = DELAY_UNKNOWN
+    expected: datetime | None = None
+    state = REALTIME_SCHEDULED
+
+    if realtime_enabled and trip_updates is not None:
         is_cancelled = trip_updates.trip_cancelled.get(row.trip_id, False)
         skipped_count = trip_updates.trip_skipped_count.get(row.trip_id, 0)
-        if stop_delay is not None:
-            is_cancelled = is_cancelled or stop_delay.is_cancelled
-            is_skipped = stop_delay.is_skipped
-
-    if realtime_enabled and stop_delay is not None:
-        delay = stop_delay.delay_seconds
-        expected = row.scheduled_departure + timedelta(seconds=delay)
-        state = REALTIME_STALE if stale_flag else REALTIME_LIVE
-    else:
-        delay = DELAY_UNKNOWN
-        expected = None
-        state = REALTIME_SCHEDULED
+        update = _lookup_update(
+            trip_updates, row.trip_id, row.stop_sequence, row.actual_stop_id
+        )
+        if update is not None:
+            is_skipped = update.is_skipped
+            # A cancelled trip has no meaningful prediction: its effective time
+            # is its scheduled time (see the windowing docstring).
+            if not is_cancelled:
+                delay, expected = _resolve_prediction(
+                    update, row.scheduled_departure, local_tz
+                )
+                if expected is not None:
+                    state = REALTIME_STALE if pin_stale else REALTIME_LIVE
 
     if pin.all_destinations:
         destination_label = row.trip_headsign
@@ -517,6 +673,25 @@ def _build_departure(
         route_color=row.route_color,
         direction_id=row.direction_id,
     )
+
+
+def _resolve_prediction(
+    update: TripStopUpdate, scheduled: datetime, local_tz: tzinfo
+) -> tuple[int, datetime | None]:
+    """Resolve a stop update to ``(delay_seconds, expected_departure)``.
+
+    ``delay`` wins; otherwise an absolute ``time`` is converted from UTC to
+    ``local_tz`` and the delay derived from it (may be negative).  ``(DELAY_UNKNOWN,
+    None)`` when the update carries no prediction at all.
+    """
+    if update.delay_seconds is not None:
+        delay = update.delay_seconds
+        return delay, scheduled + timedelta(seconds=delay)
+    if update.absolute_time is not None:
+        local = update.absolute_time.astimezone(local_tz).replace(tzinfo=None)
+        delay = int((local - scheduled).total_seconds())
+        return delay, local
+    return DELAY_UNKNOWN, None
 
 
 def _dedupe(rows: list[BoardDeparture]) -> list[BoardDeparture]:
@@ -558,13 +733,6 @@ def _departure_sort_key(d: BoardDeparture) -> tuple:
     )
 
 
-def _to_utc(now: datetime) -> datetime:
-    """Normalise a naive datetime to aware UTC (assumes it is already UTC)."""
-    if now.tzinfo is not None:
-        return now
-    return now.replace(tzinfo=timezone.utc)
-
-
 # ---------------------------------------------------------------------------
 # Alert matching
 # ---------------------------------------------------------------------------
@@ -578,56 +746,119 @@ def match_board_alerts(
 ) -> list[BoardAlert]:
     """Match active alerts to pins by informed_entity selectors.
 
-    An alert matches a pin when it is active at ``now_utc`` AND at least one of
-    its informed_entity selectors references the pin:
-
-    * ``route_id`` == the pin's route;
-    * ``stop_id`` == the pin's boarding (or destination) stop;
-    * ``trip.trip_id`` == one of the pin's departure trips.
-
-    An alert with *no* route/stop/trip selector (agency-wide) matches every pin.
-    Matching is by selector identity only — ``cause`` is never consulted.
+    GTFS-RT semantics: populated fields WITHIN one selector are ANDed; separate
+    selectors on an alert are ORed.  A selector with no route/stop/trip scope is
+    agency-level (matches pins on its feed), and a truly empty selector matches
+    everything.  Results are deduplicated by ``alert_id`` (match reasons merged
+    across pins) and capped at :data:`MAX_BOARD_ALERTS` (deterministic drop order
+    by ``alert_id``).  ``cause`` is never consulted.
     """
-    board_alerts: list[BoardAlert] = []
+    merged: dict[str, dict[str, set[str]]] = {}
+    meta: dict[str, tuple] = {}
+
     for alert in alerts:
         if not is_alert_active(alert, now_utc):
             continue
-
-        matches: list[AlertMatch] = []
-        has_scope = bool(alert.route_ids or alert.stop_ids or alert.trip_ids)
-
+        pin_reasons: dict[str, set[str]] = {}
         for pin_key, pin in pins_by_key.items():
-            reasons: list[str] = []
-            if pin.route_id in alert.route_ids:
-                reasons.append("route")
-            if pin.boarding_stop_id in alert.stop_ids or (
-                pin.destination_stop_id is not None
-                and pin.destination_stop_id in alert.stop_ids
-            ):
-                reasons.append("stop")
-            if trips_by_pin.get(pin_key, set()) & set(alert.trip_ids):
-                reasons.append("trip")
-            if not has_scope:
-                reasons.append("agency")
-
-            if reasons:
-                matches.append(AlertMatch(pin_key=pin_key, reasons=tuple(reasons)))
-
-        if matches:
-            board_alerts.append(
-                BoardAlert(
-                    alert_id=alert.alert_id,
-                    header=alert.header,
-                    description=alert.description,
-                    cause=alert.cause,
-                    effect=alert.effect,
-                    active_from=alert.active_periods[0].start if alert.active_periods else None,
-                    active_until=alert.active_periods[0].end if alert.active_periods else None,
-                    matches=tuple(matches),
-                )
+            kinds = _selector_kinds(
+                alert, pin, trips_by_pin.get(pin_key, set())
+            )
+            if kinds:
+                pin_reasons.setdefault(pin_key, set()).update(kinds)
+        if pin_reasons:
+            prev = merged.setdefault(alert.alert_id, {})
+            for pin_key, kinds in pin_reasons.items():
+                prev.setdefault(pin_key, set()).update(kinds)
+            meta.setdefault(
+                alert.alert_id,
+                (
+                    alert.header,
+                    alert.description,
+                    alert.cause,
+                    alert.effect,
+                    alert.active_periods[0].start if alert.active_periods else None,
+                    alert.active_periods[0].end if alert.active_periods else None,
+                ),
             )
 
-    return board_alerts
+    board_alerts: list[BoardAlert] = []
+    for alert_id in sorted(merged):
+        header, description, cause, effect, active_from, active_until = meta[alert_id]
+        matches = tuple(
+            AlertMatch(pin_key=pin_key, reasons=tuple(sorted(reasons)))
+            for pin_key, reasons in sorted(merged[alert_id].items())
+        )
+        board_alerts.append(
+            BoardAlert(
+                alert_id=alert_id,
+                header=header,
+                description=description,
+                cause=cause,
+                effect=effect,
+                active_from=active_from,
+                active_until=active_until,
+                matches=matches,
+            )
+        )
+
+    return board_alerts[:MAX_BOARD_ALERTS]
+
+
+def _selector_kinds(
+    alert: ServiceAlert, pin: PinData, pin_trips: set[str]
+) -> frozenset[str] | None:
+    """Return the matching reason kinds across the alert's selectors (OR), or
+    None when none match.  Within each selector the populated fields are ANDed."""
+    pin_mode = route_type_to_mode(pin.route_type)
+    kinds: set[str] = set()
+    for selector in alert.selectors:
+        matched = _selector_match(selector, pin, pin_trips, pin_mode, alert.feed_mode)
+        if matched:
+            kinds.update(matched)
+    return frozenset(kinds) if kinds else None
+
+
+def _selector_match(
+    selector: SelectorRecord,
+    pin: PinData,
+    pin_trips: set[str],
+    pin_mode: str | None,
+    feed_mode: str | None,
+) -> tuple[str, ...] | None:
+    """AND across a selector's populated fields; return the matching kinds."""
+    kinds: list[str] = []
+    if selector.route_type_id is not None:
+        if pin.route_type != selector.route_type_id:
+            return None
+        kinds.append("route_type")
+    if selector.route_id is not None:
+        if pin.route_id != selector.route_id:
+            return None
+        kinds.append("route")
+    if selector.direction_id is not None:
+        if pin.direction_id != selector.direction_id:
+            return None
+        kinds.append("direction")
+    if selector.stop_id is not None:
+        if selector.stop_id not in (pin.boarding_stop_id, pin.destination_stop_id):
+            return None
+        kinds.append("stop")
+    if selector.trip_id is not None:
+        if selector.trip_id not in pin_trips:
+            return None
+        kinds.append("trip")
+
+    if kinds:
+        return tuple(kinds)
+
+    # No route/stop/trip/route_type/direction scope.
+    if selector.agency_id is not None:
+        # Agency-scoped: matches pins on the same feed/mode (implicit agency).
+        if feed_mode is not None and pin_mode == feed_mode:
+            return ("agency",)
+        return None
+    return ("agency",)  # truly unscoped → matches everything
 
 
 # ---------------------------------------------------------------------------
@@ -636,21 +867,21 @@ def match_board_alerts(
 
 
 def compute_sync_index(rows: list[BoardDeparture]) -> str:
-    """Return a stable fingerprint over the board's rows (pin-order independent).
+    """Return a stable fingerprint over the board's rows (pin-order + TZ free).
 
     TripView ``Trip_GetSyncIndex`` semantics: identical when the board's rows
     are unchanged, different only when actual rows change.  The fingerprint
     covers each row's identity (``trip_id`` + ``stop_sequence``), its effective
-    departure time, and its cancel/skip status — folded in so a status-only
-    change still bumps the index — but NOT the pin order or ``realtime_state``,
-    so reordering pins (or a staleness transition) keeps the dashboard's scroll
-    position stable.
+    wall-clock time (ISO string — never ``.timestamp()``, so it is independent
+    of the host timezone), and its cancel/skip status — but NOT the pin order or
+    ``realtime_state``, so reordering pins (or a staleness transition) keeps the
+    dashboard's scroll position stable.
     """
     canonical = sorted(
         (
             r.trip_id,
             r.stop_sequence,
-            int(r.effective_departure.timestamp()),
+            r.effective_departure.isoformat(),
             int(r.is_cancelled),
             int(r.is_skipped),
             r.skipped_stops_count,
@@ -658,7 +889,7 @@ def compute_sync_index(rows: list[BoardDeparture]) -> str:
         for r in rows
     )
     raw = "|".join(
-        f"{tid}:{seq}:{ts}:{cancelled}:{skipped}:{skipped_count}"
-        for tid, seq, ts, cancelled, skipped, skipped_count in canonical
+        f"{tid}:{seq}:{iso}:{cancelled}:{skipped}:{skipped_count}"
+        for tid, seq, iso, cancelled, skipped, skipped_count in canonical
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()

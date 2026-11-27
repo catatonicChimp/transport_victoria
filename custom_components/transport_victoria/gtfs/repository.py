@@ -136,6 +136,7 @@ def next_departures(
     direction_stop_id: str | None = None,
     route_id_filter: str | None = None,
     platform_filter: str | None = None,
+    lookback_seconds: int = 0,
 ) -> list[DepartureRow]:
     """Return the next scheduled departures from a stop.
 
@@ -156,21 +157,27 @@ def next_departures(
             after the origin (used for specific-destination filtering).
         route_id_filter: If set, only return departures for this route_id.
         platform_filter: If set, only return departures from this platform_code.
+        lookback_seconds: Lower the departure_seconds bound by this many seconds
+            (0 = no lookback).  Lets a board also fetch trips whose *scheduled*
+            departure is in the recent past but which a realtime delay has
+            pushed into the future.  The service-date anchor is unchanged, so
+            the 00:00–03:00 cutover is still resolved against ``now``.
 
     Returns:
         List of DepartureRow, sorted by departure time, length <= limit.
     """
     service_date, now_seconds = service_day_for_time(now)
+    lower_bound = now_seconds - lookback_seconds
 
     rows_a = _query_branch(
-        db_path, stop_id, service_date, now_seconds, limit,
+        db_path, stop_id, service_date, lower_bound, limit,
         route_id_filter=route_id_filter, platform_filter=platform_filter,
     )
 
     # Second branch for post-midnight: query yesterday, offset now_seconds
     yesterday = date.fromordinal(service_date.toordinal() - 1)
     rows_b = _query_branch(
-        db_path, stop_id, yesterday, now_seconds + 86400, limit,
+        db_path, stop_id, yesterday, lower_bound + 86400, limit,
         route_id_filter=route_id_filter, platform_filter=platform_filter,
     )
 

@@ -51,12 +51,42 @@ class ActivePeriod:
 
 
 @dataclass(slots=True, frozen=True)
+class SelectorRecord:
+    """One ``informed_entity`` selector, with its populated fields preserved.
+
+    GTFS-RT semantics: the populated fields WITHIN one selector are ANDed;
+    separate selectors on an alert are ORed.  ``None`` means "not scoped by this
+    field" (the field was absent), so ``direction_id`` / ``route_type_id`` use
+    key presence — a value of ``0`` is a real scope, not "unset".
+    """
+
+    agency_id: str | None = None
+    route_type_id: int | None = None
+    route_id: str | None = None
+    direction_id: int | None = None
+    stop_id: str | None = None
+    trip_id: str | None = None
+    trip_start_date: str | None = None
+    trip_start_time: str | None = None
+
+    def is_unscoped(self) -> bool:
+        """True when no matchable field is populated (matches everything)."""
+        return not (
+            self.route_type_id is not None
+            or self.route_id is not None
+            or self.direction_id is not None
+            or self.stop_id is not None
+            or self.trip_id is not None
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ServiceAlert:
-    """A service alert with its full informed_entity selector sets (T9).
+    """A service alert with its full informed_entity selector list (T9).
 
     Unlike :class:`~custom_components.transport_victoria.models.Alert`, this
-    preserves the *trip* and *direction* selectors (not just route/stop) so a
-    board can match an alert against a specific pin's trips.  Matching is by
+    preserves the *per-selector* structure (AND-within / OR-across), the trip
+    and direction selectors, and the agency/route_type scope.  Matching is by
     selector only — ``cause`` is informational and MUST NOT be used for
     matching (the ``_CAUSE_MAP`` numbering is fixed separately in T13).
     """
@@ -67,10 +97,11 @@ class ServiceAlert:
     cause: str
     effect: str
     active_periods: tuple[ActivePeriod, ...]
-    route_ids: tuple[str, ...]
-    stop_ids: tuple[str, ...]
-    trip_ids: tuple[str, ...]
-    direction_ids: tuple[int, ...]
+    selectors: tuple[SelectorRecord, ...]
+    # The realtime mode whose feed this alert came from (implicit agency scope
+    # in the single-feed-per-mode model).  Set by the fetch helper; None when
+    # parsed standalone.
+    feed_mode: str | None = None
 
 
 def is_alert_active(alert: ServiceAlert, now: datetime) -> bool:
@@ -91,15 +122,17 @@ def is_alert_active(alert: ServiceAlert, now: datetime) -> bool:
     return False
 
 
-def parse_service_alerts(feed: object) -> list[ServiceAlert]:
+def parse_service_alerts(feed: object, feed_mode: str | None = None) -> list[ServiceAlert]:
     """Parse a service-alerts FeedMessage into selector-rich ServiceAlert rows.
 
-    Returns *all* alerts with their full informed_entity selectors and active
-    periods, WITHOUT any now-based filtering — callers apply
+    Returns *all* alerts with their per-``informed_entity`` :class:`SelectorRecord`
+    list and active periods, WITHOUT any now-based filtering — callers apply
     :func:`is_alert_active` with their own clock so matching is testable.
 
     Args:
         feed: A decoded ``gtfs_realtime_pb2.FeedMessage`` instance.
+        feed_mode: The realtime mode this feed belongs to (implicit agency
+            scope), or None when unknown.
 
     Returns:
         List of :class:`ServiceAlert` (empty on a malformed/empty feed).
@@ -137,16 +170,7 @@ def parse_service_alerts(feed: object) -> list[ServiceAlert]:
             for p in raw.active_period  # type: ignore[attr-defined]
         )
 
-        route_ids = tuple(ie.route_id for ie in raw.informed_entity if ie.route_id)
-        stop_ids = tuple(ie.stop_id for ie in raw.informed_entity if ie.stop_id)
-        trip_ids = tuple(
-            ie.trip.trip_id for ie in raw.informed_entity if ie.trip.trip_id
-        )
-        direction_ids = tuple(
-            ie.trip.direction_id
-            for ie in raw.informed_entity
-            if ie.trip.trip_id and ie.trip.direction_id
-        )
+        selectors = tuple(_selector(ie) for ie in raw.informed_entity)
 
         alerts.append(
             ServiceAlert(
@@ -156,14 +180,58 @@ def parse_service_alerts(feed: object) -> list[ServiceAlert]:
                 cause=_CAUSE_MAP.get(raw.cause, "UNKNOWN_CAUSE"),
                 effect=_EFFECT_MAP.get(raw.effect, "UNKNOWN_EFFECT"),
                 active_periods=periods,
-                route_ids=route_ids,
-                stop_ids=stop_ids,
-                trip_ids=trip_ids,
-                direction_ids=direction_ids,
+                selectors=selectors,
+                feed_mode=feed_mode,
             )
         )
 
     return alerts
+
+
+def _selector(ie: object) -> SelectorRecord:
+    """Build one :class:`SelectorRecord` from an informed_entity message."""
+    trip = ie.trip if _has_msg(ie, "trip") else None
+    return SelectorRecord(
+        agency_id=_string_field(ie, "agency_id"),
+        route_type_id=(int(ie.route_type) if _has_int(ie, "route_type") else None),
+        route_id=_string_field(ie, "route_id"),
+        direction_id=(
+            int(trip.direction_id)
+            if trip is not None and _has_int(trip, "direction_id")
+            else None
+        ),
+        stop_id=_string_field(ie, "stop_id"),
+        trip_id=(_string_field(trip, "trip_id") if trip is not None else None),
+        trip_start_date=(
+            _string_field(trip, "start_date") if trip is not None else None
+        ),
+        trip_start_time=(
+            _string_field(trip, "start_time") if trip is not None else None
+        ),
+    )
+
+
+def _has_msg(obj: object, name: str) -> bool:
+    has = getattr(obj, "HasField", None)
+    if has is None:
+        return False
+    try:
+        return bool(has(name))
+    except (ValueError, TypeError):
+        return False
+
+
+def _has_int(obj: object, name: str) -> bool:
+    """Key presence for a scalar protobuf field (``0`` counts as set)."""
+    return _has_msg(obj, name)
+
+
+def _string_field(obj: object, name: str) -> str | None:
+    try:
+        value = getattr(obj, name)
+    except AttributeError:
+        return None
+    return value or None
 
 
 def parse_alerts(
