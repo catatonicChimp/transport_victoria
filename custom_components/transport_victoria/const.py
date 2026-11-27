@@ -244,6 +244,12 @@ CONF_PROXIMITY_RADIUS_M = "proximity_radius_m"
 
 DEFAULT_MAX_VEHICLES = 5
 
+# Fleet tracking (T16): boolean option on watch/board entries that enables the
+# dynamic, route-scoped vehicle-fleet device_trackers.  Default off so existing
+# entries gain no surprise entities; the legacy ``ENTRY_TYPE_VEHICLE_TRACKER``
+# entry type (a separate single-trip tracker) is deprecated and orphaned.
+CONF_TRACK_VEHICLES = "track_vehicles"
+
 # -------------------------------------------------------------------
 # Trip-group board (T8)
 #

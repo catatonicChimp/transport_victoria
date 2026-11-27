@@ -202,6 +202,56 @@ def vehicle_position() -> rt.FeedMessage:
     return feed
 
 
+def vehicle_positions_fleet() -> rt.FeedMessage:
+    """Four vehicles for the fleet tracker (T16).
+
+    * ``V_A`` / ``V_B`` are on the watched route ``R_METRO_FRANKSTON`` (the feed
+      descriptor carries ``route_id``), so they match directly.
+    * ``V_C`` is on ``R_METRO_WERRIBEE`` (not watched) and is dropped.
+    * ``V_D`` is a "stale" trip: the descriptor carries NO ``route_id``, so the
+      resolver must fall back to the GTFS trips-table lookup (``T_FRK_OUT_3``
+      maps to ``R_METRO_FRANKSTON``) and match.
+    """
+    feed = _feed()
+
+    def _add(
+        entity_id: str,
+        trip_id: str,
+        route_id: str,
+        vehicle_id: str,
+        label: str,
+        lat: float,
+        lon: float,
+        status: int,
+    ) -> rt.VehiclePosition:
+        entity = feed.entity.add()
+        entity.id = entity_id
+        veh = entity.vehicle
+        veh.trip.trip_id = trip_id
+        if route_id:
+            veh.trip.route_id = route_id
+        veh.trip.direction_id = 0
+        veh.position.latitude = lat
+        veh.position.longitude = lon
+        veh.position.bearing = 90.0
+        veh.position.speed = 11.1
+        veh.vehicle.id = vehicle_id
+        veh.vehicle.label = label
+        veh.current_status = status
+        veh.timestamp = BASE_TIMESTAMP
+        return veh
+
+    _add("vp-fleet-1", "T_FRK_OUT_1", ROUTE_FRANKSTON, "V_A", "A",
+         -37.85, 145.02, rt.VehiclePosition.IN_TRANSIT_TO)
+    _add("vp-fleet-2", "T_FRK_OUT_2", ROUTE_FRANKSTON, "V_B", "B",
+         -37.83, 145.01, rt.VehiclePosition.STOPPED_AT)
+    _add("vp-fleet-3", "T_WRB_OUT_1", "R_METRO_WERRIBEE", "V_C", "C",
+         -37.84, 144.90, rt.VehiclePosition.IN_TRANSIT_TO)
+    _add("vp-fleet-4", "T_FRK_OUT_3", "", "V_D", "D",
+         -37.86, 145.03, rt.VehiclePosition.IN_TRANSIT_TO)
+    return feed
+
+
 def header_tick_0() -> rt.FeedMessage:
     """Empty feed at the base header timestamp."""
     return _feed(timestamp=BASE_TIMESTAMP)

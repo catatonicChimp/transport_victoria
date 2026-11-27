@@ -25,7 +25,7 @@ Prediction semantics (T9):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 _LOGGER = logging.getLogger(__name__)
@@ -86,6 +86,8 @@ class TripUpdateIndex:
     by_stop_id: dict[tuple[str, str], tuple[TripStopUpdate, ...]]
     trip_cancelled: dict[str, bool]
     trip_skipped_count: dict[str, int]
+    # ``trip_id`` → ``route_id`` from each trip descriptor (T16 fleet fallback).
+    trip_routes: dict[str, str] = field(default_factory=dict)
 
 
 def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
@@ -101,6 +103,7 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
     by_stop_id: dict[tuple[str, str], tuple[TripStopUpdate, ...]] = {}
     trip_cancelled: dict[str, bool] = {}
     trip_skipped_count: dict[str, int] = {}
+    trip_routes: dict[str, str] = {}
 
     try:
         entities = feed.entity  # type: ignore[attr-defined]
@@ -109,7 +112,7 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
             "parse_trip_updates_index received unexpected feed type: %s",
             type(feed),
         )
-        return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count)
+        return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count, trip_routes)
 
     for entity in entities:
         if not entity.HasField("trip_update"):
@@ -120,6 +123,10 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
 
         if not trip_id:
             continue
+
+        route_id = _string_field(trip_update.trip, "route_id")
+        if route_id:
+            trip_routes[trip_id] = route_id
 
         is_cancelled = trip_update.trip.schedule_relationship == _SR_CANCELED
         if is_cancelled:
@@ -162,7 +169,7 @@ def parse_trip_updates_index(feed: object) -> TripUpdateIndex:
         "Parsed %d sequence + %d stop-id trip updates",
         len(by_sequence), len(by_stop_id),
     )
-    return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count)
+    return TripUpdateIndex(by_sequence, by_stop_id, trip_cancelled, trip_skipped_count, trip_routes)
 
 
 def _prediction(stu: object) -> tuple[int | None, datetime | None]:

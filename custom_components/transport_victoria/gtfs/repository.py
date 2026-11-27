@@ -983,6 +983,30 @@ def _line_sort_key(c: LineCandidate) -> tuple:
     )
 
 
+def route_ids_for_trips(db_path: Path, trip_ids: list[str]) -> dict[str, str]:
+    """Return ``trip_id`` → ``route_id`` for the given trips (T16 fleet lookup).
+
+    Used by the vehicle-fleet tracker to resolve a vehicle's route when the
+    realtime feed omits the trip descriptor's ``route_id``.  Runs against the
+    current generation (like every other query here); unknown trips are simply
+    absent from the result.  Callers wrap this in an executor.
+    """
+    if not trip_ids:
+        return {}
+    placeholders = ", ".join("?" * len(trip_ids))
+    sql = f"SELECT trip_id, route_id FROM trips WHERE trip_id IN ({placeholders})"
+    result: dict[str, str] = {}
+    conn = sqlite3.connect(str(_resolve(db_path)))
+    try:
+        for trip_id, route_id in conn.execute(sql, list(trip_ids)):
+            result[trip_id] = route_id
+    except sqlite3.Error as exc:
+        _LOGGER.error("route_ids_for_trips failed: %s", exc)
+    finally:
+        conn.close()
+    return result
+
+
 def load_trip_shapes(
     db_path: Path,
     *,

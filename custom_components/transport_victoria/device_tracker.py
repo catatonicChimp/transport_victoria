@@ -1,21 +1,32 @@
-"""Transport Victoria vehicle tracker — device_tracker entities for live vehicle positions.
+"""Transport Victoria vehicle tracking — device_tracker entities.
 
-Two tracker types are supported:
+Two tracker surfaces are supported:
 
-1. **VehicleTrackerCoordinator / PTVVehicleTracker** (ENTRY_TYPE_VEHICLE_TRACKER)
-   Linked to a parent departure-watch entry.  Follows the single vehicle
-   serving that watch's next departure.
+1. **Fleet tracking (T16)** — :class:`FleetTrackerCoordinator` /
+   :class:`PTVFleetVehicleTracker`.  Attached to a *watch* or *board* entry
+   (opt-in via ``CONF_TRACK_VEHICLES``): tracks the **active fleet** on the
+   entry's watched routes.  One entity per vehicle (keyed by the feed's
+   ``vehicle.id``), added when a vehicle first appears on a watched route and
+   removed once it has been absent for ``GRACE_ABSENT_SECONDS``.  This replaces
+   the v0.1.0 single-trip tracker, which latched onto one trip's vehicle.
 
-2. **RouteVehicleCoordinator / PTVRouteVehicleTracker** (ENTRY_TYPE_ROUTE_TRACKER)
-   Standalone — tracks all active vehicles on a route, with optional proximity
-   filtering to a reference stop.  Creates N fixed device_tracker slots (like
-   departure sensor slots): slots without a vehicle show as "Away".
+2. **Route tracker** — :class:`RouteVehicleCoordinator` /
+   :class:`PTVRouteVehicleTracker`.  Standalone — tracks all active vehicles on
+   one route, with optional proximity filtering, into N fixed device_tracker
+   slots (like departure sensor slots).
+
+The legacy ``VehicleTrackerCoordinator`` (a separate ``ENTRY_TYPE_VEHICLE_TRACKER``
+entry that followed the single vehicle serving the next departure) has been
+REMOVED.  Its entities are orphaned on reload; see the T16 report / release
+notes.  The fleet path (and the route tracker) fetch through the shared
+:class:`~.realtime.client.PTVRealtimeClient`, whose per-feed rate limiter is the
+single enforcement point — the old double-throttle ``AsyncRateLimiter(24/60 s)``
+is gone from this module.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from datetime import timedelta
 from typing import Any
 
@@ -33,42 +44,63 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 
+from .board import PinData
+from .board_aggregation import route_type_to_mode
 from .const import (
     CONF_API_KEY,
+    CONF_ENTRY_TYPE,
     CONF_MAX_VEHICLES,
     CONF_MODE,
-    CONF_PARENT_ENTRY_ID,
     CONF_PROXIMITY_RADIUS_M,
     CONF_REFERENCE_STOP_ID,
     CONF_REFERENCE_STOP_LAT,
     CONF_REFERENCE_STOP_LON,
     CONF_ROUTE_COLOR,
     CONF_ROUTE_ID,
+    CONF_ROUTE_ID_FILTER,
     CONF_ROUTE_LONG_NAME,
     CONF_ROUTE_SHORT_NAME,
-    CONF_WATCH_NAME,
+    CONF_TRACK_VEHICLES,
     COORDINATOR_STAGGER_SECONDS,
     DEFAULT_MAX_VEHICLES,
     DEFAULT_POLL_INTERVAL_SECONDS,
     DOMAIN,
+    ENTRY_TYPE_BOARD,
     ENTRY_TYPE_ROUTE_TRACKER,
     ENTRY_TYPE_VEHICLE_TRACKER,
+    ENTRY_TYPE_WATCH,
     FEED_VEHICLE_POSITIONS,
     MODE_MDI_ICON,
     MODE_PICTOGRAM,
+    MODE_TRAM,
     PICTOGRAM_URL_BASE,
 )
-from .coordinator import PTVDataUpdateCoordinator
+from .gtfs.repository import route_ids_for_trips
 from .realtime.client import PTVRealtimeClient
-from .realtime.vehicle_positions import VehiclePosition, parse_vehicle_positions
-from .rate_limiter import AsyncRateLimiter
+from .realtime.vehicle_positions import (
+    VehiclePosition,
+    parse_vehicle_positions,
+    parse_vehicle_positions_by_vehicle,
+)
+from .vehicle_fleet import (
+    FleetVehicle,
+    FleetUpdate,
+    MAX_VEHICLES_PER_ENTRY,
+    feed_is_stale,
+    update_fleet,
+    vehicle_state,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
+# Bounded size of the trip_id → route_id lookup cache (see FleetTrackerCoordinator).
+_ROUTE_CACHE_MAX = 2000
+
 
 # ---------------------------------------------------------------------------
-# Platform setup — dispatches to the right setup based on entry type
+# Platform setup — dispatches on entry type
 # ---------------------------------------------------------------------------
 
 
@@ -77,202 +109,364 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up vehicle tracker entities for this config entry."""
-    entry_type = entry.data.get("entry_type", ENTRY_TYPE_VEHICLE_TRACKER)
+    """Set up device_tracker entities for this config entry."""
+    entry_type = entry.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH)
 
     if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
-        coordinator: RouteVehicleCoordinator = entry.runtime_data
-        known_trip_ids: set[str] = set()
+        _setup_route_tracker(entry, async_add_entities)
+        return
 
-        @callback  # type: ignore[untyped-decorator]
-        def _async_add_new_vehicles() -> None:
-            """Create entities for any trip_ids not yet seen."""
-            vehicles: list[VehiclePosition] = coordinator.data or []
-            new_entities: list[PTVRouteVehicleTracker] = []
-            for pos in vehicles:
-                if pos.trip_id and pos.trip_id not in known_trip_ids:
-                    known_trip_ids.add(pos.trip_id)
-                    new_entities.append(
-                        PTVRouteVehicleTracker(coordinator, entry, pos.trip_id)
-                    )
-            if new_entities:
-                async_add_entities(new_entities)
+    if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
+        # Legacy single-trip tracker entry — deprecated and orphaned (T16).
+        _LOGGER.warning(
+            "Legacy vehicle tracker entry '%s' is deprecated: its single-trip "
+            "tracker has been replaced by dynamic fleet tracking. Enable "
+            "'%s' on the watch/board entry instead, then remove this entry.",
+            entry.title,
+            CONF_TRACK_VEHICLES,
+        )
+        return
 
-        entry.async_on_unload(coordinator.async_add_listener(_async_add_new_vehicles))
-        _async_add_new_vehicles()
-    else:
-        watch_coordinator: VehicleTrackerCoordinator = entry.runtime_data
-        async_add_entities([PTVVehicleTracker(watch_coordinator, entry)])
+    # Watch / board → dynamic fleet tracking (opt-in).
+    if not entry.options.get(CONF_TRACK_VEHICLES, False):
+        return
+
+    coordinator = FleetTrackerCoordinator(hass, entry, _db_path_for(hass))
+    await coordinator.async_config_entry_first_refresh()
+
+    # Stash the coordinator where the rest of the entry's runtime can find it.
+    hass.data[DOMAIN].setdefault(entry.entry_id, {})["fleet_coordinator"] = coordinator
+
+    entities: dict[str, PTVFleetVehicleTracker] = {}
+
+    @callback  # type: ignore[untyped-decorator]
+    def _on_fleet_update() -> None:
+        update = coordinator.last_fleet_update
+        if update is None:
+            return
+        to_add = [
+            PTVFleetVehicleTracker(coordinator, entry, vehicle_id)
+            for vehicle_id in update.added
+            if vehicle_id not in entities
+        ]
+        for entity in to_add:
+            entities[entity.vehicle_id] = entity
+        if to_add:
+            async_add_entities(to_add)
+        for vehicle_id in update.removed:
+            entity = entities.pop(vehicle_id, None)
+            if entity is not None:
+                entity.async_remove()  # removes from the entity registry too
+
+    entry.async_on_unload(coordinator.async_add_listener(_on_fleet_update))
+    _on_fleet_update()
+
+
+def _db_path_for(hass: HomeAssistant):
+    """Return the shared GTFS DB path stored by ``__init__`` at setup."""
+    return hass.data[DOMAIN]["db_path"]
 
 
 # ---------------------------------------------------------------------------
-# Stop-linked tracker (existing, unchanged behaviour)
+# Fleet tracker (T16)
 # ---------------------------------------------------------------------------
 
 
-class VehicleTrackerCoordinator(DataUpdateCoordinator[VehiclePosition | None]):  # type: ignore[misc]
-    """Coordinator that follows the vehicle serving the next departure.
+class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  # type: ignore[misc]
+    """Coordinator tracking the active fleet on an entry's watched routes.
 
-    Reads the parent PTVDataUpdateCoordinator's data to find the current
-    trip_id, then fetches the matching vehicle position from the realtime
-    vehicle-positions feed.
+    One fetch per ``(mode, vehicle-positions)`` per TTL through the shared
+    client cache (same as T9); the client's per-feed rate limiter is the single
+    enforcement point (no separate ``AsyncRateLimiter``).  Parsing and the
+    SQLite trip→route lookup run in the executor.
+
+    Route matching precedence (see :func:`~.vehicle_fleet.resolve_vehicle_route`):
+    feed ``route_id`` → GTFS trips table → trip-updates descriptor.  This
+    coordinator fetches only vehicle-positions; the trips-table lookup (the
+    imported schedule contains every current trip) covers the fallback, so the
+    trip-updates third precedence is left to callers that already parse that
+    feed (it is exercised by the pure-module tests).
     """
 
     def __init__(
         self,
         hass: HomeAssistant,
         entry: ConfigEntry,
-        parent_coordinator: PTVDataUpdateCoordinator,
-        entry_index: int,
+        db_path,
     ) -> None:
         self._entry = entry
-        self._parent = parent_coordinator
+        self._db_path = db_path
         self._client: PTVRealtimeClient | None = None
+        # Trip id → route id lookup cache (bounded; see _route_lookup).
+        self._route_cache: dict[str, str] = {}
+        # Reconcile state — survives across polls so grace/caps are coherent.
+        self._tracked: dict[str, FleetVehicle] = {}
+        self._last_update: FleetUpdate | None = None
+        self._stale_logged: set[str] = set()
+        # Watched scope, derived once from the entry (see _fleet_scope).
+        self._watched_routes, self._modes = _fleet_scope(entry)
+        # Executor offload (injectable for tests).
+        self._run_sync = hass.async_add_executor_job
 
-        # Stagger slightly behind the parent watch (+15 s) so we benefit from
-        # the parent's fresh trip_id before fetching positions.
-        stagger = entry_index * COORDINATOR_STAGGER_SECONDS + 15
-        poll_interval = timedelta(seconds=DEFAULT_POLL_INTERVAL_SECONDS + stagger)
-
+        poll_interval = timedelta(seconds=DEFAULT_POLL_INTERVAL_SECONDS)
         super().__init__(
             hass,
             _LOGGER,
-            name=f"PTV Vehicle {entry.data.get(CONF_WATCH_NAME, entry.entry_id)}",
+            name=f"PTV fleet {entry.title}",
             update_interval=poll_interval,
         )
 
+    @property
+    def last_fleet_update(self) -> FleetUpdate | None:
+        """The most recent reconcile (added/removed vehicle ids + fleet)."""
+        return self._last_update
+
+    @property
+    def watched_routes(self) -> frozenset[str]:
+        return self._watched_routes
+
+    @property
+    def modes(self) -> frozenset[str]:
+        return self._modes
+
     async def _async_setup(self) -> None:
-        """Initialise the realtime client and shared rate limiter."""
-        self.hass.data[DOMAIN].setdefault(
-            "rate_limiter",
-            AsyncRateLimiter(capacity=24.0, refill_rate=0.4),
-        )
-        # Get the API key from the parent entry
-        parent_entry_id = self._entry.data.get(CONF_PARENT_ENTRY_ID, "")
-        parent_entry = self.hass.config_entries.async_get_entry(parent_entry_id)
-        if parent_entry is None:
-            raise UpdateFailed("Parent watch entry not found")
-        api_key: str = parent_entry.data.get(CONF_API_KEY, "")
+        """Initialise the realtime client (once HA's session is available)."""
+        api_key = self._entry.data.get(CONF_API_KEY, "")
         session = async_get_clientsession(self.hass)
         self._client = PTVRealtimeClient(api_key, session)
 
-    async def _async_update_data(self) -> VehiclePosition | None:
-        """Fetch the current position of the vehicle serving the next departure."""
-        parent_data = self._parent.data
-        if parent_data is None or not parent_data.departures:
-            return None
-
-        trip_id = parent_data.departures[0].trip_id
-        if not trip_id:
-            return None
+    async def _async_update_data(self) -> dict[str, FleetVehicle]:
+        """Fetch vehicle positions and reconcile the fleet (executor-offloaded)."""
+        if not self._watched_routes or not self._modes:
+            # No route scope (e.g. an unfiltered watch) or tram-only → no fleet.
+            return dict(self._tracked)
 
         client = self._client
         if client is None:
-            raise UpdateFailed("Vehicle tracker client not initialised")
+            raise UpdateFailed("Fleet tracker client not initialised")
 
-        # Determine mode from the parent entry
-        parent_entry_id = self._entry.data.get(CONF_PARENT_ENTRY_ID, "")
-        parent_entry = self.hass.config_entries.async_get_entry(parent_entry_id)
-        mode: str = parent_entry.data.get(CONF_MODE, "metro") if parent_entry else "metro"
+        now = dt_util.utcnow()
+        positions: list[VehiclePosition] = []
+        failed = False
+        for mode in self._modes:
+            try:
+                feed, meta = await client.fetch_feed_with_meta(
+                    mode, FEED_VEHICLE_POSITIONS
+                )
+            except aiohttp.ClientResponseError as exc:
+                if exc.status == 401:
+                    raise ConfigEntryAuthFailed("PTV API key rejected (401)") from exc
+                _LOGGER.warning(
+                    "Vehicle positions fetch failed for %s (%s) — keeping last fleet",
+                    mode, exc.status,
+                )
+                failed = True
+                continue
+            except aiohttp.ClientError as exc:
+                _LOGGER.warning(
+                    "Vehicle positions network error for %s: %s — keeping last fleet",
+                    mode, exc,
+                )
+                failed = True
+                continue
 
-        rate_limiter: AsyncRateLimiter = self.hass.data[DOMAIN]["rate_limiter"]
+            # Staleness (T13 header classification): log once, keep tracking.
+            if feed_is_stale(meta.header_timestamp, meta.fetched_at, now):
+                if mode not in self._stale_logged:
+                    self._stale_logged.add(mode)
+                    _LOGGER.warning(
+                        "Vehicle positions feed for %s is stale — trackers keep "
+                        "their last known state", mode,
+                    )
 
-        try:
-            await rate_limiter.acquire()
-            feed = await client.fetch_feed(mode, FEED_VEHICLE_POSITIONS)
-            positions = parse_vehicle_positions(feed)
-            pos = positions.get(trip_id)
-            if pos is None:
-                _LOGGER.debug("No vehicle position found for trip_id=%s", trip_id)
-            return pos
-        except aiohttp.ClientResponseError as exc:
-            if exc.status == 401:
-                raise ConfigEntryAuthFailed("PTV API key rejected (401)") from exc
-            raise UpdateFailed(f"Vehicle positions fetch failed: {exc.status}") from exc
-        except aiohttp.ClientError as exc:
-            raise UpdateFailed(f"Vehicle positions network error: {exc}") from exc
+            parsed = await self._run_sync(parse_vehicle_positions_by_vehicle, feed)
+            positions.extend(parsed.values())
+
+        if failed:
+            # A failed fetch means we cannot trust absence — keep last state
+            # (no reconcile, no grace-driven removal).  Entities stay available.
+            return dict(self._tracked)
+
+        route_by_trip_id = await self._route_lookup(positions)
+
+        update = update_fleet(
+            self._tracked,
+            positions,
+            self._watched_routes,
+            route_by_trip_id,
+            {},  # trip-updates route fallback not fetched here (see docstring)
+            now,
+        )
+        self._tracked = update.vehicles
+        self._last_update = update
+        return update.vehicles
+
+    async def _route_lookup(self, positions: list[VehiclePosition]) -> dict[str, str]:
+        """Return (and cache) trip_id → route_id for positions lacking a feed route.
+
+        Only trips whose feed entry carries no ``route_id`` need the schedule
+        lookup; the cache is bounded (oldest entries evicted first).
+        """
+        missing = [
+            p.trip_id
+            for p in positions
+            if p.trip_id and not p.route_id and p.trip_id not in self._route_cache
+        ]
+        if missing:
+            found = await self._run_sync(route_ids_for_trips, self._db_path, missing)
+            self._route_cache.update(found)
+            overflow = len(self._route_cache) - _ROUTE_CACHE_MAX
+            if overflow > 0:
+                for key in list(self._route_cache)[:overflow]:
+                    self._route_cache.pop(key, None)
+        return self._route_cache
 
 
-class PTVVehicleTracker(
-    CoordinatorEntity[VehicleTrackerCoordinator],  # type: ignore[misc]
+class PTVFleetVehicleTracker(
+    CoordinatorEntity[FleetTrackerCoordinator],  # type: ignore[misc]
     TrackerEntity,  # type: ignore[misc]
 ):
-    """A device_tracker entity showing the real-time position of a PTV vehicle."""
+    """A device_tracker entity for one active vehicle on a watched route.
 
-    _attr_has_entity_name = True
+    Keyed by the feed's ``vehicle.id`` (stable within a feed).  The entity is
+    added when the vehicle first appears on a watched route and removed by the
+    platform once it has been absent for the grace window.  ``has_entity_name``
+    is False so the name is the full entity name (no device prefix), and the
+    name is derived from the stable ``vehicle_id`` suffix so it never renames.
+    """
+
+    _attr_has_entity_name = False
     _attr_source_type = SourceType.GPS
-    _attr_icon = "mdi:train"
 
     def __init__(
         self,
-        coordinator: VehicleTrackerCoordinator,
+        coordinator: FleetTrackerCoordinator,
         entry: ConfigEntry,
+        vehicle_id: str,
     ) -> None:
         super().__init__(coordinator)
         self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_vehicle"
-        self._attr_name = "Vehicle"
-        mode = entry.data.get(CONF_MODE, "")
-        picto = MODE_PICTOGRAM.get(mode)
-        self._attr_entity_picture = f"{PICTOGRAM_URL_BASE}/{picto}.png" if picto else None
+        self.vehicle_id = vehicle_id
+        self._attr_unique_id = f"{entry.entry_id}:vehiclefleet:{vehicle_id}"
+        self._attr_icon = _fleet_icon(entry)
 
     @property
-    def device_info(self) -> DeviceInfo:
-        """Group under a device named after the tracker config entry."""
-        watch_name = self._entry.data.get(CONF_WATCH_NAME, self._entry.entry_id)
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._entry.entry_id)},
-            name=f"{watch_name} Vehicle",
-            manufacturer="Transport Victoria",
-        )
+    def name(self) -> str:
+        """A stable name from the vehicle id suffix (never renames)."""
+        suffix = self.vehicle_id[-4:] if len(self.vehicle_id) >= 4 else self.vehicle_id
+        return f"Vehicle {suffix}"
+
+    def _vehicle(self) -> FleetVehicle | None:
+        data = self.coordinator.data
+        return data.get(self.vehicle_id) if data else None
 
     @property
     def latitude(self) -> float | None:
-        pos = self.coordinator.data
-        return pos.latitude if pos else None
+        vehicle = self._vehicle()
+        return vehicle.latitude if vehicle else None
 
     @property
     def longitude(self) -> float | None:
-        pos = self.coordinator.data
-        return pos.longitude if pos else None
+        vehicle = self._vehicle()
+        return vehicle.longitude if vehicle else None
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        pos = self.coordinator.data
-        if pos is None:
-            return {}
-        return {
-            "trip_id": pos.trip_id,
-            "bearing": pos.bearing,
-            "speed_kmh": pos.speed_kmh,
-            "vehicle_id": pos.vehicle_id,
-            "vehicle_label": pos.vehicle_label,
-            "current_stop_id": pos.current_stop_id,
-            "current_status": pos.current_status,
-            "last_updated": (
-                pos.timestamp.isoformat() if pos.timestamp else None
-            ),
-        }
+    def state(self) -> str:
+        """Moving/stationary (from feed status); fall back to ``not_home`` (GPS)."""
+        vehicle = self._vehicle()
+        if vehicle is not None:
+            motion = vehicle_state(vehicle.current_status)
+            if motion is not None:
+                return motion
+        return "not_home"
 
     @property
     def available(self) -> bool:
-        """Available once we have successfully fetched at least once."""
+        """Available once we have a successful fetch (a stale feed still counts)."""
         return bool(self.coordinator.last_update_success)
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        vehicle = self._vehicle()
+        if vehicle is None:
+            return {}
+        return {
+            "route": vehicle.route_id,
+            "trip_id": vehicle.trip_id,
+            "direction_id": vehicle.direction_id,
+            "bearing": vehicle.bearing,
+            "speed_kmh": vehicle.speed_kmh,
+            "vehicle_id": vehicle.vehicle_id,
+            "vehicle_label": vehicle.vehicle_label,
+            "current_status": vehicle.current_status,
+            "motion": vehicle_state(vehicle.current_status),
+            "occupancy": vehicle.occupancy_status,
+            "last_seen": vehicle.last_seen.isoformat() if vehicle.last_seen else None,
+        }
+
+
+def _fleet_scope(entry: ConfigEntry) -> tuple[frozenset[str], frozenset[str]]:
+    """Derive ``(watched_routes, modes)`` for fleet tracking from the entry.
+
+    * A board watches the union of its enabled pins' ``route_id`` and fetches the
+      union of their realtime modes (tram, which has no vehicle-positions feed,
+      is skipped silently).
+    * A watch watches its ``route_id_filter`` (a watch without a route filter has
+      no single route scope → no fleet) and fetches its one mode.
+    """
+    entry_type = entry.data.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH)
+
+    if entry_type == ENTRY_TYPE_BOARD:
+        pins = [PinData.from_dict(sub.data) for sub in entry.subentries.values()]
+        routes = {pin.route_id for pin in pins if pin.include and pin.route_id}
+        modes: set[str] = set()
+        for pin in pins:
+            if not pin.include:
+                continue
+            mode = route_type_to_mode(pin.route_type)
+            if mode and mode != MODE_TRAM:
+                modes.add(mode)
+        return frozenset(routes), frozenset(modes)
+
+    mode = entry.data.get(CONF_MODE, "")
+    route_filter = entry.data.get(CONF_ROUTE_ID_FILTER)
+    if not route_filter:
+        return frozenset(), frozenset()
+    modes = frozenset() if mode == MODE_TRAM else frozenset({mode})
+    return frozenset({route_filter}), modes
+
+
+def _fleet_icon(entry: ConfigEntry) -> str:
+    """Pick an MDI icon: the watch's mode, else a generic bus icon."""
+    mode = entry.data.get(CONF_MODE, "")
+    return MODE_MDI_ICON.get(mode, "mdi:bus")
+
 
 # ---------------------------------------------------------------------------
-# Route-based tracker (new)
+# Route-based tracker (retained)
 # ---------------------------------------------------------------------------
 
 
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Return the great-circle distance in metres between two WGS84 points."""
-    R = 6_371_000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+def _setup_route_tracker(entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    """Wire the route tracker's dynamic trip_id slots (unchanged behaviour)."""
+    coordinator: RouteVehicleCoordinator = entry.runtime_data
+    known_trip_ids: set[str] = set()
+
+    @callback  # type: ignore[untyped-decorator]
+    def _async_add_new_vehicles() -> None:
+        vehicles: list[VehiclePosition] = coordinator.data or []
+        new_entities: list[PTVRouteVehicleTracker] = []
+        for pos in vehicles:
+            if pos.trip_id and pos.trip_id not in known_trip_ids:
+                known_trip_ids.add(pos.trip_id)
+                new_entities.append(
+                    PTVRouteVehicleTracker(coordinator, entry, pos.trip_id)
+                )
+        if new_entities:
+            async_add_entities(new_entities)
+
+    entry.async_on_unload(coordinator.async_add_listener(_async_add_new_vehicles))
+    _async_add_new_vehicles()
 
 
 class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # type: ignore[misc]
@@ -281,7 +475,7 @@ class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # 
     Fetches the vehicle-positions feed for the mode, filters by route_id,
     applies optional proximity sorting/filtering, and returns up to
     max_vehicles positions ordered by distance (if proximity filter active)
-    or vehicle_label.
+    or vehicle_label.  Rate limiting is the shared client's per-feed limiter.
     """
 
     def __init__(
@@ -305,11 +499,7 @@ class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # 
         )
 
     async def _async_setup(self) -> None:
-        """Initialise the realtime client and shared rate limiter."""
-        self.hass.data[DOMAIN].setdefault(
-            "rate_limiter",
-            AsyncRateLimiter(capacity=24.0, refill_rate=0.4),
-        )
+        """Initialise the realtime client (no separate rate limiter — see T13)."""
         api_key: str = self._entry.data.get(CONF_API_KEY, "")
         session = async_get_clientsession(self.hass)
         self._client = PTVRealtimeClient(api_key, session)
@@ -334,10 +524,7 @@ class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # 
         ref_lon: float | None = self._entry.data.get(CONF_REFERENCE_STOP_LON)
         radius_m: float = float(self._entry.data.get(CONF_PROXIMITY_RADIUS_M, 2000.0))
 
-        rate_limiter: AsyncRateLimiter = self.hass.data[DOMAIN]["rate_limiter"]
-
         try:
-            await rate_limiter.acquire()
             feed = await client.fetch_feed(mode, FEED_VEHICLE_POSITIONS)
         except aiohttp.ClientResponseError as exc:
             if exc.status == 401:
@@ -493,3 +680,15 @@ class PTVRouteVehicleTracker(
             )
 
         return base
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return the great-circle distance in metres between two WGS84 points."""
+    import math
+
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))

@@ -21,7 +21,6 @@ from .const import (
     CONF_DEPARTURE_COUNT,
     CONF_ENTRY_TYPE,
     CONF_MODE,
-    CONF_PARENT_ENTRY_ID,
     DEFAULT_DEPARTURE_COUNT,
     DOMAIN,
     ENTRY_TYPE_BOARD,
@@ -37,7 +36,7 @@ from .const import (
 from .board import PinData, board_bundles, validate_pin
 from .board_coordinator import BoardCoordinator
 from .coordinator import PTVDataUpdateCoordinator
-from .device_tracker import RouteVehicleCoordinator, VehicleTrackerCoordinator
+from .device_tracker import RouteVehicleCoordinator
 from .gtfs.downloader import (
     check_for_remote_changes,
     download_zip,
@@ -57,12 +56,15 @@ _LOGGER = logging.getLogger(__name__)
 # Config-flow-only integration (YAML has no keys); required because we implement async_setup.
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-# Platforms registered for departure watch entries
-_WATCH_PLATFORMS: list[str] = ["sensor", "binary_sensor"]
+# Platforms registered for departure watch entries.  ``device_tracker`` is
+# included for the opt-in T16 fleet tracking (the platform no-ops unless
+# ``CONF_TRACK_VEHICLES`` is set).
+_WATCH_PLATFORMS: list[str] = ["sensor", "binary_sensor", "device_tracker"]
 
 # Platforms registered for trip-group board entries (T10 adds the direction
-# select; sensor + binary_sensor carry the ranked departures + disruption).
-_BOARD_PLATFORMS: list[str] = ["sensor", "binary_sensor", "select"]
+# select; sensor + binary_sensor carry the ranked departures + disruption;
+# device_tracker carries the opt-in T16 fleet).
+_BOARD_PLATFORMS: list[str] = ["sensor", "binary_sensor", "select", "device_tracker"]
 
 # Platforms registered for vehicle tracker entries
 _TRACKER_PLATFORMS: list[str] = ["device_tracker"]
@@ -668,10 +670,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
 
+    # Expose the shared GTFS DB path so the device_tracker fleet platform can
+    # reach the trips table without a circular import.
+    hass.data[DOMAIN].setdefault("db_path", _db_path(hass))
+
     entry_type = entry.data.get(CONF_ENTRY_TYPE, "watch")
 
     if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
-        return await _async_setup_vehicle_tracker(hass, entry)
+        return await _async_setup_legacy_vehicle_tracker(hass, entry)
 
     if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
         return await _async_setup_route_tracker(hass, entry)
@@ -817,38 +823,22 @@ async def _async_setup_route_tracker(hass: HomeAssistant, entry: ConfigEntry) ->
     return True
 
 
-async def _async_setup_vehicle_tracker(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a vehicle tracker config entry."""
-    parent_entry_id: str = entry.data.get(CONF_PARENT_ENTRY_ID, "")
-    parent_entry = hass.config_entries.async_get_entry(parent_entry_id)
-    if parent_entry is None:
-        _LOGGER.error(
-            "Vehicle tracker %s: parent watch entry %s not found",
-            entry.entry_id,
-            parent_entry_id,
-        )
-        return False
+async def _async_setup_legacy_vehicle_tracker(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a deprecated legacy single-trip vehicle tracker entry.
 
-    parent_coordinator: PTVDataUpdateCoordinator = parent_entry.runtime_data
-
-    all_entries = hass.config_entries.async_entries(DOMAIN)
-    entry_index = next(
-        (i for i, e in enumerate(all_entries) if e.entry_id == entry.entry_id),
-        0,
+    The v0.1.0 single-trip tracker has been replaced by dynamic fleet tracking
+    (opt-in via ``CONF_TRACK_VEHICLES`` on the parent watch/board).  This entry
+    type is retained only so the entry loads cleanly; its entities are orphaned
+    (they vanish on reload).  The device_tracker platform logs the deprecation
+    and creates no entities for this entry type.
+    """
+    _LOGGER.warning(
+        "Legacy vehicle tracker entry '%s' is deprecated: its single-trip "
+        "tracker has been replaced by dynamic fleet tracking. Remove this "
+        "entry and enable 'track_vehicles' on the watch/board instead.",
+        entry.title,
     )
-
-    coordinator = VehicleTrackerCoordinator(
-        hass,
-        entry,
-        parent_coordinator=parent_coordinator,
-        entry_index=entry_index,
-    )
-
-    await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = coordinator
-
     hass.data[DOMAIN][entry.entry_id] = {}
-
     await hass.config_entries.async_forward_entry_setups(entry, _TRACKER_PLATFORMS)
     return True
 
