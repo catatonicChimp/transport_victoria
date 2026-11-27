@@ -8,6 +8,12 @@ since the last import. Change detection uses a two-stage approach:
 2. SHA-256 digest: after download, compare against the stored SHA-256.
    If identical, skip the import step.
 
+The download URL is resolved dynamically at refresh time (CKAN
+``package_show``) because the portal re-publishes the GTFS Schedule dataset
+under a new resource UUID every so often — a hardcoded resource URL eventually
+404s on every fresh install. If resolution fails we fall back to the last
+known-good direct URL in ``const.GTFS_SCHEDULE_URL``.
+
 The download is async (uses aiohttp via the HA session). All file I/O
 (mkdir, write, rename) runs in executor threads to keep the event loop free.
 """
@@ -18,14 +24,123 @@ import hashlib
 import logging
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.core import HomeAssistant
 
+from ..const import (
+    GTFS_SCHEDULE_CKAN_URL,
+    GTFS_SCHEDULE_DATASET_ID,
+    GTFS_SCHEDULE_URL,
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 # Chunk size for streaming the ZIP download
-_CHUNK_SIZE = 1024 * 1024  # 1 MB
+_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
+# Emit an INFO progress line every N bytes while streaming the ZIP.
+_PROGRESS_LOG_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+# CKAN metadata lookups are small JSON responses; keep the timeout tight.
+_CKAN_TIMEOUT_SECONDS = 10
+
+
+def _sanitize_url(url: str) -> str:
+    """Return ``url`` without query/fragment for logging.
+
+    The schedule URL needs no auth today, but stripping the query string keeps
+    debug logs safe if a future resource URL ever carries a signed token.
+    """
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+async def resolve_gtfs_schedule_url(
+    hass: HomeAssistant,
+    fallback: str | None = None,
+) -> str:
+    """Return the current GTFS Schedule ZIP download URL.
+
+    Queries the portal's CKAN ``package_show`` endpoint for the
+    ``gtfs-schedule`` dataset and picks its ZIP resource. The portal
+    re-publishes the dataset periodically with a new resource UUID, so
+    resolving at refresh time is what keeps fresh installs working.
+
+    Any failure (network, timeout, malformed JSON, no ZIP resource) is
+    non-fatal: the last known-good URL is returned instead.
+
+    Args:
+        hass: HomeAssistant instance for the shared aiohttp session.
+        fallback: URL to use if resolution fails (defaults to
+            ``const.GTFS_SCHEDULE_URL``).
+
+    Returns:
+        The resource URL to download, or the fallback.
+    """
+    fallback_url = fallback or GTFS_SCHEDULE_URL
+    session = async_get_clientsession(hass)
+
+    try:
+        async with session.get(
+            GTFS_SCHEDULE_CKAN_URL,
+            params={"id": GTFS_SCHEDULE_DATASET_ID},
+            timeout=_CKAN_TIMEOUT_SECONDS,
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json(content_type=None)
+
+        result = payload.get("result") if isinstance(payload, dict) else None
+        resources = result.get("resources") if isinstance(result, dict) else None
+        if not isinstance(resources, list):
+            raise ValueError("package_show response has no resources list")
+
+        zip_resources: list[tuple[dict, str]] = []
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+            url = str(resource.get("url") or "")
+            if not url:
+                continue
+            fmt = str(resource.get("format") or "").strip().upper()
+            lowered = url.lower()
+            if fmt == "ZIP" or lowered.endswith(".zip") or "/download/" in lowered:
+                zip_resources.append((resource, url))
+
+        # Prefer an explicitly-typed ZIP resource over a URL heuristic.
+        for resource, url in zip_resources:
+            if str(resource.get("format") or "").strip().upper() == "ZIP":
+                _LOGGER.debug(
+                    "GTFS schedule resource resolved: id=%s url=%s",
+                    resource.get("id"),
+                    _sanitize_url(url),
+                )
+                return url
+
+        if zip_resources:
+            resource, url = zip_resources[0]
+            _LOGGER.debug(
+                "GTFS schedule resource resolved by URL: id=%s url=%s",
+                resource.get("id"),
+                _sanitize_url(url),
+            )
+            return url
+
+        _LOGGER.debug(
+            "GTFS schedule package has no ZIP resource — using fallback %s",
+            _sanitize_url(fallback_url),
+        )
+        return fallback_url
+
+    except Exception as exc:  # noqa: BLE001 - any lookup failure is non-fatal
+        _LOGGER.debug(
+            "GTFS schedule URL lookup failed (%s: %s) — using fallback %s",
+            type(exc).__name__,
+            exc,
+            _sanitize_url(fallback_url),
+        )
+        return fallback_url
 
 
 async def check_for_remote_changes(
@@ -137,16 +252,12 @@ async def download_zip(
         # Stream HTTP response into memory, computing SHA-256 as we go
         chunks: list[bytes] = []
         total_bytes = 0
-        log_threshold = 10 * 1024 * 1024  # log every 10 MB
-        next_log_at = log_threshold
-        etag: str | None = None
-        content_length: str | None = None
+        next_log_at = _PROGRESS_LOG_BYTES
 
         async with session.get(url, timeout=600) as response:
             response.raise_for_status()
             etag = response.headers.get("ETag")
             content_length = response.headers.get("Content-Length")
-            total_expected_mb = int(content_length) / 1_048_576 if content_length else None
 
             async for chunk in response.content.iter_chunked(_CHUNK_SIZE):
                 chunks.append(chunk)
@@ -154,18 +265,11 @@ async def download_zip(
                 total_bytes += len(chunk)
 
                 if total_bytes >= next_log_at:
-                    if total_expected_mb:
-                        _LOGGER.info(
-                            "GTFS download: %.0f / %.0f MB (%.0f%%)",
-                            total_bytes / 1_048_576,
-                            total_expected_mb,
-                            100 * total_bytes / int(content_length),
-                        )
-                    else:
-                        _LOGGER.info(
-                            "GTFS download: %.0f MB so far", total_bytes / 1_048_576
-                        )
-                    next_log_at += log_threshold
+                    _LOGGER.info(
+                        "GTFS schedule download: %d MiB received",
+                        total_bytes // 1_048_576,
+                    )
+                    next_log_at += _PROGRESS_LOG_BYTES
 
         sha256_hex = hasher.hexdigest()
         _LOGGER.info(

@@ -32,6 +32,7 @@ from custom_components.transport_victoria.const import (
     CONF_MODE,
     CONF_STOP_ID,
     DOMAIN,
+    GTFS_SCHEDULE_URL,
     GTFS_SCHEMA_VERSION,
 )
 from custom_components.transport_victoria.gtfs import store
@@ -175,6 +176,15 @@ def _watch_entry(entry_id: str, mode: str):
 # Downloader / HEAD fakes
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _resolve_offline(monkeypatch):
+    """Never hit the CKAN endpoint from unit tests — use the fallback URL."""
+    async def _resolve(hass, fallback=None):
+        return GTFS_SCHEDULE_URL
+
+    monkeypatch.setattr(tv, "resolve_gtfs_schedule_url", _resolve)
+
+
 async def _always_changed(hass, url, stored_etag, stored_size) -> bool:
     return True
 
@@ -257,6 +267,69 @@ class TestRefresh:
         await tv.async_trigger_gtfs_refresh(hass, ["2"])
         # Blocking import must have run via the executor, never on the loop.
         assert "_run_import" in hass.executor_jobs
+
+    async def test_refresh_uses_ckan_resolved_url(self, tmp_path, db_path, monkeypatch):
+        """Both the HEAD check and the download must use the resolved URL.
+
+        The hardcoded constant is only a fallback — the portal moves resources.
+        """
+        live_url = "https://example.invalid/live/gtfs.zip"
+        seen: dict[str, str] = {}
+
+        async def resolve(hass, fallback=None):
+            return live_url
+
+        async def head(hass, url, stored_etag, stored_size):
+            seen["head"] = url
+            return True
+
+        downloader = _make_downloader(_make_zip_bytes(30))
+
+        async def download(hass, url, dest_path, *, skip_if_exists=False):
+            seen["download"] = url
+            return await downloader(
+                hass, url, dest_path, skip_if_exists=skip_if_exists
+            )
+
+        monkeypatch.setattr(tv, "resolve_gtfs_schedule_url", resolve)
+        monkeypatch.setattr(tv, "check_for_remote_changes", head)
+        monkeypatch.setattr(tv, "download_zip", download)
+
+        hass = FakeHass(tmp_path)
+        ok = await tv.async_trigger_gtfs_refresh(hass, ["2"])
+
+        assert ok is True
+        assert seen == {"head": live_url, "download": live_url}
+
+    async def test_refresh_retries_pinned_url_when_resolved_url_fails(
+        self, tmp_path, db_path, monkeypatch
+    ):
+        """Stale CKAN metadata pointing at a dead resource must not break setup."""
+        live_url = "https://example.invalid/stale/gtfs.zip"
+        seen: list[str] = []
+
+        async def resolve(hass, fallback=None):
+            return live_url
+
+        good_download = _make_downloader(_make_zip_bytes(30))
+
+        async def download(hass, url, dest_path, *, skip_if_exists=False):
+            seen.append(url)
+            if url == live_url:
+                raise RuntimeError("HTTP 404")
+            return await good_download(
+                hass, url, dest_path, skip_if_exists=skip_if_exists
+            )
+
+        monkeypatch.setattr(tv, "resolve_gtfs_schedule_url", resolve)
+        monkeypatch.setattr(tv, "check_for_remote_changes", _always_changed)
+        monkeypatch.setattr(tv, "download_zip", download)
+
+        hass = FakeHass(tmp_path)
+        ok = await tv.async_trigger_gtfs_refresh(hass, ["2"])
+
+        assert ok is True
+        assert seen == [live_url, GTFS_SCHEDULE_URL]
 
     async def test_healthy_unchanged_is_noop(self, tmp_path, db_path, monkeypatch):
         monkeypatch.setattr(tv, "check_for_remote_changes", _always_changed)

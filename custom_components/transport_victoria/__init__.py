@@ -38,7 +38,11 @@ from .board import PinData, board_bundles, validate_pin
 from .board_coordinator import BoardCoordinator
 from .coordinator import PTVDataUpdateCoordinator
 from .device_tracker import RouteVehicleCoordinator, VehicleTrackerCoordinator
-from .gtfs.downloader import check_for_remote_changes, download_zip
+from .gtfs.downloader import (
+    check_for_remote_changes,
+    download_zip,
+    resolve_gtfs_schedule_url,
+)
 from .gtfs.horizon import refresh_due
 from .gtfs.importer import (
     get_imported_bundles,
@@ -281,10 +285,17 @@ async def _refresh_impl(
     stored_etag = stored_meta.get("zip_etag")
     stored_size = stored_meta.get("zip_size")
 
+    # Default to the last known-good URL; refresh it from CKAN below unless the
+    # caller already has the ZIP and no HEAD check is needed.
+    schedule_url = GTFS_SCHEDULE_URL
     remote_changed = True
     if not skip_download_if_exists:
+        # The portal re-publishes the dataset with a new resource UUID, so a
+        # hardcoded URL eventually 404s. Resolution never raises — it falls
+        # back to GTFS_SCHEDULE_URL.
+        schedule_url = await resolve_gtfs_schedule_url(hass)
         remote_changed = await check_for_remote_changes(
-            hass, GTFS_SCHEDULE_URL, stored_etag, stored_size
+            hass, schedule_url, stored_etag, stored_size
         )
 
     # Healthy DB + unchanged upstream → genuinely up to date.
@@ -295,16 +306,30 @@ async def _refresh_impl(
     # Reuse the cached ZIP when we only need a local rebuild of unchanged data
     # (e.g. an aged 45-day window); otherwise fetch fresh bytes.
     reuse_cached = skip_download_if_exists or (must_rebuild and not remote_changed)
-    try:
-        _, sha256, etag, content_length = await download_zip(
-            hass,
-            GTFS_SCHEDULE_URL,
-            zip_path,
-            skip_if_exists=reuse_cached,
-        )
-    except Exception as exc:
-        _LOGGER.error("Failed to download GTFS schedule: %s", exc)
-        return False
+    # Try the CKAN-resolved URL first; if that fetch fails (stale metadata can
+    # point at a deleted resource), retry once against the pinned fallback.
+    download_urls = [schedule_url]
+    if schedule_url != GTFS_SCHEDULE_URL:
+        download_urls.append(GTFS_SCHEDULE_URL)
+    for attempt, download_url in enumerate(download_urls, start=1):
+        try:
+            _, sha256, etag, content_length = await download_zip(
+                hass,
+                download_url,
+                zip_path,
+                skip_if_exists=reuse_cached,
+            )
+            break
+        except Exception as exc:
+            if attempt < len(download_urls):
+                _LOGGER.warning(
+                    "Download from the resolved GTFS URL failed (%s) — retrying "
+                    "the pinned fallback URL",
+                    exc,
+                )
+                continue
+            _LOGGER.error("Failed to download GTFS schedule: %s", exc)
+            return False
 
     # Healthy DB + identical content → up to date (HEAD may have been
     # inconclusive, e.g. missing ETag).

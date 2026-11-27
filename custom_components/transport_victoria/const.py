@@ -8,11 +8,27 @@ DOMAIN = "transport_victoria"
 # PTV Open Data API
 # -------------------------------------------------------------------
 
+# Fallback direct-download URL for the GTFS Schedule ZIP.
+#
+# The portal re-publishes this dataset periodically and each publication gets a
+# NEW resource UUID — the old URL then 404s. Never treat this constant as
+# permanent: ``gtfs.downloader.resolve_gtfs_schedule_url`` asks the CKAN API for
+# the current ZIP resource at refresh time and only falls back to this value if
+# that lookup fails. Keep it pointed at the newest known-good resource so a
+# resolution failure still has a chance of working.
 GTFS_SCHEDULE_URL = (
     "https://opendata.transport.vic.gov.au/dataset/"
     "3f4e292e-7f8a-4ffe-831f-1953be0fe448/resource/"
-    "fb152201-859f-4882-9206-b768060b50ad/download/gtfs.zip"
+    "8af7737c-5c9e-4022-aa98-911aa04370a7/download/gtfs.zip"
 )
+
+# CKAN action API used to discover the current resource URL dynamically.
+# ``package_show`` accepts either the dataset slug or its UUID; the slug is
+# stable across re-publications.
+GTFS_SCHEDULE_CKAN_URL = (
+    "https://opendata.transport.vic.gov.au/api/3/action/package_show"
+)
+GTFS_SCHEDULE_DATASET_ID = "gtfs-schedule"
 
 REALTIME_BASE_URL = (
     "https://api.opendata.transport.vic.gov.au"

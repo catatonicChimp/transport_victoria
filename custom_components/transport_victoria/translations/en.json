@@ -16,6 +16,20 @@
         "title": "Preparing Timetable Data",
         "description": "Finishing up the timetable database. This screen will advance automatically."
       },
+      "schedule_failed": {
+        "title": "Timetable Download Failed",
+        "description": "Transport Victoria's timetable data could not be downloaded or imported. This is usually a temporary problem with the open data portal.\n\nCheck your internet connection, then retry.",
+        "menu_options": {
+          "retry_download": "Retry download",
+          "abort_setup": "Cancel setup"
+        }
+      },
+      "retry_download": {
+        "title": "Retry download"
+      },
+      "abort_setup": {
+        "title": "Cancel setup"
+      },
       "mode": {
         "title": "Select Transport Mode",
         "description": "Choose the type of service you want to track.",
@@ -161,7 +175,8 @@
       "no_routes_found": "No routes found for this transport mode. Make sure the timetable data has been imported.",
       "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker.",
       "no_pins": "This board has no pins yet.",
-      "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported — they stay as-is."
+      "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported — they stay as-is.",
+      "schedule_unavailable": "The timetable data could not be downloaded. Check your internet connection and try again."
     }
   },
   "config_subentries": {
