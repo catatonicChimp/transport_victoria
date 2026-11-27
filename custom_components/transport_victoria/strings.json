@@ -251,5 +251,13 @@
         }
       }
     }
+  },
+  "entity": {
+    "board_direction": {
+      "state": {
+        "configured": "Configured directions",
+        "opposite": "Opposite directions"
+      }
+    }
   }
 }

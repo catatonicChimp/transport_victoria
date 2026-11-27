@@ -115,6 +115,75 @@
           "watch_name": "Tracker name",
           "max_vehicles": "Number of vehicle slots"
         }
+      },
+      "board_name": {
+        "title": "Name This Board",
+        "description": "A board groups several lines at one stop into a single departure board. You'll add lines (combinations) after creating it.",
+        "data": {
+          "board_name": "Name"
+        }
+      },
+      "import": {
+        "title": "Import Watches as a Board",
+        "description": "Select one or more of your existing watches to copy into a new trip-group board. Your existing watches are **never** changed or removed — this only creates a new board.",
+        "data": {
+          "watch_ids": "Watches to import",
+          "board_name": "New board name"
+        }
+      },
+      "import_summary": {
+        "title": "Confirm Board Import",
+        "description": "The new board **{board_name}** will be created with one line per selected watch.\n\n**Imported**\n{imported}\n\n**Skipped (stays as-is)**\n{skipped}\n\n**Needs attention (stale references)**\n{stale}\n\nYour existing watches are not modified. Roll back by deleting the new board.",
+        "data": {
+          "confirm": "Create the board"
+        }
+      },
+      "origin": {
+        "title": "Boarding Stop",
+        "description": "Find the stop this pin departs from.",
+        "data": {
+          "query": "Search stops",
+          "stop_id": "Select stop"
+        }
+      },
+      "to": {
+        "title": "Destination",
+        "description": "Where do you want to go from **{stop_name}**?",
+        "data": {
+          "destination_choice": "Destination",
+          "dest_query": "Search destination stops",
+          "destination_stop_id": "Select destination"
+        }
+      },
+      "select_lines": {
+        "title": "Select Line",
+        "description": "Which line/direction serves **{stop_name}** to **{destination}**?",
+        "data": {
+          "route_id_select": "Select line",
+          "line_select": "Select line"
+        }
+      },
+      "options": {
+        "title": "Pin Options",
+        "description": "Adjust the labels and options for this pin.",
+        "data": {
+          "label_from": "Origin label",
+          "label_to": "Destination label",
+          "include": "Include this pin",
+          "platform_filter": "Platform filter (optional)",
+          "colour_override": "Colour override (optional)"
+        }
+      },
+      "reconfigure": {
+        "title": "Edit Pin",
+        "description": "Edit this pin's labels and options.",
+        "data": {
+          "label_from": "Origin label",
+          "label_to": "Destination label",
+          "include": "Include this pin",
+          "platform_filter": "Platform filter (optional)",
+          "colour_override": "Colour override (optional)"
+        }
       }
     },
     "error": {
@@ -130,12 +199,16 @@
       "no_direct_service": "No direct service found between these two stops. Try a different destination or use All destinations.",
       "destination_unreachable": "No service runs from your origin stop to this destination. Pick All destinations or another destination.",
       "invalid_route": "Route not found. Please select a route from the list.",
-      "unknown": "An unexpected error occurred."
+      "select_at_least_one": "Select at least one watch to import.",
+      "unknown": "An unexpected error occurred.",
+      "required": "This field is required."
     },
     "abort": {
       "already_configured": "This watch is already configured.",
       "no_routes_found": "No routes found for this transport mode. Make sure the timetable data has been imported.",
-      "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker."
+      "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker.",
+      "no_pins": "This board has no pins yet.",
+      "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported — they stay as-is."
     }
   },
   "options": {
@@ -160,6 +233,21 @@
           "realtime_enabled": "Enable real-time data",
           "show_run_numbers": "Show run numbers",
           "show_vehicle_type": "Show vehicle type"
+        }
+      },
+      "board_reorder": {
+        "title": "Reorder Pins",
+        "description": "Move a pin up or down in the board.",
+        "data": {
+          "pin_select": "Pin",
+          "reorder_action": "Action"
+        }
+      },
+      "board_remove": {
+        "title": "Remove a Pin",
+        "description": "Remove a pin from this board.",
+        "data": {
+          "pin_select": "Pin"
         }
       }
     }
