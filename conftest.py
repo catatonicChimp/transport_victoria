@@ -59,13 +59,22 @@ _HA_MODULES = [
     "homeassistant.util.loop",
     "aiohttp",
     "voluptuous",
-    "google",
-    "google.transit",
-    "google.transit.gtfs_realtime_pb2",
 ]
 
 for _mod_name in _HA_MODULES:
     _stub_module(_mod_name)
+
+# google.transit.gtfs_realtime_pb2 is a real TEST dependency
+# (gtfs-realtime-bindings, see requirements_test.txt). Protobuf fixtures are
+# committed as serialized bytes and decoded through the production client, so
+# the real classes must win over the sentinel stubs. Only fall back to stubs if
+# the dependency is absent (keeping the legacy, dependency-free unit tests
+# importable).
+try:
+    from google.transit import gtfs_realtime_pb2 as _gtfs_rt_pb2  # noqa: F401
+except ImportError:
+    for _mod_name in ("google", "google.transit", "google.transit.gtfs_realtime_pb2"):
+        _stub_module(_mod_name)
 
 # Set concrete names that our code uses in isinstance / raise / inherit contexts
 
