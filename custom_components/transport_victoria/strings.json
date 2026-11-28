@@ -294,12 +294,7 @@
       },
       "source_menu": {
         "title": "Transport Victoria Source",
-        "description": "Manage the data source.",
-        "menu_options": [
-          "source_reconfigure",
-          "source_refresh",
-          "source_remove"
-        ]
+        "description": "Manage the data source."
       },
       "source_reconfigure": {
         "title": "Reconfigure Credential",
