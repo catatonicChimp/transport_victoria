@@ -176,6 +176,21 @@ ROUTE_TYPE_MAP: dict[str, list[int]] = {
     MODE_VLINE: [ROUTE_TYPE_VLINE_RAIL, ROUTE_TYPE_VLINE_COACH], # 2, 204
 }
 
+# Concise singular labels per GTFS route_type, used in stop-search result
+# labels so a user can tell at a glance what kind of transport serves a stop
+# (e.g. "Coburg Station (Metro Train, 14308)").  ``1`` is the standard GTFS
+# train value (the T6 fixtures use it; PTV's own data uses HVT 400).
+ROUTE_TYPE_LABELS: dict[int, str] = {
+    ROUTE_TYPE_TRAM: "Tram",                 # 0
+    1: "Metro Train",                        # standard GTFS train
+    ROUTE_TYPE_VLINE_RAIL: "V/Line Train",   # 2
+    ROUTE_TYPE_BUS: "Bus",                   # 3
+    ROUTE_TYPE_FERRY: "Ferry",               # 102
+    ROUTE_TYPE_VLINE_COACH: "V/Line Coach",  # 204
+    ROUTE_TYPE_METRO_TRAIN: "Metro Train",   # 400
+    ROUTE_TYPE_REGIONAL_BUS: "Regional Bus", # 701
+}
+
 # -------------------------------------------------------------------
 # City Loop stop IDs
 # Used to detect when origin/destination routing needs disambiguation.

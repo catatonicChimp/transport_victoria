@@ -85,6 +85,7 @@ from .const import (
     MODE_METRO,
     MODES,
     READINESS_READY,
+    ROUTE_TYPE_LABELS,
     ROUTE_TYPE_MAP,
     SOURCE_CHOICE_REALTIME,
     SOURCE_CHOICE_SCHEDULED,
@@ -241,9 +242,23 @@ def _stops_to_selector_options(
         if show_distance and s.distance_m is not None:
             label = f"{s.stop_name}  ({s.distance_m:.0f} m)"
         else:
-            label = s.stop_name
+            label = _stop_search_label(s)
         options.append(selector.SelectOptionDict(value=s.stop_id, label=label))
     return options
+
+
+def _stop_search_label(s: StopResult) -> str:
+    """Build a stop-search result label: name + route type + stop ID.
+
+    Physical signs at tram/bus stops carry the stop ID, and a name alone is
+    ambiguous (a "station", a tram stop and a bus stop may share a name), so
+    the label surfaces both the mode (train/tram/bus/…) and the ID, e.g.
+    ``"Coburg Station (Metro Train, 14308)"``.
+    """
+    type_label = ROUTE_TYPE_LABELS.get(s.route_type) if s.route_type is not None else None
+    if type_label:
+        return f"{s.stop_name} ({type_label}, {s.stop_id})"
+    return f"{s.stop_name} ({s.stop_id})"
 
 
 def _route_display_label(r: RouteResult) -> str:
@@ -756,17 +771,29 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     async def async_step_dest(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Search for and select the destination stop.
+        """Choose a destination: All destinations, a specific stop, or a journey.
 
-        Same cross-mode searchable dropdown as the origin step.  A "journey"
-        choice branches into the multi-leg sub-flow (unchanged); picking a
-        specific stop advances to the "lines found" step.
+        A departure watch defaults to "All destinations" (no line step); a board's
+        first pin needs a specific line, so boards only offer a specific
+        destination or a journey.  A specific destination that no direct service
+        reaches falls back to All destinations (watch) rather than aborting.
+        "Journey" is always an explicit choice, never an automatic fallback.
         """
         errors: dict[str, str] = {}
         db_path = _db_path(self.hass.config.config_dir)
+        is_board = self._config.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD
 
         if user_input is not None:
-            choice = user_input.get("destination_choice", "specific")
+            choice = user_input.get(
+                "destination_choice", "specific" if is_board else "__all__"
+            )
+
+            if choice == "__all__" and not is_board:
+                self._config[CONF_ALL_DESTINATIONS] = True
+                self._config[CONF_DESTINATION_STOP_ID] = None
+                self._config[CONF_DESTINATION_STOP_NAME] = None
+                return await self.async_step_confirm(None)
+
             if choice == "journey":
                 return await self.async_step_journey(None)
 
@@ -779,6 +806,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                     s for s in self._dest_search_results if s.stop_id == dest_id
                 ]
                 dest_name = matching[0].stop_name if matching else dest_id
+                self._config[CONF_ALL_DESTINATIONS] = False
                 self._config[CONF_DESTINATION_STOP_ID] = dest_id
                 self._config[CONF_DESTINATION_STOP_NAME] = dest_name
                 return await self.async_step_lines(None)
@@ -794,19 +822,21 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 if not self._dest_search_results:
                     errors["dest_query"] = "no_stops_found"
 
+        options: list[Any] = []
+        if not is_board:
+            options.append(
+                selector.SelectOptionDict(value="__all__", label="All destinations")
+            )
+        options.extend([
+            selector.SelectOptionDict(value="specific", label="Specific destination"),
+            selector.SelectOptionDict(value="journey", label="Journey (change at stop)"),
+        ])
         schema_fields: dict[Any, Any] = {
             vol.Required(
-                "destination_choice", default="specific"
+                "destination_choice", default="specific" if is_board else "__all__"
             ): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=[
-                        selector.SelectOptionDict(
-                            value="specific", label="Specific destination"
-                        ),
-                        selector.SelectOptionDict(
-                            value="journey", label="Journey (change at stop)"
-                        ),
-                    ],
+                    options=options,
                     mode=selector.SelectSelectorMode.LIST,
                 )
             ),
@@ -839,7 +869,10 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
 
         ``get_lines_between`` returns the full set of (route_id, direction_id,
         destination_label) candidates across both directions.  A single
-        candidate auto-advances; otherwise one dropdown lists them all.
+        candidate auto-advances; otherwise one dropdown lists them all.  When NO
+        direct service reaches the chosen destination (e.g. a City Loop stop
+        that only some patterns serve), the flow falls back to All destinations
+        rather than aborting.
         """
         db_path = _db_path(self.hass.config.config_dir)
         origin_stop_id = self._config[CONF_STOP_ID]
@@ -850,7 +883,16 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 get_lines_between, db_path, origin_stop_id, destination_stop_id, None
             )
         if not self._line_choices:
-            return self.async_abort(reason="destination_unreachable")
+            if self._config.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD:
+                # A board pin is route-scoped; without a direct service there is
+                # no fallback line, so abort (translated via config.abort).
+                return self.async_abort(reason="destination_unreachable")
+            # No direct service to this destination → fall back to All
+            # destinations (a watch at the origin stop, unfiltered).
+            self._config[CONF_ALL_DESTINATIONS] = True
+            self._config[CONF_DESTINATION_STOP_ID] = None
+            self._config[CONF_DESTINATION_STOP_NAME] = None
+            return await self.async_step_confirm(None)
 
         if user_input is not None:
             chosen = user_input.get("line_select")
@@ -1035,6 +1077,9 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             final = self._config.get(CONF_JOURNEY_DESTINATION_STOP_NAME, "")
             return f"{stop_name} → {transfer} → {final}"
         dest = self._config.get(CONF_DESTINATION_STOP_NAME, "")
+        if not dest:
+            # "All destinations" — no specific destination to name.
+            return stop_name
         return f"{stop_name} → {dest}"
 
     def _direction_summary(self) -> str:
@@ -1097,9 +1142,33 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             )
 
         line = self._selected_line
+        if line is None:
+            # "All destinations": no specific line/destination selected — derive
+            # the mode from the origin stop's routes.
+            data: dict[str, Any] = {
+                CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
+                CONF_MODE: await self._derive_mode_for_stop(
+                    db_path, self._config[CONF_STOP_ID]
+                ),
+                CONF_STOP_ID: self._config[CONF_STOP_ID],
+                CONF_STOP_NAME: self._config.get(CONF_STOP_NAME, ""),
+                CONF_WATCH_NAME: name,
+                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
+                CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
+                CONF_ALL_DESTINATIONS: True,
+                CONF_DESTINATION_STOP_ID: None,
+                CONF_DESTINATION_STOP_NAME: None,
+                CONF_DIRECTION: None,
+                CONF_ROUTE_ID_FILTER: None,
+                CONF_PLATFORM_FILTER: None,
+            }
+            return self.async_create_entry(
+                title=name, data=data, options={CONF_TRACK_VEHICLES: False}
+            )
+
         data: dict[str, Any] = {
             CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
-            CONF_MODE: _mode_for_route_type(line.route_type if line else None),
+            CONF_MODE: _mode_for_route_type(line.route_type),
             CONF_STOP_ID: self._config[CONF_STOP_ID],
             CONF_STOP_NAME: self._config.get(CONF_STOP_NAME, ""),
             CONF_WATCH_NAME: name,
@@ -1110,8 +1179,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             CONF_DESTINATION_STOP_NAME: self._config.get(
                 CONF_DESTINATION_STOP_NAME, ""
             ),
-            CONF_DIRECTION: line.direction_id if line else None,
-            CONF_ROUTE_ID_FILTER: line.route_id if line else None,
+            CONF_DIRECTION: line.direction_id,
+            CONF_ROUTE_ID_FILTER: line.route_id,
             CONF_PLATFORM_FILTER: None,
         }
         return self.async_create_entry(

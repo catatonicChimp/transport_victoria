@@ -69,6 +69,7 @@ class StopResult:
     location_type: int
     parent_station: str | None
     distance_m: float | None = None  # only set by search_stops_by_distance
+    route_type: int | None = None    # GTFS route_type serving this stop (label enrichment)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +356,8 @@ def search_stops_by_name(
         SELECT MIN(s.stop_id) AS stop_id, s.stop_name,
                MIN(s.stop_lat) AS stop_lat, MIN(s.stop_lon) AS stop_lon,
                MIN(s.location_type) AS location_type,
-               MIN(s.parent_station) AS parent_station
+               MIN(s.parent_station) AS parent_station,
+               MIN(r.route_type) AS route_type
         FROM stops s
         JOIN stop_times st ON st.stop_id = s.stop_id
         JOIN trips t ON t.trip_id = st.trip_id
@@ -384,6 +386,7 @@ def search_stops_by_name(
                     stop_lon=row["stop_lon"],
                     location_type=row["location_type"],
                     parent_station=row["parent_station"],
+                    route_type=row["route_type"],
                 )
             )
         return results

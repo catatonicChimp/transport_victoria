@@ -49,6 +49,11 @@ class TestSearchStopsByName:
         assert len(results) == 1
         assert results[0].stop_name == "Coburg Station"
 
+    def test_carries_route_type(self, gtfs_db: Path):
+        """The route_type (metro train) is joined onto each result for labels."""
+        results = search_stops_by_name(gtfs_db, "Coburg", METRO_ROUTE_TYPES)
+        assert results[0].route_type == 400
+
     def test_deduplicates_same_name(self, gtfs_db: Path):
         # Two platforms with same name — should return only one result
         results = search_stops_by_name(gtfs_db, "Coburg", METRO_ROUTE_TYPES)

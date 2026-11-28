@@ -55,6 +55,14 @@
           "stop_id": "Select stop"
         }
       },
+      "origin": {
+        "title": "Search Origin Stop",
+        "description": "Search for your departure stop. Type a name and press Submit to see results.",
+        "data": {
+          "query": "Search stops",
+          "stop_id": "Select stop"
+        }
+      },
       "dest": {
         "title": "Select Destination",
         "description": "Choose where you want to go from **{stop_name}**.\n\n**All destinations** is recommended \u2014 it shows all departures regardless of direction and handles City Loop direction changes automatically.",
@@ -62,6 +70,29 @@
           "destination_choice": "Destination",
           "dest_query": "Search destination stops",
           "destination_stop_id": "Select destination"
+        }
+      },
+      "lines": {
+        "title": "Select Line",
+        "description": "Which line/direction serves **{stop_name}** to **{destination}**?",
+        "data": {
+          "line_select": "Select line"
+        }
+      },
+      "journey": {
+        "title": "Transfer Stop",
+        "description": "Choose the stop where you change services on your journey from **{stop_name}**.",
+        "data": {
+          "transfer_query": "Search transfer stops",
+          "transfer_stop_id": "Select transfer stop"
+        }
+      },
+      "journey_dest": {
+        "title": "Final Destination",
+        "description": "Choose the final destination of your journey.",
+        "data": {
+          "journey_dest_query": "Search destination stops",
+          "journey_destination_stop_id": "Select destination"
         }
       },
       "confirm": {
@@ -172,6 +203,7 @@
     },
     "abort": {
       "already_configured": "This watch is already configured.",
+      "destination_unreachable": "No service runs from your origin stop to this destination. Pick All destinations or another destination.",
       "no_routes_found": "No routes found for this transport mode. Make sure the timetable data has been imported.",
       "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker.",
       "no_pins": "This board has no pins yet.",
@@ -241,6 +273,9 @@
             "colour_override": "Colour override (optional)"
           }
         }
+      },
+      "abort": {
+        "destination_unreachable": "No service runs from your origin stop to this destination. Pick All destinations or another destination."
       }
     }
   },
