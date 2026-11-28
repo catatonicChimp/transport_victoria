@@ -117,7 +117,6 @@ from .realtime.client import PTVRealtimeClient
 from .routing.destination import (
     line_label,
 )
-from .routing.path_finder import validate_route
 from . import _get_or_create_schedule_manager, async_trigger_gtfs_refresh
 from .source import (
     all_mode_bundles,
@@ -794,7 +793,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 self._config[CONF_DESTINATION_STOP_NAME] = None
                 return await self.async_step_confirm(None)
 
-            if choice == "journey":
+            if choice == "journey" and not is_board:
                 return await self.async_step_journey(None)
 
             if (
@@ -827,10 +826,12 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             options.append(
                 selector.SelectOptionDict(value="__all__", label="All destinations")
             )
-        options.extend([
-            selector.SelectOptionDict(value="specific", label="Specific destination"),
-            selector.SelectOptionDict(value="journey", label="Journey (change at stop)"),
-        ])
+            options.append(
+                selector.SelectOptionDict(value="journey", label="Journey (change at stop)")
+            )
+        options.append(
+            selector.SelectOptionDict(value="specific", label="Specific destination")
+        )
         schema_fields: dict[Any, Any] = {
             vol.Required(
                 "destination_choice", default="specific" if is_board else "__all__"
@@ -938,24 +939,22 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         route_types = ROUTE_TYPE_MAP.get(self._config.get(CONF_MODE, "")) or ALL_ROUTE_TYPES
 
         if user_input is not None:
-            # Phase 1: transfer stop selected?
+            # Phase 1: transfer stop selected → advance to the final-destination
+            # step.  No direct-service validation here: a journey's whole point
+            # is to change services, so origin→transfer need NOT be direct.
             if CONF_TRANSFER_STOP_ID in user_input and user_input[CONF_TRANSFER_STOP_ID]:
                 transfer_id = user_input[CONF_TRANSFER_STOP_ID]
                 matching = [s for s in self._transfer_search_results if s.stop_id == transfer_id]
                 transfer_name = matching[0].stop_name if matching else transfer_id
-
-                origin_stop_id = self._config[CONF_STOP_ID]
-                route_ok = await self.hass.async_add_executor_job(
-                    validate_route, db_path, origin_stop_id, transfer_id, route_types
-                )
-                if not route_ok:
-                    errors[CONF_TRANSFER_STOP_ID] = "no_direct_service"
-                else:
-                    self._config[CONF_TRANSFER_STOP_ID] = transfer_id
-                    self._config[CONF_TRANSFER_STOP_NAME] = transfer_name
-                    return await self.async_step_journey_dest()
+                self._config[CONF_TRANSFER_STOP_ID] = transfer_id
+                self._config[CONF_TRANSFER_STOP_NAME] = transfer_name
+                return await self.async_step_journey_dest()
 
             # Search for transfer stop
+            # TODO(polish): auto-suggest interchange stops — prefer stops whose
+            # routes also serve the origin (``get_routes_for_stop(origin)``
+            # intersected with the search results), e.g. City Loop stations for
+            # an Upfield-line origin.  Manual search works today; this is a hint.
             query = user_input.get("transfer_query", "").strip()
             if len(query) < 2:
                 if query:
@@ -995,27 +994,22 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         route_types = ROUTE_TYPE_MAP.get(self._config.get(CONF_MODE, "")) or ALL_ROUTE_TYPES
 
         if user_input is not None:
-            # Final destination selected?
+            # Final destination selected → store it and confirm.  No direct
+            # service validation: a journey's legs need not be direct (and the
+            # final leg is cross-mode in general).
             if CONF_JOURNEY_DESTINATION_STOP_ID in user_input and user_input[CONF_JOURNEY_DESTINATION_STOP_ID]:
                 dest_id = user_input[CONF_JOURNEY_DESTINATION_STOP_ID]
                 matching = [s for s in self._journey_dest_search_results if s.stop_id == dest_id]
                 dest_name = matching[0].stop_name if matching else dest_id
 
-                transfer_id = self._config[CONF_TRANSFER_STOP_ID]
-                route_ok = await self.hass.async_add_executor_job(
-                    validate_route, db_path, transfer_id, dest_id, route_types
-                )
-                if not route_ok:
-                    errors[CONF_JOURNEY_DESTINATION_STOP_ID] = "no_direct_service"
-                else:
-                    self._config[CONF_JOURNEY_DESTINATION_STOP_ID] = dest_id
-                    self._config[CONF_JOURNEY_DESTINATION_STOP_NAME] = dest_name
-                    self._config[CONF_JOURNEY_MODE] = True
-                    self._config[CONF_ALL_DESTINATIONS] = False
-                    # Store min transfer minutes
-                    raw_min = user_input.get(CONF_MIN_TRANSFER_MINUTES, "5")
-                    self._config[CONF_MIN_TRANSFER_MINUTES] = int(raw_min)
-                    return await self.async_step_confirm()
+                self._config[CONF_JOURNEY_DESTINATION_STOP_ID] = dest_id
+                self._config[CONF_JOURNEY_DESTINATION_STOP_NAME] = dest_name
+                self._config[CONF_JOURNEY_MODE] = True
+                self._config[CONF_ALL_DESTINATIONS] = False
+                # Store min transfer minutes
+                raw_min = user_input.get(CONF_MIN_TRANSFER_MINUTES, "5")
+                self._config[CONF_MIN_TRANSFER_MINUTES] = int(raw_min)
+                return await self.async_step_confirm()
 
             # Search
             query = user_input.get("journey_dest_query", "").strip()
