@@ -404,6 +404,9 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             return await self.async_step_downloading()
 
         return self.async_show_form(
+            description_placeholders={
+                "portal_url": "https://opendata.transport.vic.gov.au",
+            },
             step_id="user",
             data_schema=vol.Schema({
                 vol.Required(
