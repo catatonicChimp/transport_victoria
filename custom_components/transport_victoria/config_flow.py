@@ -346,6 +346,11 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         self._config: dict[str, Any] = {}
         self._stop_search_results: list[StopResult] = []
         self._dest_search_results: list[StopResult] = []
+        # Last submitted search text, kept so the query box stays populated on
+        # the re-render that shows the results dropdown (empty box reads as a
+        # failed search).
+        self._last_query: str = ""
+        self._last_dest_query: str = ""
         self._zip_wait_task: asyncio.Task[None] | None = None
         self._db_wait_task: asyncio.Task[None] | None = None
         self._stop_method: str = "name"   # "name" | "distance" | "map"
@@ -552,6 +557,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 if query:
                     errors["query"] = "search_too_short"
             else:
+                self._last_query = query
                 self._stop_search_results = await self.hass.async_add_executor_job(
                     search_stops_by_name, db_path, query, ALL_ROUTE_TYPES, 20
                 )
@@ -559,7 +565,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                     errors["query"] = "no_stops_found"
 
         schema_fields: dict[Any, Any] = {
-            vol.Optional("query"): selector.TextSelector(
+            vol.Optional("query", default=self._last_query): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
             ),
         }
@@ -796,6 +802,10 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         errors: dict[str, str] = {}
         db_path = _db_path(self.hass.config.config_dir)
         is_board = self._config.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD
+        # Only render the direction dropdown on a re-render produced by a
+        # "Towards a direction" submission; the persisted _direction_choices
+        # alone must not leak the field onto the initial or other-choice renders.
+        show_direction = False
 
         if user_input is not None:
             choice = user_input.get(
@@ -809,6 +819,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 return await self.async_step_confirm(None)
 
             if choice == "direction" and not is_board:
+                show_direction = True
                 if "direction_select" in user_input and user_input["direction_select"]:
                     value = user_input["direction_select"]
                     matched = next(
@@ -853,6 +864,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 if query:
                     errors["dest_query"] = "search_too_short"
             else:
+                self._last_dest_query = query
                 self._dest_search_results = await self.hass.async_add_executor_job(
                     search_stops_by_name, db_path, query, ALL_ROUTE_TYPES, 20
                 )
@@ -881,7 +893,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                     mode=selector.SelectSelectorMode.LIST,
                 )
             ),
-            vol.Optional("dest_query"): selector.TextSelector(
+            vol.Optional("dest_query", default=self._last_dest_query): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
             ),
         }
@@ -889,7 +901,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             schema_fields[vol.Optional(CONF_DESTINATION_STOP_ID)] = _select_selector(
                 _stops_to_selector_options(self._dest_search_results)
             )
-        if not is_board and self._direction_choices:
+        if show_direction and self._direction_choices:
             prefix = len({d.route_id for d in self._direction_choices}) > 1
             schema_fields[
                 vol.Required(

@@ -69,7 +69,11 @@
         "data": {
           "destination_choice": "Destination",
           "dest_query": "Search destination stops",
-          "destination_stop_id": "Select destination"
+          "destination_stop_id": "Select destination",
+          "direction_select": "Direction"
+        },
+        "data_description": {
+          "direction_select": "Pick the line direction you want to track."
         }
       },
       "lines": {

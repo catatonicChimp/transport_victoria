@@ -232,6 +232,66 @@ async def test_board_default_is_not_all_destinations(metro_db: Path, monkeypatch
     assert captured.get("confirm") is not True
 
 
+# ---------------------------------------------------------------------------
+# Direction-choice visibility (DEFECT 2) + query persistence (DEFECT 3)
+# ---------------------------------------------------------------------------
+
+
+def _record_schema(monkeypatch) -> dict:
+    """Record field names + defaults as ``vol.Required``/``vol.Optional`` are
+    called (the light env stubs voluptuous, so we can't introspect the built
+    schema object)."""
+    recorded: dict = {"fields": [], "defaults": {}}
+
+    def _marker(name, *args, **kwargs):
+        recorded["fields"].append(name)
+        if "default" in kwargs:
+            recorded["defaults"][name] = kwargs["default"]
+        return object()
+
+    monkeypatch.setattr(cf.vol, "Required", _marker)
+    monkeypatch.setattr(cf.vol, "Optional", _marker)
+    return recorded
+
+
+async def test_dest_initial_render_has_no_direction_field(make_bus_flow, monkeypatch):
+    flow, _ = make_bus_flow()
+    recorded = _record_schema(monkeypatch)
+    await flow.async_step_dest(None)
+    assert "direction_select" not in recorded["fields"]
+
+
+async def test_dest_direction_choice_renders_direction_field(
+    make_bus_flow, monkeypatch
+):
+    flow, _ = make_bus_flow()
+    recorded = _record_schema(monkeypatch)
+    await flow.async_step_dest({"destination_choice": "direction"})
+    # The origin stop's direction candidates were loaded…
+    assert flow._direction_choices
+    # …and the direction_select field is rendered (its options come from
+    # _direction_choices).
+    assert "direction_select" in recorded["fields"]
+
+
+async def test_origin_query_default_persists_on_rerender(make_bus_flow, monkeypatch):
+    flow, _ = make_bus_flow()
+    recorded = _record_schema(monkeypatch)
+    await flow.async_step_origin({"query": "Sun"})
+    assert flow._stop_search_results
+    assert recorded["defaults"].get("query") == "Sun"
+
+
+async def test_dest_query_default_persists_on_rerender(make_bus_flow, monkeypatch):
+    flow, _ = make_bus_flow()
+    recorded = _record_schema(monkeypatch)
+    await flow.async_step_dest(
+        {"destination_choice": "specific", "dest_query": "Cit"}
+    )
+    assert flow._dest_search_results
+    assert recorded["defaults"].get("dest_query") == "Cit"
+
+
 def test_translations_have_destination_abort_and_steps():
     from pathlib import Path as _P
     root = _P(__file__).parents[3] / "custom_components" / "transport_victoria"
@@ -249,6 +309,14 @@ def test_translations_have_destination_abort_and_steps():
     # The abort reason resolves on both the config and subentry surfaces.
     assert "destination_unreachable" in strings["config"]["abort"]
     assert "destination_unreachable" in strings["config_subentries"]["pin"]["abort"]
+
+    # The direction dropdown has a label + description (no raw "direction_select").
+    dest_data = strings["config"]["step"]["dest"]["data"]
+    assert dest_data["direction_select"] == "Direction"
+    assert (
+        strings["config"]["step"]["dest"]["data_description"]["direction_select"]
+        == "Pick the line direction you want to track."
+    )
 
     # en.json mirrors strings.json byte-for-byte.
     assert strings == en
