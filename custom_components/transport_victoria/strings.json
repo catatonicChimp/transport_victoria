@@ -145,21 +145,6 @@
           "board_name": "Name"
         }
       },
-      "import": {
-        "title": "Import Watches as a Board",
-        "description": "Select one or more of your existing watches to copy into a new trip-group board. Your existing watches are **never** changed or removed \u2014 this only creates a new board.",
-        "data": {
-          "watch_ids": "Watches to import",
-          "board_name": "New board name"
-        }
-      },
-      "import_summary": {
-        "title": "Confirm Board Import",
-        "description": "The new board **{board_name}** will be created with one line per selected watch.\n\n**Imported**\n{imported}\n\n**Skipped (stays as-is)**\n{skipped}\n\n**Needs attention (stale references)**\n{stale}\n\nYour existing watches are not modified. Roll back by deleting the new board.",
-        "data": {
-          "confirm": "Create the board"
-        }
-      },
       "monitor_name": {
         "title": "Name your Departure Board",
         "description": "Choose a name for this board. You can add lines to it next.",
