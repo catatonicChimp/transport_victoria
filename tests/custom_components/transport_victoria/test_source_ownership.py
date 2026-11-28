@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import custom_components.transport_victoria as tv
 from custom_components.transport_victoria import config_flow as cf
 from custom_components.transport_victoria import source as src
 from custom_components.transport_victoria.const import (
@@ -155,6 +156,61 @@ class TestDependents:
         hass = _hass([hub, watch, orphan])
         deps = src.find_dependents(hass, "hub1")
         assert [d.entry_id for d in deps] == ["w1"]
+
+
+# ---------------------------------------------------------------------------
+# Defensive reconciliation: strip a stowaway credential on feature setup
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileFeatureData:
+    def test_strips_stowaway_api_key_when_already_associated(self):
+        """A feature with a copied api_key AND a correct source_entry_id still
+        gets its credential stripped (the hub owns it)."""
+        hub = _entry("hub1", _source_data("secret"))
+        watch = _entry(
+            "w1",
+            {
+                CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
+                CONF_SOURCE_ENTRY_ID: "hub1",  # already correctly associated
+                CONF_API_KEY: "secret",        # stowaway copy (defect)
+            },
+        )
+        hass = _hass([hub, watch])
+
+        result = tv._reconcile_feature_data(hass, watch, "hub1")
+
+        assert result is not None
+        assert CONF_API_KEY not in result
+        assert result[CONF_SOURCE_ENTRY_ID] == "hub1"
+
+    def test_preserves_key_when_hub_is_scheduled_only(self):
+        """A scheduled-only hub never destroys a feature's only credential."""
+        hub = _entry("hub1", _source_data(None))  # no credential
+        watch = _entry(
+            "w1",
+            {
+                CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
+                CONF_SOURCE_ENTRY_ID: "hub1",
+                CONF_API_KEY: "legacy-key",
+            },
+        )
+        hass = _hass([hub, watch])
+
+        result = tv._reconcile_feature_data(hass, watch, "hub1")
+
+        assert result is None  # unchanged — the key is preserved
+
+    def test_unchanged_when_no_key_and_associated(self):
+        """A clean, associated feature reconciles to a no-op (None)."""
+        hub = _entry("hub1", _source_data("secret"))
+        watch = _entry(
+            "w1",
+            {CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH, CONF_SOURCE_ENTRY_ID: "hub1"},
+        )
+        hass = _hass([hub, watch])
+
+        assert tv._reconcile_feature_data(hass, watch, "hub1") is None
 
 
 # ---------------------------------------------------------------------------

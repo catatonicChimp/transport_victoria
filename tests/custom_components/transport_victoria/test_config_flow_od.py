@@ -18,6 +18,7 @@ from custom_components.transport_victoria import config_flow as cf
 from custom_components.transport_victoria.board import line_value
 from custom_components.transport_victoria.const import (
     CONF_ALL_DESTINATIONS,
+    CONF_API_KEY,
     CONF_BOARD_NAME,
     CONF_DESTINATION_STOP_ID,
     CONF_DIRECTION,
@@ -91,6 +92,8 @@ async def test_full_walk_creates_watch_entry(bus_db: Path, monkeypatch):
     assert data[CONF_DIRECTION] == 0
     assert data[CONF_ROUTE_ID_FILTER] == "R_BUS_220"
     assert data[CONF_SOURCE_ENTRY_ID] == "src-1"
+    # Ownership contract: the hub owns the credential; the feature carries none.
+    assert CONF_API_KEY not in data
     # No board subentries for a watch.
     assert "subentries" not in created or not created.get("subentries")
 
@@ -111,6 +114,9 @@ async def test_full_walk_creates_board_and_pin(bus_db: Path, monkeypatch):
     assert created["title"] == "My Board"
     assert created["data"][CONF_ENTRY_TYPE] == ENTRY_TYPE_BOARD
     assert created["data"][CONF_BOARD_NAME] == "My Board"
+    # Ownership contract: the board parent carries the association, no credential.
+    assert CONF_API_KEY not in created["data"]
+    assert created["data"][CONF_SOURCE_ENTRY_ID] == "src-1"
     # Exactly one pin subentry attached in the SAME create call.
     subentries = created["subentries"]
     assert len(subentries) == 1
@@ -118,6 +124,8 @@ async def test_full_walk_creates_board_and_pin(bus_db: Path, monkeypatch):
     assert pin["subentry_type"] == SUBENTRY_TYPE_PIN
     assert pin["data"][CONF_ROUTE_ID] == "R_BUS_220"
     assert pin["unique_id"] == pin["data"]["pin_key"]
+    # Pin subentry data never carries a credential.
+    assert CONF_API_KEY not in pin["data"]
 
 
 async def test_board_confirm_screen_shows_board_name_field(bus_db: Path, monkeypatch):

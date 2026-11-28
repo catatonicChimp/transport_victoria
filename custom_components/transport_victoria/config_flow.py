@@ -973,7 +973,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 CONF_STOP_ID: self._config[CONF_STOP_ID],
                 CONF_STOP_NAME: self._config.get(CONF_STOP_NAME, ""),
                 CONF_WATCH_NAME: name,
-                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
                 CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
                 CONF_ALL_DESTINATIONS: True,
                 CONF_DESTINATION_STOP_ID: None,
@@ -992,7 +991,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             CONF_STOP_ID: self._config[CONF_STOP_ID],
             CONF_STOP_NAME: self._config.get(CONF_STOP_NAME, ""),
             CONF_WATCH_NAME: name,
-            CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
             CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
             CONF_ALL_DESTINATIONS: False,
             CONF_DESTINATION_STOP_ID: self._config.get(CONF_DESTINATION_STOP_ID),
@@ -1022,7 +1020,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             data={
                 CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
                 CONF_BOARD_NAME: board_name,
-                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
                 CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
             },
             options={
@@ -1186,7 +1183,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             data={
                 CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
                 CONF_BOARD_NAME: board_name,
-                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
                 CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
             },
             options={
@@ -1428,7 +1424,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
 
             entry_data: dict[str, Any] = {
                 CONF_ENTRY_TYPE: ENTRY_TYPE_ROUTE_TRACKER,
-                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
                 CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
                 CONF_MODE: self._config.get(CONF_MODE, ""),
                 CONF_ROUTE_ID: self._config.get(CONF_ROUTE_ID, ""),

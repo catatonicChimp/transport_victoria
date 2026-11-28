@@ -496,3 +496,36 @@ async def test_feature_setup_stamps_association_defensively(hass):
     e = hass.config_entries.async_get_entry(legacy.entry_id)
     assert e.data[CONF_SOURCE_ENTRY_ID] == hub.entry_id
     assert CONF_API_KEY not in e.data
+
+
+async def test_feature_setup_strips_stowaway_when_already_associated(hass):
+    """The live v0.3.2 defect: a feature created with BOTH a correct
+    ``source_entry_id`` AND a copied ``api_key`` is stripped at setup — the
+    association is preserved, the credential is dropped (hub owns it)."""
+    hub = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE, CONF_API_KEY: "secret-key"},
+        unique_id="transport_victoria_source",
+        title="Transport Victoria",
+    )
+    hub.add_to_hass(hass)
+
+    watch = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
+            CONF_SOURCE_ENTRY_ID: hub.entry_id,  # already correctly associated
+            CONF_API_KEY: "secret-key",          # stowaway copy (defect)
+            CONF_MODE: "metro",
+            CONF_STOP_ID: "14308",
+        },
+        unique_id="watch-unique",
+        title="Coburg",
+    )
+    watch.add_to_hass(hass)
+
+    await tv._ensure_feature_associated(hass, watch)
+
+    e = hass.config_entries.async_get_entry(watch.entry_id)
+    assert e.data[CONF_SOURCE_ENTRY_ID] == hub.entry_id  # association preserved
+    assert CONF_API_KEY not in e.data                    # credential stripped
