@@ -151,6 +151,37 @@ class TestStopSearchRanking:
 
 
 # ---------------------------------------------------------------------------
+# get_directions_for_stop (Towards-X direction choice)
+# ---------------------------------------------------------------------------
+
+
+class TestGetDirectionsForStop:
+    def test_returns_distinct_direction_combos(self, bus_db: Path):
+        from custom_components.transport_victoria.gtfs.repository import (
+            get_directions_for_stop,
+        )
+
+        directions = get_directions_for_stop(bus_db, "B_SUNSHINE", [3])
+        assert directions  # the single route serves the stop in both directions
+
+        for d in directions:
+            assert d.route_id == "R_BUS_220"
+            assert d.terminal_stop_name  # terminus label is always populated
+
+        # Distinct (direction, terminal, via) combos — no duplicate options.
+        keys = {(d.direction_id, d.terminal_stop_id, d.via_hint) for d in directions}
+        assert len(keys) == len(directions)
+
+    def test_no_routes_returns_empty(self, bus_db: Path):
+        from custom_components.transport_victoria.gtfs.repository import (
+            get_directions_for_stop,
+        )
+
+        # A route type the fixture does not serve → no candidates.
+        assert get_directions_for_stop(bus_db, "B_SUNSHINE", [400]) == []
+
+
+# ---------------------------------------------------------------------------
 # search_stops_by_distance
 # ---------------------------------------------------------------------------
 

@@ -99,6 +99,7 @@ from .gtfs.repository import (
     RouteResult,
     StopResult,
     get_all_routes,
+    get_directions_for_stop,
     get_lines_between,
     get_routes_for_stop,
     get_stop_lat_lon,
@@ -271,6 +272,23 @@ def _route_display_label(r: RouteResult) -> str:
     return short
 
 
+def _direction_label(line: LineCandidate, prefix_route: bool) -> str:
+    """Label a "Towards X" direction candidate.
+
+    "Towards {terminal}" (+ " via {via}"), prefixed with the route short name
+    when the origin serves several lines/modes — e.g. "19: Towards Stop 14
+    (Moreland)".
+    """
+    terminal = line.terminal_stop_name or line.route_short_name or line.route_id
+    if line.via_hint:
+        terminal = f"{terminal} via {line.via_hint}"
+    label = f"Towards {terminal}"
+    if prefix_route:
+        short = line.route_short_name or line.route_long_name or line.route_id
+        label = f"{short}: {label}"
+    return label
+
+
 def _mode_for_route_type(route_type: int | None) -> str:
     """Return the config mode for a GTFS ``route_type``.
 
@@ -340,6 +358,10 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         # candidate serving the origin→destination pair, and the user's pick.
         self._line_choices: list[LineCandidate] = []
         self._selected_line: LineCandidate | None = None
+        # "Towards X" direction choice (dest-less): every (route, direction, terminus)
+        # serving the origin stop, and the user's pick.
+        self._direction_choices: list[LineCandidate] = []
+        self._selected_direction: LineCandidate | None = None
         # Step to redirect to after GTFS download/import completes.  Only the
         # source hub ("create_source") and route tracker ("route_tracker_route")
         # flows trigger a download; the T18.4 watch/board flow is cross-mode and
@@ -762,12 +784,14 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     async def async_step_dest(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose a destination: All destinations or a specific stop.
+        """Choose a destination: All destinations, a specific stop, or a direction.
 
-        A departure watch defaults to "All destinations" (no line step); a board's
-        first pin needs a specific line, so boards only offer a specific
-        destination.  A specific destination that no direct service reaches falls
-        back to All destinations (watch) rather than aborting.
+        A departure watch can pick "All destinations" (no filter), a "Specific
+        destination" stop, or a "Towards X" direction (route + direction, no
+        destination stop).  A board's first pin needs a specific line, so boards
+        only offer a specific destination.  A specific destination that no direct
+        service reaches falls back to All destinations (watch) rather than
+        aborting.
         """
         errors: dict[str, str] = {}
         db_path = _db_path(self.hass.config.config_dir)
@@ -783,6 +807,32 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 self._config[CONF_DESTINATION_STOP_ID] = None
                 self._config[CONF_DESTINATION_STOP_NAME] = None
                 return await self.async_step_confirm(None)
+
+            if choice == "direction" and not is_board:
+                if "direction_select" in user_input and user_input["direction_select"]:
+                    value = user_input["direction_select"]
+                    matched = next(
+                        (d for d in self._direction_choices if line_value(d) == value),
+                        None,
+                    )
+                    if matched is None:
+                        errors["direction_select"] = "invalid_route"
+                    else:
+                        self._selected_direction = matched
+                        self._config[CONF_ALL_DESTINATIONS] = False
+                        self._config[CONF_DIRECTION] = matched.direction_id
+                        self._config[CONF_ROUTE_ID_FILTER] = matched.route_id
+                        self._config[CONF_DESTINATION_STOP_ID] = None
+                        self._config[CONF_DESTINATION_STOP_NAME] = None
+                        return await self.async_step_confirm(None)
+                # Load the origin stop's direction candidates on demand.
+                if not self._direction_choices:
+                    self._direction_choices = await self.hass.async_add_executor_job(
+                        get_directions_for_stop,
+                        db_path,
+                        self._config[CONF_STOP_ID],
+                        ALL_ROUTE_TYPES,
+                    )
 
             if (
                 CONF_DESTINATION_STOP_ID in user_input
@@ -814,6 +864,11 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             options.append(
                 selector.SelectOptionDict(value="__all__", label="All destinations")
             )
+            options.append(
+                selector.SelectOptionDict(
+                    value="direction", label="Towards a direction"
+                )
+            )
         options.append(
             selector.SelectOptionDict(value="specific", label="Specific destination")
         )
@@ -834,6 +889,18 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             schema_fields[vol.Optional(CONF_DESTINATION_STOP_ID)] = _select_selector(
                 _stops_to_selector_options(self._dest_search_results)
             )
+        if not is_board and self._direction_choices:
+            prefix = len({d.route_id for d in self._direction_choices}) > 1
+            schema_fields[
+                vol.Required(
+                    "direction_select", default=line_value(self._direction_choices[0])
+                )
+            ] = _select_selector([
+                selector.SelectOptionDict(
+                    value=line_value(d), label=_direction_label(d, prefix)
+                )
+                for d in self._direction_choices
+            ])
 
         return self.async_show_form(
             step_id="dest",
@@ -923,6 +990,17 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             origin = self._config.get(CONF_STOP_NAME, "")
             dest = self._config.get(CONF_DESTINATION_STOP_NAME, "")
             return f"Route {route_title} from {origin} to {dest}"
+        direction = self._selected_direction
+        if direction is not None:
+            stop_name = self._config.get(CONF_STOP_NAME, "")
+            label = (
+                direction.terminal_stop_name
+                or direction.route_short_name
+                or direction.route_id
+            )
+            if direction.via_hint:
+                label = f"{label} via {direction.via_hint}"
+            return f"{stop_name} towards {label}"
         stop_name = self._config.get(CONF_STOP_NAME, "")
         dest = self._config.get(CONF_DESTINATION_STOP_NAME, "")
         if not dest:
@@ -931,16 +1009,26 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return f"{stop_name} → {dest}"
 
     def _direction_summary(self) -> str:
-        """Human direction summary derived from the selected line."""
+        """Human direction summary derived from the selected line / direction."""
         line = self._selected_line
-        if line is None:
-            return ""
-        if line.direction_id in (0, 1):
-            direction = "Outbound" if line.direction_id == 1 else "Inbound"
-        else:
-            direction = ""
-        label = line.terminal_stop_name or line.route_short_name or line.route_id
-        return f"{direction} → {label}".strip() if direction else label
+        if line is not None:
+            if line.direction_id in (0, 1):
+                direction = "Outbound" if line.direction_id == 1 else "Inbound"
+            else:
+                direction = ""
+            label = line.terminal_stop_name or line.route_short_name or line.route_id
+            return f"{direction} → {label}".strip() if direction else label
+        direction = self._selected_direction
+        if direction is not None:
+            label = (
+                direction.terminal_stop_name
+                or direction.route_short_name
+                or direction.route_id
+            )
+            if direction.via_hint:
+                label = f"{label} via {direction.via_hint}"
+            return f"Towards {label}"
+        return ""
 
     async def _derive_mode_for_stop(self, db_path: Path, stop_id: str) -> str:
         """Derive a config mode for an all-destinations watch from its routes."""
@@ -962,7 +1050,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         db_path = _db_path(self.hass.config.config_dir)
 
         line = self._selected_line
-        if line is None:
+        direction = self._selected_direction
+        if line is None and direction is None:
             # "All destinations": no specific line/destination selected — derive
             # the mode from the origin stop's routes.
             data: dict[str, Any] = {
@@ -979,6 +1068,26 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 CONF_DESTINATION_STOP_NAME: None,
                 CONF_DIRECTION: None,
                 CONF_ROUTE_ID_FILTER: None,
+                CONF_PLATFORM_FILTER: None,
+            }
+            return self.async_create_entry(
+                title=name, data=data, options={CONF_TRACK_VEHICLES: False}
+            )
+
+        if direction is not None:
+            # "Towards X" direction watch: route + direction, NO destination stop.
+            data: dict[str, Any] = {
+                CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
+                CONF_MODE: _mode_for_route_type(direction.route_type),
+                CONF_STOP_ID: self._config[CONF_STOP_ID],
+                CONF_STOP_NAME: self._config.get(CONF_STOP_NAME, ""),
+                CONF_WATCH_NAME: name,
+                CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
+                CONF_ALL_DESTINATIONS: False,
+                CONF_DESTINATION_STOP_ID: None,
+                CONF_DESTINATION_STOP_NAME: None,
+                CONF_DIRECTION: direction.direction_id,
+                CONF_ROUTE_ID_FILTER: direction.route_id,
                 CONF_PLATFORM_FILTER: None,
             }
             return self.async_create_entry(

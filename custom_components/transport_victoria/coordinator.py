@@ -38,6 +38,7 @@ from .const import (
     CONF_API_KEY,
     CONF_DEPARTURE_COUNT,
     CONF_DESTINATION_STOP_ID,
+    CONF_DIRECTION,
     DEFAULT_DEPARTURE_COUNT,
     CONF_JOURNEY_DESTINATION_STOP_ID,
     CONF_JOURNEY_MODE,
@@ -336,6 +337,12 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
         destination_stop_id: str | None = (
             None if watch.all_destinations else watch.destination_stop_id
         )
+        # A "Towards X" direction watch has no destination stop; its direction is
+        # expressed as a trips.direction_id filter instead (the destination
+        # EXISTS filter and the direction filter are mutually exclusive).
+        direction_filter: int | None = None
+        if destination_stop_id is None and watch.direction_id is not None:
+            direction_filter = watch.direction_id
 
         try:
             departure_rows = await self.hass.async_add_executor_job(
@@ -347,6 +354,10 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
                 destination_stop_id,
                 watch.route_id_filter,
                 watch.platform_filter,
+                0,  # lookback_seconds
+                0,  # offset
+                None,  # resolved_db
+                direction_filter,
             )
         except Exception as exc:
             raise UpdateFailed(f"Departure query failed: {exc}") from exc
@@ -591,6 +602,7 @@ def _watch_config_from_entry(entry: ConfigEntry) -> WatchConfig:
         departure_count=int(options.get(CONF_DEPARTURE_COUNT, data.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT))),
         route_id_filter=data.get(CONF_ROUTE_ID_FILTER),
         platform_filter=data.get(CONF_PLATFORM_FILTER),
+        direction_id=data.get(CONF_DIRECTION),
         journey_mode=data.get(CONF_JOURNEY_MODE, False),
         transfer_stop_id=data.get(CONF_TRANSFER_STOP_ID),
         transfer_stop_name=data.get(CONF_TRANSFER_STOP_NAME, ""),

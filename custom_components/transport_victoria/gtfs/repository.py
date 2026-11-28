@@ -1442,6 +1442,40 @@ def get_terminals_for_route(db_path: Path, route_id: str) -> list[Destination]:
     return _collapse_duplicate_labels(build_destination_candidates(trips))
 
 
+def get_directions_for_stop(
+    db_path: Path,
+    stop_id: str,
+    route_types: list[int],
+) -> list[LineCandidate]:
+    """Return distinct (route, direction, terminus) combos serving a stop.
+
+    Dest-less TripView primitive: for every route serving ``stop_id``, list each
+    of its directions as a :class:`LineCandidate` ("Towards Upfield",
+    "Towards Flinders Street via City Loop").  A direction watch therefore needs
+    no destination stop — it filters by route + ``direction_id``.  Ordered by the
+    same :func:`_line_sort_key` as :func:`get_lines_between`.
+    """
+    routes = get_routes_for_stop(db_path, stop_id, route_types)
+    candidates: list[LineCandidate] = []
+    for route in routes:
+        for terminal in get_terminals_for_route(db_path, route.route_id):
+            candidates.append(
+                LineCandidate(
+                    route_id=route.route_id,
+                    route_short_name=route.route_short_name,
+                    route_long_name=route.route_long_name,
+                    direction_id=terminal.direction_id,
+                    terminal_stop_id=terminal.terminal_stop_id,
+                    terminal_stop_name=terminal.terminal_stop_name,
+                    via_hint=terminal.via_hint,
+                    route_color=route.route_color,
+                    route_type=route.route_type,
+                )
+            )
+    candidates.sort(key=_line_sort_key)
+    return candidates
+
+
 def get_lines_between(
     db_path: Path,
     origin_stop_id: str,

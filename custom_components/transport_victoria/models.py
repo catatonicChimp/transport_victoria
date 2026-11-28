@@ -30,6 +30,7 @@ class WatchConfig:
     # Filtering
     route_id_filter: str | None = None   # Restrict to a specific route/line
     platform_filter: str | None = None  # Restrict to a specific platform code
+    direction_id: int | None = None     # Restrict to a GTFS direction_id (T18.x "Towards X")
 
     # Multi-leg journey mode
     journey_mode: bool = False

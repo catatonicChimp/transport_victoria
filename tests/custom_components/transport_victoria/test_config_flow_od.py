@@ -21,6 +21,7 @@ from custom_components.transport_victoria.const import (
     CONF_API_KEY,
     CONF_BOARD_NAME,
     CONF_DESTINATION_STOP_ID,
+    CONF_DESTINATION_STOP_NAME,
     CONF_DIRECTION,
     CONF_ENTRY_TYPE,
     CONF_MODE,
@@ -189,7 +190,8 @@ def test_mode_for_route_type_helper():
 async def test_dest_options_watch_has_all_and_specific_no_journey(
     bus_db: Path, monkeypatch
 ):
-    """A watch's destination step offers All destinations + Specific, never Journey."""
+    """A watch's destination step offers All destinations + Direction + Specific,
+    never Journey."""
     flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
     values: list = []
 
@@ -205,6 +207,7 @@ async def test_dest_options_watch_has_all_and_specific_no_journey(
     await flow.async_step_dest(None)
 
     assert "__all__" in values
+    assert "direction" in values
     assert "specific" in values
     assert "journey" not in values
 
@@ -226,3 +229,53 @@ async def test_dest_options_board_has_specific_only(bus_db: Path, monkeypatch):
     await flow.async_step_dest(None)
 
     assert values == ["specific"]
+
+
+async def test_direction_watch_walk(bus_db: Path, monkeypatch):
+    """A "Towards X" direction watch stores route + direction, NO destination stop."""
+    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+    created: dict = {}
+
+    def fake_create_entry(**kwargs):
+        created.update(kwargs)
+        return {"type": "create_entry"}
+
+    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
+
+    await flow.async_step_origin({"query": "Sun"})
+    await flow.async_step_origin({CONF_STOP_ID: "B_SUNSHINE"})
+
+    # dest → direction (loads the origin stop's direction candidates)
+    await flow.async_step_dest({"destination_choice": "direction"})
+    assert flow._direction_choices
+
+    value = line_value(flow._direction_choices[0])
+    await flow.async_step_dest(
+        {"destination_choice": "direction", "direction_select": value}
+    )
+    assert flow._selected_direction is not None
+
+    await flow.async_step_confirm({CONF_WATCH_NAME: "W"})
+
+    data = created["data"]
+    assert data[CONF_ENTRY_TYPE] == ENTRY_TYPE_WATCH
+    assert data[CONF_ROUTE_ID_FILTER] == "R_BUS_220"
+    assert data[CONF_DIRECTION] == flow._selected_direction.direction_id
+    assert data[CONF_DESTINATION_STOP_ID] is None       # no destination stop
+    assert data[CONF_DESTINATION_STOP_NAME] is None
+    assert data[CONF_ALL_DESTINATIONS] is False
+
+
+async def test_direction_watch_suggested_name(bus_db: Path, monkeypatch):
+    """The suggested name includes "towards {terminal}" for a direction watch."""
+    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+    await flow.async_step_origin({"query": "Sun"})
+    await flow.async_step_origin({CONF_STOP_ID: "B_SUNSHINE"})
+    await flow.async_step_dest({"destination_choice": "direction"})
+    value = line_value(flow._direction_choices[0])
+    await flow.async_step_dest(
+        {"destination_choice": "direction", "direction_select": value}
+    )
+
+    name = flow._suggested_name()
+    assert "towards" in name.lower()
