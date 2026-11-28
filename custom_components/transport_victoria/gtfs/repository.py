@@ -363,7 +363,10 @@ def search_stops_by_name(
         conn.row_factory = sqlite3.Row
 
         # Ranked match (exact → prefix → word-boundary → substring); the
-        # route-type filter is applied in Python over the CSV.
+        # route-type filter is applied in Python over the CSV.  Within a match
+        # tier, results are ordered by service weight (trip_count DESC, NULLs
+        # last), then shorter names first, with stop_name alphabetical only as
+        # the final tiebreak — never the primary signal.
         sql = """
             SELECT stop_id, stop_name, stop_lat, stop_lon, location_type,
                    parent_station, route_type, route_types,
@@ -375,7 +378,10 @@ def search_stops_by_name(
                    END AS rank
             FROM stop_search
             WHERE name_norm LIKE ?
-            ORDER BY rank, stop_name COLLATE NOCASE
+            ORDER BY rank,
+                     trip_count DESC,
+                     length(name_norm) ASC,
+                     stop_name COLLATE NOCASE ASC
         """
         params = [
             q_norm,
@@ -411,22 +417,31 @@ def search_stops_by_name(
 
 
 def _ensure_stop_search(conn: sqlite3.Connection) -> None:
-    """Defensively build ``stop_search`` once on a DB that predates the table
-    (or whose schema created it empty, e.g. a fixture DB).
+    """Defensively (re)build ``stop_search`` once when it is missing, empty, or
+    predates the ``trip_count`` service-weight column.
 
     The importer rebuilds ``stop_search`` on every refresh; this path covers an
     existing install whose live generation predates this change (so the first
-    search still works, cheaply and idempotently).
+    search still works *and* still ranks by service weight), cheaply and
+    idempotently.  A populated table that merely lacks ``trip_count`` is rebuilt
+    via :func:`build_stop_search`, which adds the column in place.
     """
     from .importer import build_stop_search
 
+    needs_build = False
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stop_search'"
     ).fetchone()
-    count = 0
-    if exists is not None:
-        count = conn.execute("SELECT COUNT(*) FROM stop_search").fetchone()[0]
-    if exists is None or count == 0:
+    if exists is None:
+        needs_build = True
+    else:
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(stop_search)")}
+        if "trip_count" not in cols:
+            needs_build = True
+        else:
+            count = conn.execute("SELECT COUNT(*) FROM stop_search").fetchone()[0]
+            needs_build = count == 0
+    if needs_build:
         build_stop_search(conn)
         conn.commit()
 

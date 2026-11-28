@@ -155,7 +155,8 @@ class TestImportBundlesToGeneration:
         import_bundles_to_generation(db_path, zip_path, "abc", ["2"])
         conn = _open_generation(db_path)
         row = conn.execute(
-            "SELECT stop_name, name_norm, route_type, route_types FROM stop_search"
+            "SELECT stop_name, name_norm, route_type, route_types, trip_count "
+            "FROM stop_search"
         ).fetchone()
         conn.close()
         assert row is not None
@@ -163,6 +164,7 @@ class TestImportBundlesToGeneration:
         assert row[1] == "test station"  # normalized
         assert row[2] == 400             # representative route type
         assert row[3] == "400"           # CSV
+        assert row[4] == 1               # one stop_time in the fixture
 
     def test_stop_search_rebuilt_on_reimport(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)

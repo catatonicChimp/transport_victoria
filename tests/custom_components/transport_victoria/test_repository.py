@@ -150,6 +150,150 @@ class TestStopSearchRanking:
         assert search_stops_by_name(ranking_db, "parliament", [0]) == []
 
 
+class TestStopSearchServiceWeight:
+    """Same-tier matches rank by trip_count (service weight), not alphabetically.
+
+    Reproduces the real-world failures: "Coburg Station" must beat the
+    alphabetically-earlier "Coburg Cemetery/Bell St", and "Flinders Street
+    Station" must beat "Flinders Christian Community College/Ballarto Rd".
+    """
+
+    @pytest.fixture
+    def weight_db(self, tmp_path: Path) -> Path:
+        from tests import gtfs_fixtures as fx
+        from tests.gtfs_builder import import_bundle
+
+        routes = [
+            {"route_id": "R_METRO", "route_short_name": "Metro",
+             "route_long_name": "Metro Line", "route_type": 400},
+            {"route_id": "R_BUS", "route_short_name": "Bus",
+             "route_long_name": "Bus Route", "route_type": 3},
+        ]
+        stops = [
+            fx._stop("S_COBURG", "Coburg Station", -37.74, 144.96),
+            fx._stop("S_COBURG_CEM", "Coburg Cemetery/Bell St", -37.75, 144.95),
+            fx._stop("S_COBURG_LAKE", "Coburg Lake Reserve", -37.76, 144.94),
+            fx._stop("S_FLINDERS_ST", "Flinders Street Station", -37.82, 144.96),
+            fx._stop(
+                "S_FLINDERS_COL",
+                "Flinders Christian Community College/Ballarto Rd",
+                -37.83,
+                144.95,
+            ),
+        ]
+        trips: list = []
+        stop_times: list = []
+        # Coburg Station: 50 scheduled departures (high service weight).
+        for i in range(50):
+            tid = f"T_METRO_CB_{i}"
+            trips.append(fx._trip(tid, "R_METRO", "SVC", "City", 0))
+            stop_times.append(fx._st(tid, "S_COBURG", 1, "08:00:00"))
+        # The two "Coburg …" bus stops: 2 departures each (low weight).
+        for i in range(2):
+            tid = f"T_BUS_CEM_{i}"
+            trips.append(fx._trip(tid, "R_BUS", "SVC", "City", 0))
+            stop_times.append(fx._st(tid, "S_COBURG_CEM", 1, "08:00:00"))
+        for i in range(2):
+            tid = f"T_BUS_LAKE_{i}"
+            trips.append(fx._trip(tid, "R_BUS", "SVC", "City", 0))
+            stop_times.append(fx._st(tid, "S_COBURG_LAKE", 1, "08:00:00"))
+        # Flinders Street Station: 50 departures (beats the alphabetically
+        # earlier "Flinders Christian …" college, which has only 2).
+        for i in range(50):
+            tid = f"T_METRO_FL_{i}"
+            trips.append(fx._trip(tid, "R_METRO", "SVC", "City", 1))
+            stop_times.append(fx._st(tid, "S_FLINDERS_ST", 1, "09:00:00"))
+        for i in range(2):
+            tid = f"T_BUS_FL_{i}"
+            trips.append(fx._trip(tid, "R_BUS", "SVC", "City", 1))
+            stop_times.append(fx._st(tid, "S_FLINDERS_COL", 1, "09:00:00"))
+
+        return import_bundle(
+            tmp_path, folder="2", routes=routes, trips=trips, stops=stops,
+            stop_times=stop_times, calendar=[fx._calendar("SVC")],
+        )
+
+    def test_coburg_station_beats_alphabetically_earlier_bus_stops(
+        self, weight_db: Path
+    ):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(weight_db, "coburg", [400, 3], limit=10)
+        ]
+        assert names[0] == "Coburg Station"
+        assert "Coburg Cemetery/Bell St" in names
+        assert "Coburg Lake Reserve" in names
+
+    def test_flinders_street_beats_alphabetically_earlier_college(
+        self, weight_db: Path
+    ):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(weight_db, "flinders", [400, 3], limit=10)
+        ]
+        assert names[0] == "Flinders Street Station"
+        assert "Flinders Christian Community College/Ballarto Rd" in names
+
+
+class TestStopSearchSchemaDelta:
+    """A live generation from the previous commit has a populated ``stop_search``
+    WITHOUT ``trip_count``; the defensive path must add the column and rebuild."""
+
+    def test_rebuilds_when_trip_count_column_missing(self, tmp_path: Path):
+        import sqlite3
+
+        from tests import gtfs_fixtures as fx
+        from tests.gtfs_builder import import_bundle
+        from custom_components.transport_victoria.gtfs import store
+
+        routes = [{
+            "route_id": "R", "route_short_name": "M",
+            "route_long_name": "M", "route_type": 400,
+        }]
+        stops = [fx._stop("S1", "Coburg Station", -37.74, 144.96)]
+        trips = [fx._trip("T1", "R", "SVC", "City", 0)]
+        stop_times = [fx._st("T1", "S1", 1, "08:00:00")]
+        db = import_bundle(
+            tmp_path, folder="2", routes=routes, trips=trips, stops=stops,
+            stop_times=stop_times, calendar=[fx._calendar("SVC")],
+        )
+
+        # Simulate the pre-trip_count table: recreate stop_search without the
+        # column but still populated.
+        resolved = store.resolve_db(db)
+        conn = sqlite3.connect(str(resolved))
+        conn.execute("DROP TABLE stop_search")
+        conn.execute(
+            """
+            CREATE TABLE stop_search (
+                stop_id TEXT PRIMARY KEY, stop_name TEXT NOT NULL,
+                name_norm TEXT NOT NULL, stop_lat REAL, stop_lon REAL,
+                location_type INTEGER DEFAULT 0, parent_station TEXT,
+                route_type INTEGER, route_types TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO stop_search (stop_id, stop_name, name_norm, route_types) "
+            "VALUES ('S1', 'Coburg Station', 'coburg station', '400')"
+        )
+        conn.commit()
+        conn.close()
+
+        # First search on the legacy table must still work and re-rank.
+        results = search_stops_by_name(db, "coburg", [400])
+        assert [r.stop_name for r in results] == ["Coburg Station"]
+
+        conn = sqlite3.connect(str(resolved))
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(stop_search)")}
+        trip_count = conn.execute(
+            "SELECT trip_count FROM stop_search WHERE stop_id = 'S1'"
+        ).fetchone()[0]
+        conn.close()
+        assert "trip_count" in cols
+        assert trip_count == 1  # rebuilt, not left NULL
+
+
 # ---------------------------------------------------------------------------
 # get_directions_for_stop (Towards-X direction choice)
 # ---------------------------------------------------------------------------

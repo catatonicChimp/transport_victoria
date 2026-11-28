@@ -381,10 +381,12 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
 
     One row per collapsed stop-name (lowest ``stop_id`` is the representative —
     the same collapse ``search_stops_by_name`` applies), with a punctuation-
-    stripped lowercased ``name_norm`` and a sorted CSV of every route type
-    serving the stop.  Self-contained (creates the table + index if absent) and
-    idempotent; called at the end of every import and defensively on first
-    search when the table is missing.
+    stripped lowercased ``name_norm``, a sorted CSV of every route type serving
+    the stop, and a ``trip_count`` service-weight (total stop_times rows across
+    every platform sharing the collapsed name).  Self-contained (creates the
+    table + index if absent, and widens a pre-existing table that lacks
+    ``trip_count``) and idempotent; called at the end of every import and
+    defensively on first search when the table is missing.
     """
     # Create-if-absent (also declared in schema.sql for fresh imports).
     conn.execute(
@@ -398,14 +400,28 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
             location_type  INTEGER DEFAULT 0,
             parent_station TEXT,
             route_type     INTEGER,
-            route_types    TEXT NOT NULL
+            route_types    TEXT NOT NULL,
+            trip_count     INTEGER
         )
         """
     )
+    # Schema delta for a DB whose stop_search table predates trip_count (the
+    # table was first shipped without it): add the column in place rather than
+    # dropping/recreating the populated index.
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(stop_search)")
+    }
+    if "trip_count" not in cols:
+        conn.execute("ALTER TABLE stop_search ADD COLUMN trip_count INTEGER")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_stop_search_name_norm ON stop_search (name_norm)"
     )
     conn.execute("DELETE FROM stop_search")
+    # Single-pass aggregation: the stops→stop_times→trips→routes join is 1:1
+    # per stop_time row (each stop_time has exactly one trip, one route), so
+    # COUNT(st.rowid) is the total number of scheduled departures/arrivals for
+    # the whole name group without a second scan of stop_times.
     sql = """
         SELECT
             MIN(s.stop_id)  AS stop_id,
@@ -415,7 +431,8 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
             MIN(s.location_type) AS location_type,
             MIN(s.parent_station) AS parent_station,
             MIN(r.route_type) AS route_type,
-            GROUP_CONCAT(DISTINCT r.route_type) AS route_types
+            GROUP_CONCAT(DISTINCT r.route_type) AS route_types,
+            COUNT(st.rowid) AS trip_count
         FROM stops s
         JOIN stop_times st ON st.stop_id = s.stop_id
         JOIN trips t ON t.trip_id = st.trip_id
@@ -426,12 +443,15 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
     insert_sql = """
         INSERT INTO stop_search
             (stop_id, stop_name, name_norm, stop_lat, stop_lon,
-             location_type, parent_station, route_type, route_types)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             location_type, parent_station, route_type, route_types, trip_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     total = 0
     for row in conn.execute(sql):
-        stop_id, stop_name, stop_lat, stop_lon, loc_type, parent, route_type, raw_types = row
+        (
+            stop_id, stop_name, stop_lat, stop_lon, loc_type, parent,
+            route_type, raw_types, trip_count,
+        ) = row
         # Deterministic sorted CSV of the serving route types.
         rts = sorted({t for t in (raw_types or "").split(",") if t})
         conn.execute(
@@ -446,6 +466,7 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
                 parent,
                 route_type,
                 ",".join(rts),
+                trip_count,
             ),
         )
         total += 1
