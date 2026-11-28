@@ -351,11 +351,12 @@ def search_stops_by_name(
     query = (query or "").strip()
     if len(query) < 2:
         return []
-    from .importer import normalize_stop_name
+    from .importer import count_stop_name_tokens, normalize_stop_name
 
     q_norm = normalize_stop_name(query)
     if not q_norm:
         return []
+    q_tokens = max(1, count_stop_name_tokens(q_norm))
 
     conn = sqlite3.connect(str(_resolve(db_path)))
     try:
@@ -364,9 +365,10 @@ def search_stops_by_name(
 
         # Ranked match (exact → prefix → word-boundary → substring); the
         # route-type filter is applied in Python over the CSV.  Within a match
-        # tier, results are ordered by service weight (trip_count DESC, NULLs
-        # last), then shorter names first, with stop_name alphabetical only as
-        # the final tiebreak — never the primary signal.
+        # tier, order by match specificity first (fewer extra tokens beyond the
+        # query means the name is closer to what the user typed), then service
+        # weight (trip_count DESC, NULLs last), then shorter names, with
+        # stop_name alphabetical only as the final tiebreak.
         sql = """
             SELECT stop_id, stop_name, stop_lat, stop_lon, location_type,
                    parent_station, route_type, route_types,
@@ -379,6 +381,7 @@ def search_stops_by_name(
             FROM stop_search
             WHERE name_norm LIKE ?
             ORDER BY rank,
+                     max(0, token_count - ?) ASC,
                      trip_count DESC,
                      length(name_norm) ASC,
                      stop_name COLLATE NOCASE ASC
@@ -388,6 +391,7 @@ def search_stops_by_name(
             q_norm + "%",
             "% " + q_norm + "%",
             "%" + q_norm + "%",
+            q_tokens,
         ]
         wanted = {str(rt) for rt in route_types}
         results: list[StopResult] = []
@@ -418,13 +422,14 @@ def search_stops_by_name(
 
 def _ensure_stop_search(conn: sqlite3.Connection) -> None:
     """Defensively (re)build ``stop_search`` once when it is missing, empty, or
-    predates the ``trip_count`` service-weight column.
+    predates the ``trip_count``/``token_count`` weighting columns.
 
     The importer rebuilds ``stop_search`` on every refresh; this path covers an
     existing install whose live generation predates this change (so the first
-    search still works *and* still ranks by service weight), cheaply and
-    idempotently.  A populated table that merely lacks ``trip_count`` is rebuilt
-    via :func:`build_stop_search`, which adds the column in place.
+    search still works *and* still ranks by specificity + service weight),
+    cheaply and idempotently.  A populated table that merely lacks a weighting
+    column is rebuilt via :func:`build_stop_search`, which adds the column in
+    place.
     """
     from .importer import build_stop_search
 
@@ -436,7 +441,7 @@ def _ensure_stop_search(conn: sqlite3.Connection) -> None:
         needs_build = True
     else:
         cols = {c[1] for c in conn.execute("PRAGMA table_info(stop_search)")}
-        if "trip_count" not in cols:
+        if "trip_count" not in cols or "token_count" not in cols:
             needs_build = True
         else:
             count = conn.execute("SELECT COUNT(*) FROM stop_search").fetchone()[0]

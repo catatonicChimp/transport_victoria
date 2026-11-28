@@ -150,96 +150,112 @@ class TestStopSearchRanking:
         assert search_stops_by_name(ranking_db, "parliament", [0]) == []
 
 
-class TestStopSearchServiceWeight:
-    """Same-tier matches rank by trip_count (service weight), not alphabetically.
-
-    Reproduces the real-world failures: "Coburg Station" must beat the
-    alphabetically-earlier "Coburg Cemetery/Bell St", and "Flinders Street
-    Station" must beat "Flinders Christian Community College/Ballarto Rd".
+class TestStopSearchSpecificity:
+    """Within a match tier, match specificity (fewer extra tokens beyond the
+    query) ranks ahead of service weight — the human-relevant signal for a
+    departure app.  Reproduces the live PTV failures where a high-volume bus/
+    tram stop with a longer descriptive name beat the actual station on raw
+    trip_count.
     """
 
     @pytest.fixture
-    def weight_db(self, tmp_path: Path) -> Path:
+    def spec_db(self, tmp_path: Path) -> Path:
         from tests import gtfs_fixtures as fx
         from tests.gtfs_builder import import_bundle
 
         routes = [
+            {"route_id": "R_TRAM", "route_short_name": "Tram",
+             "route_long_name": "Tram", "route_type": 0},
+            {"route_id": "R_BUS", "route_short_name": "Bus",
+             "route_long_name": "Bus", "route_type": 3},
             {"route_id": "R_METRO", "route_short_name": "Metro",
              "route_long_name": "Metro Line", "route_type": 400},
-            {"route_id": "R_BUS", "route_short_name": "Bus",
-             "route_long_name": "Bus Route", "route_type": 3},
         ]
         stops = [
             fx._stop("S_COBURG", "Coburg Station", -37.74, 144.96),
-            fx._stop("S_COBURG_CEM", "Coburg Cemetery/Bell St", -37.75, 144.95),
-            fx._stop("S_COBURG_LAKE", "Coburg Lake Reserve", -37.76, 144.94),
-            fx._stop("S_FLINDERS_ST", "Flinders Street Station", -37.82, 144.96),
+            fx._stop("S_COBURG_PS", "Coburg PS/Bell St", -37.75, 144.95),
+            fx._stop("S_PARLIAMENT", "Parliament Station", -37.81, 144.97),
+            fx._stop(
+                "S_PARL_TRAM", "Parliament Station/Macarthur St #10",
+                -37.81, 144.97,
+            ),
+            fx._stop("S_FLINDERS", "Flinders Street Station", -37.82, 144.96),
             fx._stop(
                 "S_FLINDERS_COL",
                 "Flinders Christian Community College/Ballarto Rd",
-                -37.83,
-                144.95,
+                -37.83, 144.95,
             ),
         ]
         trips: list = []
         stop_times: list = []
-        # Coburg Station: 50 scheduled departures (high service weight).
-        for i in range(50):
-            tid = f"T_METRO_CB_{i}"
-            trips.append(fx._trip(tid, "R_METRO", "SVC", "City", 0))
-            stop_times.append(fx._st(tid, "S_COBURG", 1, "08:00:00"))
-        # The two "Coburg …" bus stops: 2 departures each (low weight).
-        for i in range(2):
-            tid = f"T_BUS_CEM_{i}"
-            trips.append(fx._trip(tid, "R_BUS", "SVC", "City", 0))
-            stop_times.append(fx._st(tid, "S_COBURG_CEM", 1, "08:00:00"))
-        for i in range(2):
-            tid = f"T_BUS_LAKE_{i}"
-            trips.append(fx._trip(tid, "R_BUS", "SVC", "City", 0))
-            stop_times.append(fx._st(tid, "S_COBURG_LAKE", 1, "08:00:00"))
-        # Flinders Street Station: 50 departures (beats the alphabetically
-        # earlier "Flinders Christian …" college, which has only 2).
-        for i in range(50):
-            tid = f"T_METRO_FL_{i}"
-            trips.append(fx._trip(tid, "R_METRO", "SVC", "City", 1))
-            stop_times.append(fx._st(tid, "S_FLINDERS_ST", 1, "09:00:00"))
-        for i in range(2):
-            tid = f"T_BUS_FL_{i}"
-            trips.append(fx._trip(tid, "R_BUS", "SVC", "City", 1))
-            stop_times.append(fx._st(tid, "S_FLINDERS_COL", 1, "09:00:00"))
+
+        def _serve(prefix: str, route_id: str, stop_id: str, n: int,
+                   direction: int, time: str) -> None:
+            for i in range(n):
+                tid = f"{prefix}_{i}"
+                trips.append(fx._trip(tid, route_id, "SVC", "City", direction))
+                stop_times.append(fx._st(tid, stop_id, 1, time))
+
+        # The correct answer carries FEW scheduled services; the descriptive
+        # (wrong) stop carries MANY — specificity must still win over volume.
+        _serve("T_METRO_CB", "R_METRO", "S_COBURG", 2, 0, "08:00:00")
+        _serve("T_BUS_PS", "R_BUS", "S_COBURG_PS", 40, 0, "08:01:00")
+        _serve("T_METRO_PA", "R_METRO", "S_PARLIAMENT", 2, 0, "08:02:00")
+        _serve("T_TRAM_PA", "R_TRAM", "S_PARL_TRAM", 40, 0, "08:03:00")
+        _serve("T_METRO_FL", "R_METRO", "S_FLINDERS", 2, 1, "09:00:00")
+        _serve("T_BUS_FL", "R_BUS", "S_FLINDERS_COL", 40, 1, "09:01:00")
 
         return import_bundle(
             tmp_path, folder="2", routes=routes, trips=trips, stops=stops,
             stop_times=stop_times, calendar=[fx._calendar("SVC")],
         )
 
-    def test_coburg_station_beats_alphabetically_earlier_bus_stops(
-        self, weight_db: Path
-    ):
+    def test_coburg_station_beats_high_volume_bus_stop(self, spec_db: Path):
         names = [
             r.stop_name
-            for r in search_stops_by_name(weight_db, "coburg", [400, 3], limit=10)
+            for r in search_stops_by_name(spec_db, "coburg", [0, 3, 400], limit=10)
         ]
         assert names[0] == "Coburg Station"
-        assert "Coburg Cemetery/Bell St" in names
-        assert "Coburg Lake Reserve" in names
+        assert "Coburg PS/Bell St" in names
 
-    def test_flinders_street_beats_alphabetically_earlier_college(
-        self, weight_db: Path
-    ):
+    def test_parliament_station_beats_high_volume_tram_stop(self, spec_db: Path):
         names = [
             r.stop_name
-            for r in search_stops_by_name(weight_db, "flinders", [400, 3], limit=10)
+            for r in search_stops_by_name(
+                spec_db, "parliament", [0, 3, 400], limit=10
+            )
+        ]
+        assert names[0] == "Parliament Station"
+        assert "Parliament Station/Macarthur St #10" in names
+
+    def test_flinders_street_beats_high_volume_college(self, spec_db: Path):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(spec_db, "flinders", [0, 3, 400], limit=10)
         ]
         assert names[0] == "Flinders Street Station"
         assert "Flinders Christian Community College/Ballarto Rd" in names
 
+    def test_token_count_reflects_slashed_name_shape(self, spec_db: Path):
+        import sqlite3
+
+        from custom_components.transport_victoria.gtfs import store
+
+        conn = sqlite3.connect(str(store.resolve_db(spec_db)))
+        row = conn.execute(
+            "SELECT token_count FROM stop_search WHERE stop_id = 'S_COBURG_PS'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 4  # "Coburg PS/Bell St" → Coburg / PS / Bell / St
+
 
 class TestStopSearchSchemaDelta:
-    """A live generation from the previous commit has a populated ``stop_search``
-    WITHOUT ``trip_count``; the defensive path must add the column and rebuild."""
+    """A live generation from an earlier commit has a populated ``stop_search``
+    missing the ``token_count`` (and/or ``trip_count``) column; the defensive
+    path must add the column and rebuild."""
 
-    def test_rebuilds_when_trip_count_column_missing(self, tmp_path: Path):
+    def test_rebuilds_when_token_count_column_missing(self, tmp_path: Path):
         import sqlite3
 
         from tests import gtfs_fixtures as fx
@@ -258,8 +274,8 @@ class TestStopSearchSchemaDelta:
             stop_times=stop_times, calendar=[fx._calendar("SVC")],
         )
 
-        # Simulate the pre-trip_count table: recreate stop_search without the
-        # column but still populated.
+        # Simulate the immediately-previous table: it has trip_count but NOT
+        # token_count, still populated.
         resolved = store.resolve_db(db)
         conn = sqlite3.connect(str(resolved))
         conn.execute("DROP TABLE stop_search")
@@ -269,13 +285,15 @@ class TestStopSearchSchemaDelta:
                 stop_id TEXT PRIMARY KEY, stop_name TEXT NOT NULL,
                 name_norm TEXT NOT NULL, stop_lat REAL, stop_lon REAL,
                 location_type INTEGER DEFAULT 0, parent_station TEXT,
-                route_type INTEGER, route_types TEXT NOT NULL
+                route_type INTEGER, route_types TEXT NOT NULL,
+                trip_count INTEGER
             )
             """
         )
         conn.execute(
-            "INSERT INTO stop_search (stop_id, stop_name, name_norm, route_types) "
-            "VALUES ('S1', 'Coburg Station', 'coburg station', '400')"
+            "INSERT INTO stop_search "
+            "(stop_id, stop_name, name_norm, route_types, trip_count) "
+            "VALUES ('S1', 'Coburg Station', 'coburg station', '400', 1)"
         )
         conn.commit()
         conn.close()
@@ -286,12 +304,12 @@ class TestStopSearchSchemaDelta:
 
         conn = sqlite3.connect(str(resolved))
         cols = {c[1] for c in conn.execute("PRAGMA table_info(stop_search)")}
-        trip_count = conn.execute(
-            "SELECT trip_count FROM stop_search WHERE stop_id = 'S1'"
+        token_count = conn.execute(
+            "SELECT token_count FROM stop_search WHERE stop_id = 'S1'"
         ).fetchone()[0]
         conn.close()
-        assert "trip_count" in cols
-        assert trip_count == 1  # rebuilt, not left NULL
+        assert "token_count" in cols
+        assert token_count == 2  # rebuilt, not left NULL
 
 
 # ---------------------------------------------------------------------------

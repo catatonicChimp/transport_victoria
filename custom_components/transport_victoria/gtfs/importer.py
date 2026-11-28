@@ -376,17 +376,30 @@ def normalize_stop_name(name: str) -> str:
     return re.sub(r"\s+", " ", norm).strip()
 
 
+def count_stop_name_tokens(name: str) -> int:
+    """Count alphanumeric tokens in a stop name.
+
+    Runs of non-alphanumeric characters are separators, so slashes/descriptors
+    shape the count: ``"Coburg Station"`` → 2, ``"Coburg PS/Bell St"`` → 4,
+    ``"Parliament Station/Macarthur St #10"`` → 5.  Empty/blank → 0.
+    """
+    import re
+
+    return len(re.findall(r"[a-zA-Z0-9]+", name or ""))
+
+
 def build_stop_search(conn: sqlite3.Connection) -> int:
     """(Re)build the materialized ``stop_search`` table from the live tables.
 
     One row per collapsed stop-name (lowest ``stop_id`` is the representative —
     the same collapse ``search_stops_by_name`` applies), with a punctuation-
     stripped lowercased ``name_norm``, a sorted CSV of every route type serving
-    the stop, and a ``trip_count`` service-weight (total stop_times rows across
-    every platform sharing the collapsed name).  Self-contained (creates the
-    table + index if absent, and widens a pre-existing table that lacks
-    ``trip_count``) and idempotent; called at the end of every import and
-    defensively on first search when the table is missing.
+    the stop, a ``trip_count`` service-weight (total stop_times rows across
+    every platform sharing the collapsed name), and a ``token_count`` match-
+    specificity weight (alphanumeric tokens in the original name).  Self-
+    contained (creates the table + index if absent, and widens a pre-existing
+    table that lacks either new column) and idempotent; called at the end of
+    every import and defensively on first search when the table is missing.
     """
     # Create-if-absent (also declared in schema.sql for fresh imports).
     conn.execute(
@@ -401,19 +414,22 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
             parent_station TEXT,
             route_type     INTEGER,
             route_types    TEXT NOT NULL,
-            trip_count     INTEGER
+            trip_count     INTEGER,
+            token_count    INTEGER
         )
         """
     )
-    # Schema delta for a DB whose stop_search table predates trip_count (the
-    # table was first shipped without it): add the column in place rather than
-    # dropping/recreating the populated index.
+    # Schema delta for a DB whose stop_search table predates trip_count/token_count
+    # (the table first shipped without them): add the columns in place rather
+    # than dropping/recreating the populated index.
     cols = {
         row[1]
         for row in conn.execute("PRAGMA table_info(stop_search)")
     }
     if "trip_count" not in cols:
         conn.execute("ALTER TABLE stop_search ADD COLUMN trip_count INTEGER")
+    if "token_count" not in cols:
+        conn.execute("ALTER TABLE stop_search ADD COLUMN token_count INTEGER")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_stop_search_name_norm ON stop_search (name_norm)"
     )
@@ -443,8 +459,9 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
     insert_sql = """
         INSERT INTO stop_search
             (stop_id, stop_name, name_norm, stop_lat, stop_lon,
-             location_type, parent_station, route_type, route_types, trip_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             location_type, parent_station, route_type, route_types,
+             trip_count, token_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     total = 0
     for row in conn.execute(sql):
@@ -467,6 +484,7 @@ def build_stop_search(conn: sqlite3.Connection) -> int:
                 route_type,
                 ",".join(rts),
                 trip_count,
+                max(1, count_stop_name_tokens(stop_name)),
             ),
         )
         total += 1
