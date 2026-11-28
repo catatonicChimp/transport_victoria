@@ -359,7 +359,7 @@ async def test_reconcile_idempotent(hass):
 
 async def test_add_monitor_option_removed_from_source_menu(hass):
     """Maintainer decision: features are added via Add Integration, not the options menu."""
-    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_init("01M8FB8PS7KF0J92ZKPEGVSXTN")
     assert result["type"] == FlowResultType.MENU
     assert set(result["menu_options"]) == {
         "source_reconfigure",
