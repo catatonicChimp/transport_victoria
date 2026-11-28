@@ -1,8 +1,8 @@
-"""Config-flow destination step tests (T7), built on the T6 bus fixture.
+"""T18.4 config-flow destination-search + line-selection tests (light env).
 
-Verifies the #2 scenario: a bus watch can select a specific destination (a
-short-working terminus) and have its direction derived and stored, while the
-"All destinations" default is preserved.
+Covers the TripView-style O/D journey's second and third steps — the
+destination search (``async_step_dest``) and the "lines found" dropdown
+(``async_step_lines``) — built on the T6 bus / V/Line fixtures.
 """
 
 from __future__ import annotations
@@ -14,20 +14,12 @@ import pytest
 
 from custom_components.transport_victoria import config_flow as cf
 from custom_components.transport_victoria.const import (
-    CONF_ALL_DESTINATIONS,
     CONF_DESTINATION_STOP_ID,
     CONF_DESTINATION_STOP_NAME,
-    CONF_DIRECTION,
-    CONF_MODE,
     CONF_STOP_ID,
     CONF_STOP_NAME,
-    MODE_BUS,
-    MODE_METRO,
 )
-from custom_components.transport_victoria.routing.destination import (
-    destination_label,
-    destination_value,
-)
+from custom_components.transport_victoria.routing.destination import line_label
 
 
 class FakeHass:
@@ -41,114 +33,110 @@ class FakeHass:
 
 
 @pytest.fixture
-def make_flow(bus_db: Path, monkeypatch):
+def make_bus_flow(bus_db: Path, monkeypatch):
     def _make():
         flow = cf.PTVConfigFlow()
         flow.hass = FakeHass()
         flow._config = {
-            CONF_MODE: MODE_BUS,
             CONF_STOP_ID: "B_SUNSHINE",
             CONF_STOP_NAME: "Sunshine",
         }
         captured: dict = {}
 
-        async def fake_confirm(user_input=None):
-            captured["confirmed"] = True
-            return {"step_id": "confirm"}
+        async def fake_lines(user_input=None):
+            captured["advanced_to_lines"] = True
+            return {"step_id": "lines"}
 
         def fake_show_form(*args, **kwargs):
             captured["form"] = kwargs
             return {"type": "form", "step_id": "dest"}
 
-        monkeypatch.setattr(flow, "async_step_confirm", fake_confirm)
+        monkeypatch.setattr(flow, "async_step_lines", fake_lines)
         monkeypatch.setattr(flow, "async_show_form", fake_show_form)
-        # Point the flow's DB anchor at the fixture generation (skip download).
         monkeypatch.setattr(cf, "_db_path", lambda cfg: bus_db)
         return flow, captured
 
     return _make
 
 
-async def test_bus_destination_step_lists_terminals(make_flow):
-    flow, captured = make_flow()
-    await flow.async_step_dest(None)
-
-    assert captured["form"] is not None
-    assert flow._dest_route_id == "R_BUS_220"
-    names = {c.terminal_stop_name for c in flow._dest_candidates}
-    assert {"Footscray", "Braybrook", "City", "Sunshine"} <= names
-
-
-async def test_bus_specific_destination_closes_issue(make_flow):
-    flow, captured = make_flow()
-    await flow.async_step_dest(None)
-
-    footscray = next(
-        c for c in flow._dest_candidates
-        if c.terminal_stop_name == "Footscray" and c.via_hint is None
+async def test_dest_search_selects_destination(make_bus_flow):
+    flow, captured = make_bus_flow()
+    await flow.async_step_dest(
+        {"destination_choice": "specific", "dest_query": "Cit"}
     )
-    await flow.async_step_dest({"destination_choice": destination_value(footscray)})
+    assert flow._dest_search_results
 
-    assert captured["confirmed"] is True
-    assert flow._config[CONF_DESTINATION_STOP_ID] == "B_FOOTSCRAY"
-    assert flow._config[CONF_DESTINATION_STOP_NAME] == "Footscray"
-    assert flow._config[CONF_DIRECTION] == 0
-    assert flow._config[CONF_ALL_DESTINATIONS] is False
-
-
-async def test_all_destinations_preserved(make_flow):
-    flow, captured = make_flow()
-    await flow.async_step_dest(None)
-    await flow.async_step_dest({"destination_choice": "__all__"})
-
-    assert captured["confirmed"] is True
-    assert flow._config[CONF_ALL_DESTINATIONS] is True
-    assert flow._config[CONF_DESTINATION_STOP_ID] is None
-    assert flow._config[CONF_DIRECTION] is None
+    await flow.async_step_dest(
+        {"destination_choice": "specific", CONF_DESTINATION_STOP_ID: "B_CITY"}
+    )
+    assert captured["advanced_to_lines"] is True
+    assert flow._config[CONF_DESTINATION_STOP_ID] == "B_CITY"
+    assert flow._config[CONF_DESTINATION_STOP_NAME] == "City"
 
 
-@pytest.fixture
-def make_metro_flow(duplicate_labels_db: Path, monkeypatch):
-    """Metro flow whose origin is served by one route with colliding patterns."""
+async def test_dest_journey_choice_branches(make_bus_flow):
+    flow, captured = make_bus_flow()
 
-    def _make():
-        flow = cf.PTVConfigFlow()
-        flow.hass = FakeHass()
-        flow._config = {
-            CONF_MODE: MODE_METRO,
-            CONF_STOP_ID: "U_FLINDERS",
-            CONF_STOP_NAME: "Flinders Street",
-        }
-        captured: dict = {}
+    async def fake_journey(user_input=None):
+        captured["journey"] = True
+        return {"step_id": "journey"}
 
-        async def fake_confirm(user_input=None):
-            captured["confirmed"] = True
-            return {"step_id": "confirm"}
+    # Patch on the instance (async_step_dest calls ``self.async_step_journey``).
+    flow.async_step_journey = fake_journey
 
-        def fake_show_form(*args, **kwargs):
-            captured["form"] = kwargs
-            return {"type": "form", "step_id": "dest"}
-
-        monkeypatch.setattr(flow, "async_step_confirm", fake_confirm)
-        monkeypatch.setattr(flow, "async_show_form", fake_show_form)
-        monkeypatch.setattr(cf, "_db_path", lambda cfg: duplicate_labels_db)
-        return flow, captured
-
-    return _make
+    await flow.async_step_dest({"destination_choice": "journey"})
+    assert captured["journey"] is True
 
 
-async def test_metro_destination_step_has_no_duplicate_labels(make_metro_flow):
-    """Regression: identical pattern labels must appear once in the selector."""
-    flow, captured = make_metro_flow()
-    await flow.async_step_dest(None)
+async def test_lines_lists_all_candidates_no_duplicates(bus_db: Path, monkeypatch):
+    """The "lines found" dropdown lists every O/D candidate with unique labels."""
+    flow = cf.PTVConfigFlow()
+    flow.hass = FakeHass()
+    flow._config = {
+        CONF_STOP_ID: "B_SUNSHINE",
+        CONF_STOP_NAME: "Sunshine",
+        CONF_DESTINATION_STOP_ID: "B_CITY",
+        CONF_DESTINATION_STOP_NAME: "City",
+    }
+    captured: dict = {}
 
-    assert captured["form"] is not None
-    labels = [destination_label(c) for c in flow._dest_candidates]
-    assert labels == [
-        "Upfield Station via Gowrie Station",
-        "Flinders Street via North Melbourne",
-        "Flinders Street via Southern Cross",
-    ]
-    # No duplicate option labels anywhere in the rendered selector.
-    assert len(labels) == len(set(labels))
+    def fake_show_form(*args, **kwargs):
+        captured["form"] = kwargs
+        return {"type": "form", "step_id": "lines"}
 
+    monkeypatch.setattr(flow, "async_show_form", fake_show_form)
+    monkeypatch.setattr(cf, "_db_path", lambda cfg: bus_db)
+
+    await flow.async_step_lines(None)
+
+    # Two "City" routings (via Footscray / via Kensington) → two candidates.
+    assert len(flow._line_choices) == 2
+    labels = [line_label(l) for l in flow._line_choices]
+    assert len(labels) == len(set(labels))  # no duplicate option labels
+    assert any("via" in lbl for lbl in labels)
+
+
+async def test_lines_single_candidate_auto_advances(vline_db: Path, monkeypatch):
+    """A single route+direction candidate skips the dropdown entirely."""
+    flow = cf.PTVConfigFlow()
+    flow.hass = FakeHass()
+    flow._config = {
+        CONF_STOP_ID: "V_SC",
+        CONF_STOP_NAME: "Southern Cross",
+        CONF_DESTINATION_STOP_ID: "V_GEELONG",
+        CONF_DESTINATION_STOP_NAME: "Geelong",
+    }
+    captured: dict = {}
+
+    async def fake_confirm(user_input=None):
+        captured["confirm"] = True
+        return {"step_id": "confirm"}
+
+    monkeypatch.setattr(flow, "async_step_confirm", fake_confirm)
+    monkeypatch.setattr(cf, "_db_path", lambda cfg: vline_db)
+
+    await flow.async_step_lines(None)
+
+    assert captured["confirm"] is True
+    assert flow._selected_line is not None
+    assert flow._selected_line.route_id == "R_VLINE_GEELONG"

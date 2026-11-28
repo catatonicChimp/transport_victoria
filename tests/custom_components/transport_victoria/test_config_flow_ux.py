@@ -453,30 +453,28 @@ async def test_board_settings_track_vehicles_defaults_false(monkeypatch):
     assert created["data"][CONF_TRACK_VEHICLES] is False
 
 
-async def test_watch_confirm_track_vehicles_stored_in_options(monkeypatch):
-    """The watch creation confirm step stores the toggle in entry options."""
+async def test_watch_confirm_screen_has_no_vestigial_toggle(monkeypatch):
+    """The T18.4 review screen drops the track-vehicles toggle (options-only now)."""
     flow = cf.PTVConfigFlow()
     flow.hass = SimpleNamespace(config=SimpleNamespace(config_dir="/unused"))
-    flow._config = {}
-    created = {}
+    flow._config = {CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH}
+    required: list[str] = []
 
-    def fake_create_entry(**kwargs):
-        created.update(kwargs)
-        return {"type": "create_entry"}
+    def _record_required(name, *args, **kwargs):
+        required.append(name)
+        return object()
 
-    async def fake_summary():
-        return ""
+    monkeypatch.setattr(cf.vol, "Required", _record_required)
 
-    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
-    monkeypatch.setattr(flow, "_get_disruption_summary", fake_summary)
+    def fake_show_form(**kwargs):
+        return {"type": "form", "step_id": "confirm"}
 
-    await flow.async_step_confirm({
-        CONF_WATCH_NAME: "My Watch",
-        CONF_TRACK_VEHICLES: True,
-    })
+    monkeypatch.setattr(flow, "async_show_form", fake_show_form)
 
-    assert created["title"] == "My Watch"
-    assert created["options"][CONF_TRACK_VEHICLES] is True
+    await flow.async_step_confirm(None)
+
+    assert CONF_WATCH_NAME in required
+    assert CONF_TRACK_VEHICLES not in required
 
 
 async def test_watch_options_track_vehicles_round_trip(monkeypatch):
