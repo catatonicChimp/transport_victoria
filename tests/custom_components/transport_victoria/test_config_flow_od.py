@@ -151,6 +151,79 @@ async def test_board_confirm_screen_shows_board_name_field(bus_db: Path, monkeyp
     assert CONF_WATCH_NAME not in required
 
 
+def _capture_confirm_placeholders(flow, monkeypatch) -> dict:
+    """Capture the confirm step's description_placeholders (skip other steps)."""
+    captured: dict = {}
+
+    def fake_show_form(**kwargs):
+        if kwargs.get("step_id") == "confirm":
+            captured["placeholders"] = kwargs.get("description_placeholders", {})
+        return {"type": "form", "step_id": kwargs.get("step_id", "confirm")}
+
+    monkeypatch.setattr(flow, "async_show_form", fake_show_form)
+    return captured
+
+
+_CONFIRM_PLACEHOLDER_KEYS = (
+    "mode", "stop_name", "destination", "disruption", "city_loop_note"
+)
+
+
+async def test_confirm_supplies_all_description_placeholders(
+    bus_db: Path, monkeypatch
+):
+    """The confirm description references {mode}/{stop_name}/{destination}/
+    {disruption}/{city_loop_note}; all must be supplied (no raw intl error)."""
+    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+    captured = _capture_confirm_placeholders(flow, monkeypatch)
+    await _walk_to_confirm(flow)
+
+    placeholders = captured["placeholders"]
+    for key in _CONFIRM_PLACEHOLDER_KEYS:
+        assert key in placeholders, key
+    assert placeholders["mode"] == "Bus"       # bus fixture → route_type 3
+    assert placeholders["stop_name"] == "Sunshine"
+    assert placeholders["destination"] == "City"
+    assert placeholders["disruption"] == ""
+    assert placeholders["city_loop_note"] == ""
+
+
+async def test_confirm_direction_placeholders(bus_db: Path, monkeypatch):
+    """A direction watch's confirm destination is the terminus label."""
+    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+    captured = _capture_confirm_placeholders(flow, monkeypatch)
+
+    await flow.async_step_origin({"query": "Sun"})
+    await flow.async_step_origin({CONF_STOP_ID: "B_SUNSHINE"})
+    await flow.async_step_dest({"destination_choice": "direction"})
+    value = line_value(flow._direction_choices[0])
+    await flow.async_step_dest(
+        {"destination_choice": "direction", "direction_select": value}
+    )
+
+    placeholders = captured["placeholders"]
+    assert placeholders["mode"] == "Bus"
+    assert placeholders["destination"]  # terminus label, not empty
+    assert placeholders["disruption"] == ""
+    assert placeholders["city_loop_note"] == ""
+
+
+async def test_confirm_all_destinations_placeholders(bus_db: Path, monkeypatch):
+    """An all-destinations watch names its destination honestly."""
+    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+    captured = _capture_confirm_placeholders(flow, monkeypatch)
+
+    await flow.async_step_origin({"query": "Sun"})
+    await flow.async_step_origin({CONF_STOP_ID: "B_SUNSHINE"})
+    await flow.async_step_dest({"destination_choice": "__all__"})
+
+    placeholders = captured["placeholders"]
+    assert placeholders["mode"] == "Bus"
+    assert placeholders["destination"] == "everywhere this line reaches"
+    assert placeholders["disruption"] == ""
+    assert placeholders["city_loop_note"] == ""
+
+
 async def test_watch_data_schema_backward_compatible(bus_db: Path, monkeypatch):
     """The stored watch data keeps every key the old flow produced (no renames)."""
     flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)

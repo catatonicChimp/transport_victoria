@@ -305,6 +305,17 @@ def _mode_for_route_type(route_type: int | None) -> str:
     return MODE_METRO
 
 
+def _route_type_display_label(route_type: int | None) -> str:
+    """Human mode label for the confirm screen ("Metro Train", "Bus", "Tram"…).
+
+    Uses the singular ``ROUTE_TYPE_LABELS`` phrasing (matches the dest-step
+    stop labels); unknown/absent types fall back to "Metro Train".
+    """
+    if route_type is not None and route_type in ROUTE_TYPE_LABELS:
+        return ROUTE_TYPE_LABELS[route_type]
+    return "Metro Train"
+
+
 async def _validate_api_key(hass, api_key: str) -> dict[str, str]:
     """Return an errors dict if the key is invalid, empty dict if OK.
 
@@ -1202,12 +1213,63 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return self.async_show_form(
             step_id="confirm",
             data_schema=vol.Schema(schema_fields),
-            description_placeholders={
-                "stop_name": self._config.get(CONF_STOP_NAME, ""),
-                "destination": self._config.get(CONF_DESTINATION_STOP_NAME, ""),
-                "direction": self._direction_summary(),
-            },
+            description_placeholders=await self._confirm_placeholders(),
         )
+
+    async def _confirm_placeholders(self) -> dict[str, str]:
+        """Description placeholders for the confirm step (watch + board).
+
+        Supplies every key the confirm description references — ``mode``,
+        ``stop_name``, ``destination``, ``disruption``, ``city_loop_note`` — so
+        the string never renders a raw intl ``MISSING_VALUE`` error.
+        """
+        stop_name = self._config.get(CONF_STOP_NAME, "")
+        line = self._selected_line
+        direction = self._selected_direction
+
+        if line is not None:
+            # Specific destination (watch) or board's first pin.
+            mode_label = _route_type_display_label(line.route_type)
+            destination = (
+                self._config.get(CONF_DESTINATION_STOP_NAME, "")
+                or line.terminal_stop_name
+                or line.route_short_name
+                or line.route_id
+            )
+        elif direction is not None:
+            # "Towards X" direction watch — no destination stop.
+            mode_label = _route_type_display_label(direction.route_type)
+            destination = (
+                direction.terminal_stop_name
+                or direction.route_short_name
+                or direction.route_id
+            )
+            if direction.via_hint:
+                destination = f"{destination} via {direction.via_hint}"
+        else:
+            # All destinations — derive the mode from the origin stop's routes.
+            mode_label = "Metro Train"
+            if CONF_STOP_ID in self._config and hasattr(
+                self.hass, "async_add_executor_job"
+            ):
+                db_path = _db_path(self.hass.config.config_dir)
+                routes = await self.hass.async_add_executor_job(
+                    get_routes_for_stop,
+                    db_path,
+                    self._config[CONF_STOP_ID],
+                    ALL_ROUTE_TYPES,
+                )
+                if routes:
+                    mode_label = _route_type_display_label(routes[0].route_type)
+            destination = "everywhere this line reaches"
+
+        return {
+            "mode": mode_label,
+            "stop_name": stop_name,
+            "destination": destination,
+            "disruption": "",
+            "city_loop_note": "",
+        }
 
     # ------------------------------------------------------------------
     # Entry type choice (departure watch / route tracker / board)
