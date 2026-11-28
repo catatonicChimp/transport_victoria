@@ -357,25 +357,16 @@ async def test_reconcile_idempotent(hass):
     assert data_after_second == data_after_first
 
 
-async def test_add_monitor_shows_instructions_not_invisible_flow(hass):
-    """F6 — "Add monitor" renders an instruction form, not a backend flow."""
-    hub = await _create_source(hass, realtime=False)
-
-    result = await hass.config_entries.options.async_init(hub.entry_id)
-    assert result["step_id"] == "source_menu"
-    # No new flow may be silently created by the menu itself.
-    flows_before = list(hass.config_entries.flow.async_progress())
-
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"next_step_id": "add_monitor"}
-    )
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "add_monitor"
-
-    flows_after = list(hass.config_entries.flow.async_progress())
-    assert len(flows_after) == len(flows_before)  # no invisible flow created
-
-
+async def test_add_monitor_option_removed_from_source_menu(hass):
+    """Maintainer decision: features are added via Add Integration, not the options menu."""
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == FlowResultType.MENU
+    assert set(result["menu_options"]) == {
+        "source_reconfigure",
+        "source_refresh",
+        "source_remove",
+    }
+    assert "add_monitor" not in set(result["menu_options"])
 async def test_force_refresh_surfaces_failure_then_success(hass, monkeypatch):
     """F1 — manual repair routes through the manager + surfaces the outcome."""
     hub = await _create_source(hass, realtime=False)

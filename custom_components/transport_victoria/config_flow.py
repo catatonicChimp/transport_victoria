@@ -2665,33 +2665,10 @@ class PTVSourceOptionsFlow(OptionsFlow):  # type: ignore[misc]
         return self.async_show_menu(
             step_id="source_menu",
             menu_options=[
-                "add_monitor",
                 "source_reconfigure",
                 "source_refresh",
                 "source_remove",
             ],
-        )
-
-    async def async_step_add_monitor(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Explain how to add a monitor (no invisible backend flow, F6).
-
-        Creating a second flow from inside an options flow is not a visible
-        frontend navigation, so instead of silently opening one we show a
-        persistent instruction: the user adds features via Settings → Devices &
-        Services → Add Integration, where the flow preselects this source.
-        """
-        if user_input is not None:
-            return self.async_create_entry(data=dict(self.config_entry.options))
-        return self.async_show_form(
-            step_id="add_monitor",
-            data_schema=vol.Schema({
-                vol.Required("done", default=True): selector.BooleanSelector(),
-            }),
-            description_placeholders={
-                "source_name": self.config_entry.title,
-            },
         )
 
     # -- credential reconfigure ----------------------------------------

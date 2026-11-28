@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Transport Victoria",
-        "description": "Set up the Transport Victoria data source.\n\nChoose **Enable realtime** to use live delays/cancellations (requires a subscription key), or **Scheduled times only** to use timetable data with no key.\n\nTo get a key: register at [opendata.transport.vic.gov.au]({portal_url}) → **My Account → Subscription Keys**.",
+        "description": "Set up the Transport Victoria data source.\n\nChoose **Enable realtime** to use live delays/cancellations (requires a subscription key), or **Scheduled times only** to use timetable data with no key.\n\nTo get a key: register at [opendata.transport.vic.gov.au]({portal_url}) \u2192 **My Account \u2192 Subscription Keys**.",
         "data": {
           "display_name": "Name",
           "enable_realtime": "Realtime"
@@ -11,14 +11,14 @@
       },
       "source_key": {
         "title": "Subscription Key",
-        "description": "Enter your PTV Open Data **subscription key**.\n\n⚠️ Do **not** use the token from *Data Platform API Tokens* — that is a different system and will be rejected.",
+        "description": "Enter your PTV Open Data **subscription key**.\n\n\u26a0\ufe0f Do **not** use the token from *Data Platform API Tokens* \u2014 that is a different system and will be rejected.",
         "data": {
           "api_key": "Subscription Key"
         }
       },
       "downloading": {
         "title": "Preparing Timetable Data",
-        "description": "Downloading the Transport Victoria timetable (~230 MB) and building the local database. This can take **1–10 minutes** depending on your connection and hardware.\n\nThis only happens once — future setups reuse the cached data.\n\nThis screen will advance automatically when everything is ready."
+        "description": "Downloading the Transport Victoria timetable (~230 MB) and building the local database. This can take **1\u201310 minutes** depending on your connection and hardware.\n\nThis only happens once \u2014 future setups reuse the cached data.\n\nThis screen will advance automatically when everything is ready."
       },
       "importing": {
         "title": "Preparing Timetable Data",
@@ -57,7 +57,7 @@
       },
       "dest": {
         "title": "Select Destination",
-        "description": "Choose where you want to go from **{stop_name}**.\n\n**All destinations** is recommended — it shows all departures regardless of direction and handles City Loop direction changes automatically.",
+        "description": "Choose where you want to go from **{stop_name}**.\n\n**All destinations** is recommended \u2014 it shows all departures regardless of direction and handles City Loop direction changes automatically.",
         "data": {
           "destination_choice": "Destination",
           "dest_query": "Search destination stops",
@@ -80,42 +80,42 @@
         }
       },
       "vehicle_tracker": {
-        "title": "Vehicle Tracker — Select Station",
+        "title": "Vehicle Tracker \u2014 Select Station",
         "description": "Choose the departure watch (station) this vehicle tracker should follow.",
         "data": {
           "parent_entry_id": "Departure Station"
         }
       },
       "vehicle_tracker_name": {
-        "title": "Vehicle Tracker — Name",
+        "title": "Vehicle Tracker \u2014 Name",
         "description": "Name this vehicle tracker. It will follow the next vehicle departing from **{station_name}**.",
         "data": {
           "watch_name": "Name"
         }
       },
       "route_tracker_mode": {
-        "title": "Route Tracker — Select Mode",
+        "title": "Route Tracker \u2014 Select Mode",
         "description": "Choose the transport mode for the route you want to track.",
         "data": {
           "mode": "Mode"
         }
       },
       "route_tracker_route": {
-        "title": "Route Tracker — Select Route",
+        "title": "Route Tracker \u2014 Select Route",
         "description": "Choose the line or route to track. All vehicles currently running on this route will be shown.",
         "data": {
           "route_id_select": "Select route"
         }
       },
       "route_tracker_filter": {
-        "title": "Route Tracker — Filter by Location?",
-        "description": "You can optionally filter to only show vehicles near a specific stop — useful for busy routes with many services.",
+        "title": "Route Tracker \u2014 Filter by Location?",
+        "description": "You can optionally filter to only show vehicles near a specific stop \u2014 useful for busy routes with many services.",
         "data": {
           "filter_mode": "Vehicle filter"
         }
       },
       "route_tracker_stop": {
-        "title": "Route Tracker — Reference Stop",
+        "title": "Route Tracker \u2014 Reference Stop",
         "description": "Choose a stop to use as the centre of your proximity filter.",
         "data": {
           "ref_stop_id": "Select stop",
@@ -123,7 +123,7 @@
         }
       },
       "route_tracker_proximity": {
-        "title": "Route Tracker — Proximity & Vehicle Count",
+        "title": "Route Tracker \u2014 Proximity & Vehicle Count",
         "description": "Set how close a vehicle must be to the reference stop, and how many tracker slots to create.",
         "data": {
           "proximity_radius": "Show vehicles within",
@@ -131,7 +131,7 @@
         }
       },
       "route_tracker_confirm": {
-        "title": "Route Tracker — Name",
+        "title": "Route Tracker \u2014 Name",
         "description": "Tracking **{route_name}**.",
         "data": {
           "watch_name": "Tracker name",
@@ -147,7 +147,7 @@
       },
       "import": {
         "title": "Import Watches as a Board",
-        "description": "Select one or more of your existing watches to copy into a new trip-group board. Your existing watches are **never** changed or removed — this only creates a new board.",
+        "description": "Select one or more of your existing watches to copy into a new trip-group board. Your existing watches are **never** changed or removed \u2014 this only creates a new board.",
         "data": {
           "watch_ids": "Watches to import",
           "board_name": "New board name"
@@ -163,12 +163,12 @@
     },
     "error": {
       "api_key_required": "Subscription key cannot be empty.",
-      "invalid_auth": "Invalid subscription key. Check your key at opendata.transport.vic.gov.au → My Account → Subscription Keys. Note: Data Platform API Tokens will not work here.",
+      "invalid_auth": "Invalid subscription key. Check your key at opendata.transport.vic.gov.au \u2192 My Account \u2192 Subscription Keys. Note: Data Platform API Tokens will not work here.",
       "cannot_connect": "Unable to reach the PTV API. Check your network connection and try again.",
       "db_not_ready": "Timetable data is still being prepared. Please wait a minute and try again.",
       "search_too_short": "Please enter at least 2 characters.",
       "no_stops_found": "No stops found. Try a different search term.",
-      "no_home_zone": "No Home zone configured in Home Assistant. Set your home location in Settings → System → General.",
+      "no_home_zone": "No Home zone configured in Home Assistant. Set your home location in Settings \u2192 System \u2192 General.",
       "no_stops_near_location": "No stops found within 500 m of the selected location. Try zooming in closer.",
       "location_required": "Please pick a location on the map.",
       "no_direct_service": "No direct service found between these two stops. Try a different destination or use All destinations.",
@@ -183,7 +183,7 @@
       "no_routes_found": "No routes found for this transport mode. Make sure the timetable data has been imported.",
       "no_watches": "No departure watches found. Add a Station Departures entry first, then add a Vehicle Tracker.",
       "no_pins": "This board has no pins yet.",
-      "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported — they stay as-is.",
+      "no_compatible_watches": "No compatible watches found. Transfer journeys and vehicle/route trackers cannot be imported \u2014 they stay as-is.",
       "schedule_unavailable": "The timetable data could not be downloaded. Check your internet connection and try again."
     }
   },
@@ -287,7 +287,7 @@
       },
       "board_reorder": {
         "title": "Reorder Pins",
-        "description": "Move a pin up, down, to first, or to last. Each move is applied immediately — choose \"Done\" when finished.",
+        "description": "Move a pin up, down, to first, or to last. Each move is applied immediately \u2014 choose \"Done\" when finished.",
         "data": {
           "pin_select": "Pin",
           "reorder_action": "Move"
@@ -303,12 +303,11 @@
       "source_menu": {
         "title": "Transport Victoria Source",
         "description": "Manage the data source.",
-        "menu_options": {
-          "add_monitor": "Add something to monitor",
-          "source_reconfigure": "Reconfigure credential",
-          "source_refresh": "Force schedule refresh",
-          "source_remove": "Remove source"
-        }
+        "menu_options": [
+          "source_reconfigure",
+          "source_refresh",
+          "source_remove"
+        ]
       },
       "source_reconfigure": {
         "title": "Reconfigure Credential",
@@ -316,13 +315,6 @@
         "data": {
           "enable_realtime": "Realtime",
           "api_key": "Subscription Key"
-        }
-      },
-      "add_monitor": {
-        "title": "Add Something to Monitor",
-        "description": "To add a watch, board, journey, or route tracker, go to **Settings → Devices & Services → Add Integration → Transport Victoria**. The flow preselects this source ({source_name}) and will not re-ask for credentials.",
-        "data": {
-          "done": "OK"
         }
       },
       "source_refresh": {
@@ -336,7 +328,7 @@
         "title": "Remove Source",
         "description": "Removing the source also removes every feature that depends on it.\n\n**Dependents**\n{dependents}",
         "data": {
-          "confirm": "I understand — remove the source and its features"
+          "confirm": "I understand \u2014 remove the source and its features"
         }
       }
     },
