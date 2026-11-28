@@ -274,6 +274,17 @@ async def test_dest_direction_choice_renders_direction_field(
     assert "direction_select" in recorded["fields"]
 
 
+async def test_dest_direction_rerender_keeps_radio_on_direction(
+    make_bus_flow, monkeypatch
+):
+    """The radio stays on "direction" so a direction submit isn't swallowed as
+    "All destinations"."""
+    flow, _ = make_bus_flow()
+    recorded = _record_schema(monkeypatch)
+    await flow.async_step_dest({"destination_choice": "direction"})
+    assert recorded["defaults"].get("destination_choice") == "direction"
+
+
 async def test_origin_query_default_persists_on_rerender(make_bus_flow, monkeypatch):
     flow, _ = make_bus_flow()
     recorded = _record_schema(monkeypatch)

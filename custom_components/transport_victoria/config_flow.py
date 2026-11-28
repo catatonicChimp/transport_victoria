@@ -884,9 +884,16 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         options.append(
             selector.SelectOptionDict(value="specific", label="Specific destination")
         )
+        # On a "Towards a direction" re-render keep the radio on "direction" so a
+        # user who picks from the Direction group without re-tapping the radio
+        # still submits destination_choice == "direction" (boards never reach
+        # show_direction).
+        choice_default = (
+            "direction" if show_direction else ("specific" if is_board else "__all__")
+        )
         schema_fields: dict[Any, Any] = {
             vol.Required(
-                "destination_choice", default="specific" if is_board else "__all__"
+                "destination_choice", default=choice_default
             ): selector.SelectSelector(
                 selector.SelectSelectorConfig(
                     options=options,
