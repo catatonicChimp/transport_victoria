@@ -1,6 +1,6 @@
 """T18.4 config-flow destination-search + line-selection tests (light env).
 
-Covers the TripView-style O/D journey's second and third steps — the
+Covers the TripView-style origin→destination flow's second and third steps — the
 destination search (``async_step_dest``) and the "lines found" dropdown
 (``async_step_lines``) — built on the T6 bus / V/Line fixtures.
 """
@@ -77,20 +77,6 @@ async def test_dest_search_selects_destination(make_bus_flow):
     assert captured["advanced_to_lines"] is True
     assert flow._config[CONF_DESTINATION_STOP_ID] == "B_CITY"
     assert flow._config[CONF_DESTINATION_STOP_NAME] == "City"
-
-
-async def test_dest_journey_choice_branches(make_bus_flow):
-    flow, captured = make_bus_flow()
-
-    async def fake_journey(user_input=None):
-        captured["journey"] = True
-        return {"step_id": "journey"}
-
-    # Patch on the instance (async_step_dest calls ``self.async_step_journey``).
-    flow.async_step_journey = fake_journey
-
-    await flow.async_step_dest({"destination_choice": "journey"})
-    assert captured["journey"] is True
 
 
 async def test_lines_lists_all_candidates_no_duplicates(bus_db: Path, monkeypatch):
@@ -252,10 +238,13 @@ def test_translations_have_destination_abort_and_steps():
     strings = json.loads((root / "strings.json").read_text())
     en = json.loads((root / "translations" / "en.json").read_text())
 
-    # The TripView O/D journey steps each have a title + description.
-    for step in ("origin", "lines", "journey", "journey_dest"):
+    # The TripView origin→destination steps each have a title + description.
+    for step in ("origin", "lines"):
         assert step in strings["config"]["step"], step
         assert "title" in strings["config"]["step"][step], step
+    # The journey (change-at-stop) steps are gone.
+    assert "journey" not in strings["config"]["step"]
+    assert "journey_dest" not in strings["config"]["step"]
 
     # The abort reason resolves on both the config and subentry surfaces.
     assert "destination_unreachable" in strings["config"]["abort"]

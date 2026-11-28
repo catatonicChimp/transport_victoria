@@ -1,4 +1,4 @@
-"""T18.4 TripView-style journey — real Home Assistant harness tests.
+"""T18.4 TripView-style origin→destination flow — real Home Assistant harness tests.
 
 Exercises the single four-step creation flow (origin → destination → line →
 confirm) against a real HA runtime, for both the watch and board entry types:

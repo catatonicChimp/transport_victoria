@@ -36,13 +36,9 @@ from .const import (
     CONF_ENABLE_REALTIME,
     CONF_ENTRY_TYPE,
     CONF_INCLUDE,
-    CONF_JOURNEY_DESTINATION_STOP_ID,
-    CONF_JOURNEY_DESTINATION_STOP_NAME,
-    CONF_JOURNEY_MODE,
     CONF_LABEL_FROM,
     CONF_LABEL_TO,
     CONF_MAX_VEHICLES,
-    CONF_MIN_TRANSFER_MINUTES,
     CONF_MODE,
     CONF_PLATFORM_FILTER,
     CONF_DEPARTURE_COUNT,
@@ -65,8 +61,6 @@ from .const import (
     CONF_STOP_NAME,
     CONF_SUBENTRY_ORDER,
     CONF_TRACK_VEHICLES,
-    CONF_TRANSFER_STOP_ID,
-    CONF_TRANSFER_STOP_NAME,
     CONF_WATCH_NAME,
     DEFAULT_DEPARTURE_COUNT,
     DEFAULT_MAX_VEHICLES,
@@ -334,8 +328,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         self._config: dict[str, Any] = {}
         self._stop_search_results: list[StopResult] = []
         self._dest_search_results: list[StopResult] = []
-        self._transfer_search_results: list[StopResult] = []
-        self._journey_dest_search_results: list[StopResult] = []
         self._zip_wait_task: asyncio.Task[None] | None = None
         self._db_wait_task: asyncio.Task[None] | None = None
         self._stop_method: str = "name"   # "name" | "distance" | "map"
@@ -344,7 +336,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         self._route_tracker_routes: list[RouteResult] = []
         self._dest_candidates: list[Destination] = []
         self._dest_route_id: str | None = None
-        # TripView-style O/D journey state: every (route, direction, terminal)
+        # TripView-style origin→destination flow state: every (route, direction, terminal)
         # candidate serving the origin→destination pair, and the user's pick.
         self._line_choices: list[LineCandidate] = []
         self._selected_line: LineCandidate | None = None
@@ -509,7 +501,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return await _validate_api_key(self.hass, api_key)
 
     # ------------------------------------------------------------------
-    # Step 2 — Origin stop search (TripView-style O/D journey, T18.4)
+    # Step 2 — Origin stop search (TripView-style origin→destination flow, T18.4)
     # ------------------------------------------------------------------
 
     async def async_step_origin(
@@ -770,13 +762,12 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     async def async_step_dest(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose a destination: All destinations, a specific stop, or a journey.
+        """Choose a destination: All destinations or a specific stop.
 
         A departure watch defaults to "All destinations" (no line step); a board's
         first pin needs a specific line, so boards only offer a specific
-        destination or a journey.  A specific destination that no direct service
-        reaches falls back to All destinations (watch) rather than aborting.
-        "Journey" is always an explicit choice, never an automatic fallback.
+        destination.  A specific destination that no direct service reaches falls
+        back to All destinations (watch) rather than aborting.
         """
         errors: dict[str, str] = {}
         db_path = _db_path(self.hass.config.config_dir)
@@ -792,9 +783,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 self._config[CONF_DESTINATION_STOP_ID] = None
                 self._config[CONF_DESTINATION_STOP_NAME] = None
                 return await self.async_step_confirm(None)
-
-            if choice == "journey" and not is_board:
-                return await self.async_step_journey(None)
 
             if (
                 CONF_DESTINATION_STOP_ID in user_input
@@ -825,9 +813,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         if not is_board:
             options.append(
                 selector.SelectOptionDict(value="__all__", label="All destinations")
-            )
-            options.append(
-                selector.SelectOptionDict(value="journey", label="Journey (change at stop)")
             )
         options.append(
             selector.SelectOptionDict(value="specific", label="Specific destination")
@@ -927,133 +912,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         )
 
     # ------------------------------------------------------------------
-    # Step 4b — Journey sub-flow
-    # ------------------------------------------------------------------
-
-    async def async_step_journey(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Configure a multi-leg journey: origin → transfer → destination."""
-        errors: dict[str, str] = {}
-        db_path = _db_path(self.hass.config.config_dir)
-        route_types = ROUTE_TYPE_MAP.get(self._config.get(CONF_MODE, "")) or ALL_ROUTE_TYPES
-
-        if user_input is not None:
-            # Phase 1: transfer stop selected → advance to the final-destination
-            # step.  No direct-service validation here: a journey's whole point
-            # is to change services, so origin→transfer need NOT be direct.
-            if CONF_TRANSFER_STOP_ID in user_input and user_input[CONF_TRANSFER_STOP_ID]:
-                transfer_id = user_input[CONF_TRANSFER_STOP_ID]
-                matching = [s for s in self._transfer_search_results if s.stop_id == transfer_id]
-                transfer_name = matching[0].stop_name if matching else transfer_id
-                self._config[CONF_TRANSFER_STOP_ID] = transfer_id
-                self._config[CONF_TRANSFER_STOP_NAME] = transfer_name
-                return await self.async_step_journey_dest()
-
-            # Search for transfer stop
-            # TODO(polish): auto-suggest interchange stops — prefer stops whose
-            # routes also serve the origin (``get_routes_for_stop(origin)``
-            # intersected with the search results), e.g. City Loop stations for
-            # an Upfield-line origin.  Manual search works today; this is a hint.
-            query = user_input.get("transfer_query", "").strip()
-            if len(query) < 2:
-                if query:
-                    errors["transfer_query"] = "search_too_short"
-            else:
-                self._transfer_search_results = await self.hass.async_add_executor_job(
-                    search_stops_by_name, db_path, query, route_types, 20
-                )
-                if not self._transfer_search_results:
-                    errors["transfer_query"] = "no_stops_found"
-
-        schema_fields: dict[Any, Any] = {
-            vol.Optional("transfer_query"): selector.TextSelector(
-                selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
-            ),
-        }
-        if self._transfer_search_results:
-            schema_fields[vol.Optional(CONF_TRANSFER_STOP_ID)] = _select_selector(
-                _stops_to_selector_options(self._transfer_search_results)
-            )
-
-        return self.async_show_form(
-            step_id="journey",
-            data_schema=vol.Schema(schema_fields),
-            errors=errors,
-            description_placeholders={
-                "stop_name": self._config.get(CONF_STOP_NAME, ""),
-            },
-        )
-
-    async def async_step_journey_dest(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Select the final destination for a journey watch."""
-        errors: dict[str, str] = {}
-        db_path = _db_path(self.hass.config.config_dir)
-        route_types = ROUTE_TYPE_MAP.get(self._config.get(CONF_MODE, "")) or ALL_ROUTE_TYPES
-
-        if user_input is not None:
-            # Final destination selected → store it and confirm.  No direct
-            # service validation: a journey's legs need not be direct (and the
-            # final leg is cross-mode in general).
-            if CONF_JOURNEY_DESTINATION_STOP_ID in user_input and user_input[CONF_JOURNEY_DESTINATION_STOP_ID]:
-                dest_id = user_input[CONF_JOURNEY_DESTINATION_STOP_ID]
-                matching = [s for s in self._journey_dest_search_results if s.stop_id == dest_id]
-                dest_name = matching[0].stop_name if matching else dest_id
-
-                self._config[CONF_JOURNEY_DESTINATION_STOP_ID] = dest_id
-                self._config[CONF_JOURNEY_DESTINATION_STOP_NAME] = dest_name
-                self._config[CONF_JOURNEY_MODE] = True
-                self._config[CONF_ALL_DESTINATIONS] = False
-                # Store min transfer minutes
-                raw_min = user_input.get(CONF_MIN_TRANSFER_MINUTES, "5")
-                self._config[CONF_MIN_TRANSFER_MINUTES] = int(raw_min)
-                return await self.async_step_confirm()
-
-            # Search
-            query = user_input.get("journey_dest_query", "").strip()
-            if len(query) < 2:
-                if query:
-                    errors["journey_dest_query"] = "search_too_short"
-            else:
-                self._journey_dest_search_results = await self.hass.async_add_executor_job(
-                    search_stops_by_name, db_path, query, route_types, 20
-                )
-                if not self._journey_dest_search_results:
-                    errors["journey_dest_query"] = "no_stops_found"
-
-        schema_fields: dict[Any, Any] = {
-            vol.Required(CONF_MIN_TRANSFER_MINUTES, default="5"): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[
-                        selector.SelectOptionDict(value="2", label="2 minutes"),
-                        selector.SelectOptionDict(value="5", label="5 minutes"),
-                        selector.SelectOptionDict(value="10", label="10 minutes"),
-                        selector.SelectOptionDict(value="15", label="15 minutes"),
-                    ],
-                    mode=selector.SelectSelectorMode.LIST,
-                )
-            ),
-            vol.Optional("journey_dest_query"): selector.TextSelector(
-                selector.TextSelectorConfig(type=selector.TextSelectorType.SEARCH)
-            ),
-        }
-        if self._journey_dest_search_results:
-            schema_fields[vol.Optional(CONF_JOURNEY_DESTINATION_STOP_ID)] = _select_selector(
-                _stops_to_selector_options(self._journey_dest_search_results)
-            )
-
-        return self.async_show_form(
-            step_id="journey_dest",
-            data_schema=vol.Schema(schema_fields),
-            errors=errors,
-            description_placeholders={
-                "transfer_stop": self._config.get(CONF_TRANSFER_STOP_NAME, ""),
-            },
-        )
-
-    # ------------------------------------------------------------------
     # Step 5 — Confirm (review screen, T18.4)
     # ------------------------------------------------------------------
 
@@ -1066,10 +924,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             dest = self._config.get(CONF_DESTINATION_STOP_NAME, "")
             return f"Route {route_title} from {origin} to {dest}"
         stop_name = self._config.get(CONF_STOP_NAME, "")
-        if self._config.get(CONF_JOURNEY_MODE):
-            transfer = self._config.get(CONF_TRANSFER_STOP_NAME, "")
-            final = self._config.get(CONF_JOURNEY_DESTINATION_STOP_NAME, "")
-            return f"{stop_name} → {transfer} → {final}"
         dest = self._config.get(CONF_DESTINATION_STOP_NAME, "")
         if not dest:
             # "All destinations" — no specific destination to name.
@@ -1089,7 +943,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return f"{direction} → {label}".strip() if direction else label
 
     async def _derive_mode_for_stop(self, db_path: Path, stop_id: str) -> str:
-        """Derive a config mode for a journey watch from the origin's routes."""
+        """Derive a config mode for an all-destinations watch from its routes."""
         routes = await self.hass.async_add_executor_job(
             get_routes_for_stop, db_path, stop_id, ALL_ROUTE_TYPES
         )
@@ -1098,42 +952,14 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         return MODE_METRO
 
     async def _create_watch_entry(
-        self, name: str, journey_mode: bool
+        self, name: str
     ) -> ConfigFlowResult:
-        """Build and create a watch entry from the selected line / journey.
+        """Build and create a watch entry from the selected line.
 
         The stored schema stays identical to the previous watch flow (no key
         renames): ``stop_id``/``destination_stop_id``/``direction``/``mode`` etc.
         """
         db_path = _db_path(self.hass.config.config_dir)
-        if journey_mode:
-            data: dict[str, Any] = {
-                CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
-                CONF_MODE: await self._derive_mode_for_stop(
-                    db_path, self._config[CONF_STOP_ID]
-                ),
-                CONF_STOP_ID: self._config[CONF_STOP_ID],
-                CONF_STOP_NAME: self._config.get(CONF_STOP_NAME, ""),
-                CONF_WATCH_NAME: name,
-                CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
-                CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
-                CONF_ALL_DESTINATIONS: False,
-                CONF_JOURNEY_MODE: True,
-                CONF_TRANSFER_STOP_ID: self._config.get(CONF_TRANSFER_STOP_ID),
-                CONF_TRANSFER_STOP_NAME: self._config.get(CONF_TRANSFER_STOP_NAME, ""),
-                CONF_JOURNEY_DESTINATION_STOP_ID: self._config.get(
-                    CONF_JOURNEY_DESTINATION_STOP_ID
-                ),
-                CONF_JOURNEY_DESTINATION_STOP_NAME: self._config.get(
-                    CONF_JOURNEY_DESTINATION_STOP_NAME, ""
-                ),
-                CONF_MIN_TRANSFER_MINUTES: self._config.get(
-                    CONF_MIN_TRANSFER_MINUTES, 5
-                ),
-            }
-            return self.async_create_entry(
-                title=name, data=data, options={CONF_TRACK_VEHICLES: False}
-            )
 
         line = self._selected_line
         if line is None:
@@ -1226,7 +1052,6 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         """
         entry_type = self._config.get(CONF_ENTRY_TYPE, ENTRY_TYPE_WATCH)
         is_board = entry_type == ENTRY_TYPE_BOARD
-        journey_mode = bool(self._config.get(CONF_JOURNEY_MODE))
         suggested = self._suggested_name()
 
         if user_input is not None:
@@ -1237,7 +1062,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 )
                 return await self._create_board_and_pin(board_name)
             name = (user_input.get(CONF_WATCH_NAME, "") or "").strip() or suggested
-            return await self._create_watch_entry(name, journey_mode)
+            return await self._create_watch_entry(name)
 
         schema_fields: dict[Any, Any] = {}
         if is_board:
@@ -1280,7 +1105,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             self._config[CONF_ENTRY_TYPE] = entry_type
             if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
                 return await self.async_step_route_tracker_mode()
-            # Watch and board share the same TripView-style O/D journey,
+            # Watch and board share the same TripView-style origin→destination flow,
             # starting at the origin stop search.
             return await self.async_step_origin()
 

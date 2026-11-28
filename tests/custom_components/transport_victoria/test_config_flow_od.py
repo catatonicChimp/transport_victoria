@@ -1,10 +1,10 @@
-"""T18.4 TripView-style stop-pair journey tests (light env, stub style).
+"""T18.4 TripView-style origin→destination creation-flow tests (light env).
 
-Covers the single four-step creation flow (origin → destination → line →
-confirm) for both watch and board entry types, plus the derived-mode helper and
-the watch data-schema backward-compat guarantee.
+Covers the single origin → destination → line → confirm creation flow for both
+watch and board entry types, plus the derived-mode helper and the watch
+data-schema backward-compat guarantee.
 
-Real-runtime equivalents live in ``test_config_flow_journey_ha.py``.
+Real-runtime equivalents live in ``test_config_flow_od_ha.py``.
 """
 
 from __future__ import annotations
@@ -22,17 +22,12 @@ from custom_components.transport_victoria.const import (
     CONF_DESTINATION_STOP_ID,
     CONF_DIRECTION,
     CONF_ENTRY_TYPE,
-    CONF_JOURNEY_DESTINATION_STOP_ID,
-    CONF_JOURNEY_MODE,
-    CONF_MIN_TRANSFER_MINUTES,
     CONF_MODE,
     CONF_ROUTE_ID,
     CONF_ROUTE_ID_FILTER,
     CONF_SOURCE_ENTRY_ID,
     CONF_STOP_ID,
     CONF_STOP_NAME,
-    CONF_TRANSFER_STOP_ID,
-    CONF_TRANSFER_STOP_NAME,
     CONF_WATCH_NAME,
     ENTRY_TYPE_BOARD,
     ENTRY_TYPE_WATCH,
@@ -178,119 +173,48 @@ def test_mode_for_route_type_helper():
     assert cf._mode_for_route_type(None) == "metro"
     assert cf._mode_for_route_type(999) == "metro"  # unknown → fallback
 
-
 # ---------------------------------------------------------------------------
-# Journey ("change at stop") sub-flow — no direct-service validation
+# Destination-step options (the Journey "change at stop" choice was removed)
 # ---------------------------------------------------------------------------
 
 
-async def test_journey_flow_walk_has_no_direct_service_error(
+async def test_dest_options_watch_has_all_and_specific_no_journey(
     bus_db: Path, monkeypatch
 ):
-    """origin → journey → transfer → final destination → confirm, with no
-    "No direct service found" error anywhere (a journey's legs need not be
-    direct)."""
+    """A watch's destination step offers All destinations + Specific, never Journey."""
     flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+    values: list = []
 
-    captured: dict = {}
+    def _record_option(**kwargs):
+        values.append(kwargs.get("value"))
+        return object()
 
-    async def fake_confirm(user_input=None):
-        captured["confirm"] = True
-        return {"step_id": "confirm"}
-
-    monkeypatch.setattr(flow, "async_step_confirm", fake_confirm)
-
-    # origin
-    await flow.async_step_origin({"query": "Sun"})
-    await flow.async_step_origin({CONF_STOP_ID: "B_SUNSHINE"})
-
-    # destination → journey (explicit choice)
-    await flow.async_step_dest({"destination_choice": "journey"})
-
-    # transfer stop search + select → advances straight to journey_dest
-    await flow.async_step_journey({"transfer_query": "Foo"})
-    await flow.async_step_journey({CONF_TRANSFER_STOP_ID: "B_FOOTSCRAY"})
-    assert flow._config[CONF_TRANSFER_STOP_ID] == "B_FOOTSCRAY"
-    assert flow._config[CONF_TRANSFER_STOP_NAME] == "Footscray"
-
-    # final destination search + select → confirm
-    await flow.async_step_journey_dest({"journey_dest_query": "Cit"})
-    await flow.async_step_journey_dest({
-        CONF_JOURNEY_DESTINATION_STOP_ID: "B_CITY",
-        CONF_MIN_TRANSFER_MINUTES: "5",
-    })
-
-    assert captured["confirm"] is True
-    assert flow._config[CONF_JOURNEY_MODE] is True
-    assert flow._config[CONF_JOURNEY_DESTINATION_STOP_ID] == "B_CITY"
-
-
-async def test_journey_transfer_not_directly_reachable_still_advances(
-    bus_db: Path, monkeypatch
-):
-    """Even a transfer with no direct origin→transfer service advances (the
-    whole point of a journey is to change services) — no "no_direct_service"."""
-    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
-
-    advanced: dict = {}
-
-    async def fake_journey_dest(user_input=None):
-        advanced["reached"] = True
-        return {"step_id": "journey_dest"}
-
-    monkeypatch.setattr(flow, "async_step_journey_dest", fake_journey_dest)
-
-    await flow.async_step_origin({"query": "Sun"})
-    await flow.async_step_origin({CONF_STOP_ID: "B_SUNSHINE"})
-    await flow.async_step_dest({"destination_choice": "journey"})
-
-    # Select a transfer WITHOUT going through the search (so the stop id need
-    # not be directly reachable): the flow must not validate it.
-    flow._transfer_search_results = [
-        cf.StopResult(
-            stop_id="B_KENSINGTON", stop_name="Kensington", stop_lat=None,
-            stop_lon=None, location_type=0, parent_station=None,
-        )
-    ]
-    await flow.async_step_journey({CONF_TRANSFER_STOP_ID: "B_KENSINGTON"})
-
-    assert advanced["reached"] is True
-    assert flow._config[CONF_TRANSFER_STOP_ID] == "B_KENSINGTON"
-
-
-async def test_board_dest_has_no_journey_option(bus_db: Path, monkeypatch):
-    """Boards (and their pins) are route-scoped, so a board's destination step
-    neither offers nor routes to the journey choice — only a watch gets it."""
-    flow = _new_flow(bus_db, ENTRY_TYPE_BOARD, monkeypatch)
-
-    journey_called: dict = {}
-
-    async def fake_journey(user_input=None):
-        journey_called["called"] = True
-        return {"step_id": "journey"}
-
-    monkeypatch.setattr(flow, "async_step_journey", fake_journey)
+    monkeypatch.setattr(cf.selector, "SelectOptionDict", _record_option)
     monkeypatch.setattr(
         flow, "async_show_form", lambda **kw: {"type": "form", "step_id": "dest"}
     )
 
-    # Submitting "journey" on a board does NOT branch to the journey step.
-    await flow.async_step_dest({"destination_choice": "journey"})
-    assert journey_called.get("called") is not True
+    await flow.async_step_dest(None)
+
+    assert "__all__" in values
+    assert "specific" in values
+    assert "journey" not in values
 
 
-async def test_watch_dest_offers_journey(bus_db: Path, monkeypatch):
-    """A departure watch's destination step DOES offer the journey choice."""
-    flow = _new_flow(bus_db, ENTRY_TYPE_WATCH, monkeypatch)
+async def test_dest_options_board_has_specific_only(bus_db: Path, monkeypatch):
+    """A board's destination step offers only Specific (no All, no Journey)."""
+    flow = _new_flow(bus_db, ENTRY_TYPE_BOARD, monkeypatch)
+    values: list = []
 
-    branched: dict = {}
+    def _record_option(**kwargs):
+        values.append(kwargs.get("value"))
+        return object()
 
-    async def fake_journey(user_input=None):
-        branched["journey"] = True
-        return {"step_id": "journey"}
+    monkeypatch.setattr(cf.selector, "SelectOptionDict", _record_option)
+    monkeypatch.setattr(
+        flow, "async_show_form", lambda **kw: {"type": "form", "step_id": "dest"}
+    )
 
-    monkeypatch.setattr(flow, "async_step_journey", fake_journey)
+    await flow.async_step_dest(None)
 
-    await flow.async_step_dest({"destination_choice": "journey"})
-
-    assert branched["journey"] is True
+    assert values == ["specific"]

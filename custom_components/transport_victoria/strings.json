@@ -79,22 +79,6 @@
           "line_select": "Select line"
         }
       },
-      "journey": {
-        "title": "Transfer Stop",
-        "description": "Choose the stop where you change services on your journey from **{stop_name}**.",
-        "data": {
-          "transfer_query": "Search transfer stops",
-          "transfer_stop_id": "Select transfer stop"
-        }
-      },
-      "journey_dest": {
-        "title": "Final Destination",
-        "description": "Choose the final destination of your journey.",
-        "data": {
-          "journey_dest_query": "Search destination stops",
-          "journey_destination_stop_id": "Select destination"
-        }
-      },
       "confirm": {
         "title": "Name This Watch",
         "description": "Tracking **{mode}** from **{stop_name}** to **{destination}**.\n\n{disruption}{city_loop_note}",
@@ -194,7 +178,6 @@
       "no_home_zone": "No Home zone configured in Home Assistant. Set your home location in Settings \u2192 System \u2192 General.",
       "no_stops_near_location": "No stops found within 500 m of the selected location. Try zooming in closer.",
       "location_required": "Please pick a location on the map.",
-      "no_direct_service": "No direct service found between these two stops. Try a different destination or use All destinations.",
       "destination_unreachable": "No service runs from your origin stop to this destination. Pick All destinations or another destination.",
       "invalid_route": "Route not found. Please select a route from the list.",
       "select_at_least_one": "Select at least one watch to import.",
