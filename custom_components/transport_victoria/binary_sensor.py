@@ -68,6 +68,21 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the disruption binary sensor for a config entry."""
+    if source_is_scheduled_only(hass):
+        # Scheduled-only: there is no service-alert feed (no credential), so the
+        # disruption sensor is NOT created — it can never certify "no disruption",
+        # and a created-but-unavailable placeholder would only clutter the UI.
+        # Adding a key later via hub reconfigure reloads this entry, which then
+        # creates the sensor normally.  (T18.2 — NOT CREATED is the fresh-setup
+        # semantic; removing a key later leaves the previously-created entity
+        # "unavailable" via HA's registry restore — still never a false OFF.  The
+        # entity-level ``available`` guard below is defense-in-depth.)
+        _LOGGER.debug(
+            "Scheduled-only: not creating the disruption sensor for '%s'",
+            entry.title,
+        )
+        return
+
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_BOARD:
         coordinator: BoardCoordinator = entry.runtime_data
         async_add_entities([BoardDisruptionBinarySensor(coordinator, entry)])
@@ -128,9 +143,10 @@ class BoardDisruptionBinarySensor(
     def available(self) -> bool:
         """Unavailable when the coordinator failed OR an alert feed failed.
 
-        Also unavailable (never a false OFF) in scheduled-only mode: without a
-        credential there is no service-alert feed, so "no disruption" cannot be
-        certified.
+        Defense-in-depth: also unavailable (never a false OFF) in scheduled-only
+        mode.  The primary gate is in ``async_setup_entry`` (the sensor is NOT
+        created in scheduled-only mode); this covers a key removed without a
+        reload leaving a still-registered entity.
         """
         if _scheduled_only(self):
             return False
@@ -208,8 +224,9 @@ class PTVDisruptionBinarySensor(
     def available(self) -> bool:
         """Unavailable (never a false OFF) in scheduled-only mode.
 
-        Without a credential there is no service-alert feed, so "no disruption"
-        cannot be certified — the sensor reports unavailable rather than OFF.
+        Defense-in-depth: the primary gate is in ``async_setup_entry`` (this
+        sensor is NOT created in scheduled-only mode); without a credential
+        there is no service-alert feed, so "no disruption" cannot be certified.
         """
         if _scheduled_only(self):
             return False

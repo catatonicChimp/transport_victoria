@@ -48,8 +48,22 @@ from .const import (
 )
 from .coordinator import PTVDataUpdateCoordinator
 from .models import CoordinatorData, Departure
+from .source import source_is_scheduled_only
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _scheduled_only(entity: object) -> bool:
+    """Return True when the entity's source hub is in scheduled-only mode.
+
+    Defensive (mirrors ``binary_sensor._scheduled_only``): the light-env entity
+    tests construct entities directly without a real ``hass`` handle; a
+    missing/stub hass yields "no source hub", which is not scheduled-only.
+    """
+    hass = getattr(entity, "hass", None)
+    if hass is None:
+        return False
+    return source_is_scheduled_only(hass)
 
 
 def _pictogram_url(mode: str) -> str | None:
@@ -169,13 +183,18 @@ class BoardDepartureSensor(CoordinatorEntity[BoardCoordinator], SensorEntity):  
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        # ``scheduled_only`` is the persistent per-entry banner (§5.3): present
+        # (True) whenever the board is in scheduled-only mode, even with no rows.
         data = self._data
         row = self._row
+        attrs: dict[str, Any] = {}
+        if _scheduled_only(self):
+            attrs["scheduled_only"] = True
         if data is None or row is None:
-            return {}
+            return attrs
 
         pin = self.coordinator.pin_by_key.get(row.pin_key)
-        attrs: dict[str, Any] = {
+        attrs.update({
             "route": row.route_short_name or row.route_long_name,
             "route_number": row.route_short_name,
             "destination": row.destination_label,
@@ -200,7 +219,7 @@ class BoardDepartureSensor(CoordinatorEntity[BoardCoordinator], SensorEntity):  
             "pin_label_to": (
                 pin.label_to if pin is not None else row.destination_label
             ),
-        }
+        })
         # sync_index surfaces once, on departure_1 only (compact, documented).
         if self._slot == 1:
             attrs["sync_index"] = data.sync_index
@@ -285,12 +304,18 @@ class PTVDepartureSensor(CoordinatorEntity[PTVDataUpdateCoordinator], SensorEnti
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        # ``scheduled_only`` is the persistent per-entry banner (§5.3): present
+        # (True) whenever the watch is in scheduled-only mode, even with no rows,
+        # so the frontend/automations can see the watch is timetable-only.
+        attrs: dict[str, Any] = {}
+        if _scheduled_only(self):
+            attrs["scheduled_only"] = True
         dep = self._departure
         if dep is None:
-            return {}
+            return attrs
         local_now = dt_util.now().replace(tzinfo=None)
         delta = dep.actual_departure - local_now
-        attrs: dict[str, Any] = {
+        attrs.update({
             "minutes_until": int(delta.total_seconds() // 60),
             "scheduled_time": dep.scheduled_departure.isoformat(),
             "actual_time": dep.actual_departure.isoformat(),
@@ -308,7 +333,7 @@ class PTVDepartureSensor(CoordinatorEntity[PTVDataUpdateCoordinator], SensorEnti
             "platform": dep.platform,
             "service_type": dep.service_type,
             "trip_id": dep.trip_id,
-        }
+        })
         # Journey mode extras
         if dep.total_journey_minutes is not None:
             attrs["transfer_stop"] = dep.transfer_stop_name
