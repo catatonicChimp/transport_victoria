@@ -10,13 +10,21 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import custom_components.transport_victoria as tv
 from custom_components.transport_victoria import ScheduleManager
 from custom_components.transport_victoria.const import (
+    CONF_API_KEY,
+    CONF_ENTRY_TYPE,
+    CONF_MODE,
+    CONF_SOURCE_ENTRY_ID,
+    CONF_STOP_ID,
     DOMAIN,
+    ENTRY_TYPE_SOURCE,
+    ENTRY_TYPE_WATCH,
     READINESS_CONFIGURED,
     READINESS_DOWNLOADING,
     READINESS_IMPORTING,
@@ -244,3 +252,83 @@ async def test_refresh_preserves_cancellation(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         await manager.refresh(["2"])
+
+
+class _AssocConfigEntries:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def async_entries(self, domain):
+        return self._entries
+
+    def async_get_entry(self, sid):
+        return next((e for e in self._entries if e.entry_id == sid), None)
+
+    def async_update_entry(self, entry, **kw):
+        if "data" in kw:
+            entry.data = dict(kw["data"])
+
+
+class _AssocHass:
+    def __init__(self, entries):
+        self.data = {DOMAIN: {}}
+        self.config_entries = _AssocConfigEntries(entries)
+
+
+def _assoc_entry(entry_id, data):
+    return SimpleNamespace(entry_id=entry_id, data=dict(data), options={}, title=entry_id)
+
+
+async def test_ensure_feature_associated_skips_without_hub():
+    """Defensive stamp must not strip a feature's key before a hub carries one."""
+    feature = _assoc_entry("w1", {CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH, CONF_API_KEY: "k"})
+    hass = _AssocHass([feature])
+    result = await tv._ensure_feature_associated(hass, feature)
+    assert result is None
+    assert CONF_API_KEY in feature.data  # key preserved — no hub to carry it
+
+
+async def test_ensure_feature_associated_stamps_and_strips():
+    hub = _assoc_entry("hub1", {CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE, CONF_API_KEY: "k"})
+    feature = _assoc_entry(
+        "w1",
+        {CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH, CONF_MODE: "metro", CONF_STOP_ID: "14308", CONF_API_KEY: "k"},
+    )
+    hass = _AssocHass([hub, feature])
+    result = await tv._ensure_feature_associated(hass, feature)
+    assert result is not None
+    assert feature.data[CONF_SOURCE_ENTRY_ID] == "hub1"
+    assert CONF_API_KEY not in feature.data
+
+
+async def test_migration_task_swallows_exceptions(monkeypatch):
+    """The fire-and-forget migration wrapper never raises out of the task."""
+    hass = _ManagerHass()
+
+    async def boom(hass):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(tv, "async_migrate_entries_to_source", boom)
+    await tv._migration_task(hass)  # must not raise
+
+
+async def test_scheduled_only_hub_preserves_feature_key_until_it_gains_one():
+    """A scheduled-only hub must never strip a feature's only credential."""
+    hub = _assoc_entry("hub1", {CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE})  # keyless
+    feature = _assoc_entry(
+        "w1",
+        {CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH, CONF_MODE: "metro", CONF_STOP_ID: "14308", CONF_API_KEY: "legacy-key"},
+    )
+    hass = _AssocHass([hub, feature])
+
+    # Association is stamped, but the feature's key is PRESERVED (no recovery source yet).
+    result = await tv._ensure_feature_associated(hass, feature)
+    assert result is not None
+    assert feature.data[CONF_SOURCE_ENTRY_ID] == "hub1"
+    assert feature.data.get(CONF_API_KEY) == "legacy-key"
+
+    # Hub reconfigure adds a credential → the next reconcile strips the copy.
+    hub.data[CONF_API_KEY] = "new-key"
+    await tv._ensure_feature_associated(hass, feature)
+    assert CONF_API_KEY not in feature.data
+    assert feature.data[CONF_SOURCE_ENTRY_ID] == "hub1"

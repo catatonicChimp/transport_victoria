@@ -53,6 +53,7 @@ from .source import (
     async_reload_dependents,
     async_remove_dependents,
     find_dependents,
+    get_source_api_key,
     get_source_entry,
     is_source_entry,
     source_lock,
@@ -759,10 +760,22 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignor
             cache_headers=True,
         ),
     ])
-    # Ownership migration (T18.1): associate pre-existing feature entries with a
-    # source hub, creating one (from the carried-over credential) if needed.
-    await async_migrate_entries_to_source(hass)
+    # Ownership reconciliation (T18.1) runs as a fire-and-forget task — NOT
+    # awaited here.  Awaiting it would make the hub-creation config flow call
+    # ``async_setup_component`` re-entrantly, which awaits this very setup's
+    # future and deadlocks until HA's bootstrap interrupt cancels it (the 10s+
+    # "Setup is taking over 10 seconds" stall).  Deferred, the migration runs
+    # after the component is marked loaded and the flow no longer re-enters.
+    hass.async_create_task(_migration_task(hass))
     return True
+
+
+async def _migration_task(hass: HomeAssistant) -> None:
+    """Run the ownership reconciliation in the background (exception-safe)."""
+    try:
+        await async_migrate_entries_to_source(hass)
+    except Exception as exc:  # noqa: BLE001 - never kill the background task
+        _LOGGER.warning("Ownership migration failed: %s", exc)
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -849,11 +862,12 @@ async def async_migrate_entries_to_source(hass: HomeAssistant) -> ConfigEntry | 
     changes), not just a one-shot migration:
 
       1. Ensure the source hub exists (create it from any feature's carried-over
-         credential when none exists; serialize with F2's source-creation lock).
+         credential when none exists; singleton race-safe via
+         ``async_set_unique_id``, NOT under the source lock).
       2. For EVERY feature entry whose ``source_entry_id`` is missing or dangling
          (points at a removed hub), set it to the live hub id AND strip the
          feature's local ``api_key`` copy (the hub alone owns credentials), then
-         reload that feature once.
+         reload that feature once — under ``source_lock``.
 
     Returns the source entry, or None when there are no feature entries to
     reconcile.
@@ -866,43 +880,51 @@ async def async_migrate_entries_to_source(hass: HomeAssistant) -> ConfigEntry | 
         return get_source_entry(hass)
     _MIGRATION_RUNNING = True
     try:
-        async with source_lock():
-            entries = hass.config_entries.async_entries(DOMAIN)
-            hub = get_source_entry(hass)
-
-            # 1. Ensure the hub exists.
-            features = [e for e in entries if not is_source_entry(e)]
+        # 1. Ensure the hub exists — NOT under ``source_lock``.  ``flow.async_init``
+        #    (hub creation) re-enters HA's component setup, which synchronously
+        #    sets up every feature entry; those setups call
+        #    ``_ensure_feature_associated`` which takes ``source_lock`` — so
+        #    holding the lock across creation would deadlock.  The singleton is
+        #    already race-safe via ``async_set_unique_id`` in the flow.
+        hub = get_source_entry(hass)
+        if hub is None:
+            features = [
+                e for e in hass.config_entries.async_entries(DOMAIN)
+                if not is_source_entry(e)
+            ]
+            if not features:
+                return None
+            carried_key = next(
+                (str(e.data.get(CONF_API_KEY)) for e in features if e.data.get(CONF_API_KEY)),
+                "",
+            ) or None
+            hub = await _create_source_entry(hass, carried_key or "")
             if hub is None:
-                if not features:
-                    return None
-                carried_key = next(
-                    (str(e.data.get(CONF_API_KEY)) for e in features if e.data.get(CONF_API_KEY)),
-                    "",
-                ) or None
-                hub = await _create_source_entry(hass, carried_key or "")
-                if hub is None:
-                    return None
-            hub_id = hub.entry_id
+                return None
 
-            # 2. Reconcile every feature: associate + strip local credentials.
-            for entry in features:
-                data = dict(entry.data)
-                sid = data.get(CONF_SOURCE_ENTRY_ID)
-                dangling = sid is not None and hass.config_entries.async_get_entry(sid) is None
-                needs_association = sid != hub_id or dangling
-                has_local_key = bool(data.get(CONF_API_KEY))
-                if not needs_association and not has_local_key:
+        # 2. Reconcile every feature under the lock (stamp + conditional strip).
+        async with source_lock():
+            hub = get_source_entry(hass) or hub
+            hub_id = hub.entry_id
+            for entry in hass.config_entries.async_entries(DOMAIN):
+                if is_source_entry(entry):
                     continue
-                data[CONF_SOURCE_ENTRY_ID] = hub_id
-                data.pop(CONF_API_KEY, None)
-                hass.config_entries.async_update_entry(entry, data=data)
+                new_data = _reconcile_feature_data(hass, entry, hub_id)
+                if new_data is None:
+                    continue
+                hass.config_entries.async_update_entry(entry, data=new_data)
                 _LOGGER.info(
                     "Reconciled feature entry '%s' with source hub %s", entry.title, hub_id
                 )
                 if getattr(entry, "runtime_data", None) is not None:
                     await hass.config_entries.async_reload(entry.entry_id)
 
-            return hub
+        return hub
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - background task must not die
+        _LOGGER.warning("Ownership reconciliation failed: %s", exc)
+        return None
     finally:
         _MIGRATION_RUNNING = False
 
@@ -932,6 +954,65 @@ async def _create_source_entry(hass: HomeAssistant, api_key: str) -> ConfigEntry
     return hub
 
 
+def _reconcile_feature_data(
+    hass: HomeAssistant, entry: ConfigEntry, hub_id: str
+) -> dict | None:
+    """Return the reconciled data dict for a feature entry, or None if unchanged.
+
+    Shared by BOTH association paths (the background-migration reconcile loop and
+    the defensive setup stamp) so they cannot diverge:
+
+      * ``source_entry_id`` is always stamped (association).
+      * the feature's local ``api_key`` copy is stripped ONLY when the hub
+        carries a credential — a scheduled-only hub must never destroy a
+        feature's only credential (that would degrade a realtime install to
+        scheduled-only with no recovery source).
+    """
+    data = dict(entry.data)
+    sid = data.get(CONF_SOURCE_ENTRY_ID)
+    dangling = sid is not None and hass.config_entries.async_get_entry(sid) is None
+    needs_association = sid != hub_id or dangling
+    has_local_key = bool(data.get(CONF_API_KEY))
+    hub_has_credential = get_source_api_key(hass) is not None
+
+    if needs_association:
+        data[CONF_SOURCE_ENTRY_ID] = hub_id
+    if has_local_key and hub_has_credential:
+        data.pop(CONF_API_KEY, None)
+
+    return None if data == dict(entry.data) else data
+
+
+async def _ensure_feature_associated(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> ConfigEntry | None:
+    """Associate a feature entry with the singleton hub (defensive setup stamp).
+
+    The background migration normally reconciles associations, but stamping here
+    too makes association *guaranteed* regardless of load state, restart count,
+    or whether the migration has run yet.  A single combined data update stamps
+    ``source_entry_id`` and (only when the hub carries a credential) strips the
+    feature's local ``api_key``.  Returns the hub (or None when no hub exists
+    yet — nothing is stripped then, so a feature never loses its key before a
+    hub carries a credential).  Serialized with the migration via ``source_lock``.
+    """
+    if get_source_entry(hass) is None:
+        return None
+    async with source_lock():
+        hub = get_source_entry(hass)
+        if hub is None:
+            return None
+        new_data = _reconcile_feature_data(hass, entry, hub.entry_id)
+        if new_data is not None:
+            hass.config_entries.async_update_entry(entry, data=new_data)
+            _LOGGER.info(
+                "Associated feature entry '%s' with source hub %s (setup stamp)",
+                entry.title,
+                hub.entry_id,
+            )
+    return hub
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up PTV from a config entry."""
     _LOGGER.debug("Setting up PTV entry: %s", entry.entry_id)
@@ -946,6 +1027,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if entry_type == ENTRY_TYPE_SOURCE:
         return await _async_setup_source(hass, entry)
+
+    # Defensive association: guarantee the feature is linked to the singleton
+    # hub (and its copied credential stripped) before setup, regardless of
+    # whether the background migration has run yet or was interrupted.
+    await _ensure_feature_associated(hass, entry)
 
     if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
         return await _async_setup_legacy_vehicle_tracker(hass, entry)

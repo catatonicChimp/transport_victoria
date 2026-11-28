@@ -43,14 +43,17 @@ import custom_components.transport_victoria as tv  # noqa: E402
 from custom_components.transport_victoria import config_flow as cf  # noqa: E402
 from custom_components.transport_victoria import source as src  # noqa: E402
 from custom_components.transport_victoria.const import (  # noqa: E402
+    CONF_ALL_DESTINATIONS,
     CONF_API_KEY,
     CONF_DISPLAY_NAME,
     CONF_ENABLE_REALTIME,
     CONF_ENTRY_TYPE,
     CONF_MODE,
+    CONF_ROUTE_ID,
     CONF_SOURCE_ENTRY_ID,
     CONF_STOP_ID,
     DOMAIN,
+    ENTRY_TYPE_ROUTE_TRACKER,
     ENTRY_TYPE_SOURCE,
     ENTRY_TYPE_WATCH,
     MODE_BUS,
@@ -406,3 +409,88 @@ async def test_force_refresh_surfaces_failure_then_success(hass, monkeypatch):
     assert result["type"] is FlowResultType.FORM
     assert result["description_placeholders"]["refresh_outcome"] == "Schedule is ready."
     assert src.source_readiness(hass, hub.entry_id) == READINESS_READY
+
+
+async def test_legacy_entries_migrate_and_are_fully_associated(hass):
+    """Reproduction of the live defect: v0.1.0-era entries (own api_key, no
+    source_entry_id, missing/varying modern fields) on an instance WITHOUT a
+    hub → the migration creates the hub AND stamps + strips every feature."""
+    legacy_watch = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH,
+            CONF_MODE: "metro",
+            CONF_STOP_ID: "14308",
+            CONF_ALL_DESTINATIONS: True,
+            CONF_API_KEY: "legacy-key",
+            # legacy shape: no stop_name / watch_name (modern fields absent)
+        },
+        title="Coburg",
+    )
+    legacy_watch.add_to_hass(hass)
+    tracker6 = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_ROUTE_TRACKER,
+            CONF_MODE: "metro",
+            CONF_ROUTE_ID: "R6",
+            CONF_API_KEY: "legacy-key",
+        },
+        title="6 Tracker",
+    )
+    tracker6.add_to_hass(hass)
+    tracker1 = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_ROUTE_TRACKER,
+            CONF_MODE: "metro",
+            CONF_ROUTE_ID: "R1",
+            CONF_API_KEY: "legacy-key",
+        },
+        title="1 Tracker",
+    )
+    tracker1.add_to_hass(hass)
+
+    hub = await tv.async_migrate_entries_to_source(hass)
+
+    assert hub is not None
+    assert hub.data[CONF_ENTRY_TYPE] == ENTRY_TYPE_SOURCE
+    assert hub.data[CONF_API_KEY] == "legacy-key"
+
+    for entry in (legacy_watch, tracker6, tracker1):
+        e = hass.config_entries.async_get_entry(entry.entry_id)
+        assert e.data[CONF_SOURCE_ENTRY_ID] == hub.entry_id
+        assert CONF_API_KEY not in e.data  # hub alone owns the credential
+
+    # Idempotent: a second restart reconciles to a no-op.
+    data_after_first = {
+        eid: dict(hass.config_entries.async_get_entry(eid).data)
+        for eid in (legacy_watch.entry_id, tracker6.entry_id, tracker1.entry_id)
+    }
+    await tv.async_migrate_entries_to_source(hass)
+    for eid in data_after_first:
+        assert dict(hass.config_entries.async_get_entry(eid).data) == data_after_first[eid]
+
+
+async def test_feature_setup_stamps_association_defensively(hass):
+    """A feature set up after the hub exists is stamped even without migration."""
+    hub = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE, CONF_API_KEY: "k"},
+        unique_id="transport_victoria_source",
+        title="Transport Victoria",
+    )
+    hub.add_to_hass(hass)
+
+    legacy = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ENTRY_TYPE: ENTRY_TYPE_WATCH, CONF_MODE: "metro", CONF_STOP_ID: "14308", CONF_API_KEY: "k"},
+        title="Coburg",
+    )
+    legacy.add_to_hass(hass)
+
+    await tv._ensure_feature_associated(hass, legacy)
+
+    e = hass.config_entries.async_get_entry(legacy.entry_id)
+    assert e.data[CONF_SOURCE_ENTRY_ID] == hub.entry_id
+    assert CONF_API_KEY not in e.data
