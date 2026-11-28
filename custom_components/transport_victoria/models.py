@@ -53,6 +53,7 @@ class Departure:
     scheduled_departure: datetime        # Absolute local datetime
     delay_seconds: int = 0              # From realtime trip-updates feed
     is_cancelled: bool = False
+    realtime_state: str = "scheduled"   # scheduled | live | stale (see const)
     platform: str | None = None
     route_color: str | None = None     # Hex colour string from routes table (no '#')
     service_type: str | None = None    # "Stopping All Stations" / "Limited Express" / "Express"

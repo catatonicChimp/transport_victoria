@@ -33,6 +33,8 @@ from .const import (
     CONF_DESTINATION_STOP_ID,
     CONF_DESTINATION_STOP_NAME,
     CONF_DIRECTION,
+    CONF_DISPLAY_NAME,
+    CONF_ENABLE_REALTIME,
     CONF_ENTRY_TYPE,
     CONF_INCLUDE,
     CONF_JOURNEY_DESTINATION_STOP_ID,
@@ -59,6 +61,7 @@ from .const import (
     CONF_ROUTE_SHORT_NAME,
     CONF_SHOW_RUN_NUMBERS,
     CONF_SHOW_VEHICLE_TYPE,
+    CONF_SOURCE_ENTRY_ID,
     CONF_STOP_ID,
     CONF_STOP_NAME,
     CONF_SUBENTRY_ORDER,
@@ -71,15 +74,21 @@ from .const import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_SHOW_RUN_NUMBERS,
     DEFAULT_SHOW_VEHICLE_TYPE,
+    DEFAULT_SOURCE_NAME,
     DOMAIN,
     ENTRY_TYPE_BOARD,
     ENTRY_TYPE_ROUTE_TRACKER,
+    ENTRY_TYPE_SOURCE,
     ENTRY_TYPE_VEHICLE_TRACKER,
     ENTRY_TYPE_WATCH,
     MODE_BUNDLE_MAP,
     MODE_LABELS,
     MODES,
+    READINESS_READY,
     ROUTE_TYPE_MAP,
+    SOURCE_CHOICE_REALTIME,
+    SOURCE_CHOICE_SCHEDULED,
+    SOURCE_UNIQUE_ID,
     SUBENTRY_TYPE_PIN,
 )
 from .board import (
@@ -101,6 +110,7 @@ from .gtfs.repository import (
     get_stop_lat_lon,
     get_terminals_for_route,
     is_mode_ready,
+    schedule_state,
     search_routes_by_name,
     search_stops_by_distance,
     search_stops_by_name,
@@ -119,7 +129,18 @@ from .watch_import import (
     WatchMapping,
     map_watches,
 )
-from . import async_trigger_gtfs_refresh
+from . import _get_or_create_schedule_manager, async_trigger_gtfs_refresh
+from .source import (
+    all_mode_bundles,
+    async_reload_dependents,
+    async_remove_dependents,
+    find_dependents,
+    get_source_api_key,
+    get_source_entry,
+    get_source_entry_id,
+    source_lock,
+    source_readiness,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -255,15 +276,39 @@ def _route_display_label(r: RouteResult) -> str:
     return short
 
 
+async def _validate_api_key(hass, api_key: str) -> dict[str, str]:
+    """Return an errors dict if the key is invalid, empty dict if OK.
+
+    Module-level (shared by the config flow and the source options flow) so a
+    realtime credential change re-validates against the live API the same way a
+    first-time key does.
+    """
+    session = async_get_clientsession(hass)
+    client = PTVRealtimeClient(api_key, session)
+    try:
+        await client.test_connection()
+    except aiohttp.ClientResponseError as exc:
+        if exc.status == 401:
+            return {"base": "invalid_auth"}
+        _LOGGER.warning("PTV API returned HTTP %s during validation", exc.status)
+        return {"base": "cannot_connect"}
+    except aiohttp.ClientError:
+        return {"base": "cannot_connect"}
+    return {}
+
+
 class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     """Handle the PTV config flow.
 
-    Steps:
-      1. user    — API key (validated against the realtime API)
-      2. mode    — transport mode (metro train, tram, bus, regional bus, v/line)
-      3. stop    — origin stop (by name search against local GTFS DB)
-      4. dest    — destination: all or specific stop
-      5. confirm — name the watch, preview active disruptions
+    Steps (entry-point routes on whether a source hub exists):
+      1. user        — source hub creation (name + realtime/scheduled-only choice)
+                      when no hub exists; otherwise "Add something to monitor".
+      2. source_key  — API key (validated against the realtime API) when realtime.
+      3. downloading/importing — GTFS schedule progress (import-all for the hub).
+      4. create_source — create the source entry.
+      5. feature flows (entry_type → mode → stop → dest → confirm / board /
+         route-tracker / import) run AFTER the hub exists, each carrying
+         ``source_entry_id``.
     """
 
     VERSION = 2
@@ -291,51 +336,125 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         self._import_board_name: str = ""
         self._import_skipped: list[tuple[str, str]] = []
         self._import_stale: list[tuple[str, str]] = []
+        # T18.1 source-hub creation: True when this flow run is creating the
+        # source entry (import-all bundles + create a ``source`` entry instead of
+        # a feature entry).
+        self._source_mode: bool = False
 
     # ------------------------------------------------------------------
-    # Step 1 — API key (skipped if a key is already stored)
+    # Step 1 — source hub creation (name + realtime choice → optional key)
     # ------------------------------------------------------------------
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Collect and validate the PTV Open Data API key.
+        """Entry point: create the source hub, or add a feature to an existing hub.
 
-        If an existing PTV config entry already has a valid key, this step is
-        skipped automatically — the stored key is re-used so the user doesn't
-        have to paste it in every time they add a new watch.
+        Single-hub rule: when a source entry already exists, this flow routes to
+        the "Add something to monitor" feature menu (a second source entry is
+        never created here).  With no source entry, the user is creating the hub:
+        a display name + a realtime/scheduled-only choice (the API key is only
+        collected when realtime is chosen).
         """
-        # Reuse key from an existing entry (first-time setup still asks)
-        if user_input is None:
-            existing_key = self._get_existing_api_key()
-            if existing_key:
-                self._config[CONF_API_KEY] = existing_key
-                self.hass.async_create_task(async_trigger_gtfs_refresh(self.hass))
-                return await self.async_step_entry_type()
+        # Existing hub → add a feature (never a second source).
+        if user_input is None and get_source_entry(self.hass) is not None:
+            return await self.async_step_entry_type()
+
+        # Single-hub rule: a hub form submission while a hub already exists
+        # (e.g. a race) aborts rather than creating a second source entry.
+        if user_input is not None and get_source_entry(self.hass) is not None:
+            return self.async_abort(reason="already_configured")
+
+        # Programmatic source creation (migration): a SOURCE_USER flow with
+        # ``entry_type: "source"`` in its data creates the hub directly.  The
+        # caller (migration) already holds the source-creation lock, so we only
+        # re-check the single-hub rule here (no re-acquisition — asyncio.Lock is
+        # not reentrant).  The stable unique id makes a concurrent duplicate
+        # creation fail the flow.
+        if user_input is not None and user_input.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_SOURCE:
+            # Singleton via HA's unique-id machinery: setting the stable unique id
+            # returns an existing entry (abort) or raises already_in_progress if a
+            # concurrent flow is creating it.
+            existing = await self.async_set_unique_id(SOURCE_UNIQUE_ID)
+            if existing is not None:
+                return self.async_abort(reason="already_configured")
+            name = (user_input.get(CONF_DISPLAY_NAME) or "").strip() or DEFAULT_SOURCE_NAME
+            api_key = user_input.get(CONF_API_KEY, "")
+            return self.async_create_entry(
+                title=name,
+                data={
+                    CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE,
+                    CONF_DISPLAY_NAME: name,
+                    CONF_API_KEY: api_key,
+                },
+            )
 
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            api_key = user_input[CONF_API_KEY].strip()
-
-            if not api_key:
-                errors[CONF_API_KEY] = "api_key_required"
-            else:
-                errors = await self._validate_api_key(api_key)
-                if not errors:
-                    self._config[CONF_API_KEY] = api_key
-                    # Kick off GTFS download immediately so it runs while the
-                    # user completes the remaining config flow steps.
-                    self.hass.async_create_task(
-                        async_trigger_gtfs_refresh(self.hass)
-                    )
-                    return await self.async_step_entry_type()
+            name = (user_input.get(CONF_DISPLAY_NAME) or "").strip() or DEFAULT_SOURCE_NAME
+            self._config[CONF_DISPLAY_NAME] = name
+            self._source_mode = True
+            self._post_import_step = "create_source"
+            choice = user_input.get(CONF_ENABLE_REALTIME, SOURCE_CHOICE_REALTIME)
+            if choice == SOURCE_CHOICE_REALTIME:
+                return await self.async_step_source_key()
+            # Scheduled-only: no credential.
+            self._config[CONF_API_KEY] = ""
+            return await self.async_step_downloading()
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
                 vol.Required(
-                    CONF_API_KEY, default=self._get_existing_api_key() or ""
+                    CONF_DISPLAY_NAME, default=DEFAULT_SOURCE_NAME
+                ): selector.TextSelector(),
+                vol.Required(
+                    CONF_ENABLE_REALTIME, default=SOURCE_CHOICE_REALTIME
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(
+                                value=SOURCE_CHOICE_REALTIME,
+                                label="Enable realtime (recommended)",
+                            ),
+                            selector.SelectOptionDict(
+                                value=SOURCE_CHOICE_SCHEDULED,
+                                label="Scheduled times only (no key needed)",
+                            ),
+                        ],
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }),
+            errors=errors,
+        )
+
+    async def async_step_source_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect and validate the API key for a realtime source hub.
+
+        Validation failure is a retryable error (never silent): the form re-shows
+        with the error until a live test succeeds.
+        """
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            api_key = user_input.get(CONF_API_KEY, "").strip()
+            if not api_key:
+                errors[CONF_API_KEY] = "api_key_required"
+            else:
+                errors = await _validate_api_key(self.hass, api_key)
+                if not errors:
+                    self._config[CONF_API_KEY] = api_key
+                    return await self.async_step_downloading()
+
+        return self.async_show_form(
+            step_id="source_key",
+            data_schema=vol.Schema({
+                vol.Required(
+                    CONF_API_KEY, default=""
                 ): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
                 ),
@@ -346,9 +465,19 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             },
         )
 
+    def _get_source_entry_id(self) -> str | None:
+        """Return the single live source entry id, or None when no hub exists."""
+        return get_source_entry_id(self.hass)
+
     def _get_existing_api_key(self) -> str | None:
-        """Return the API key from an existing PTV config entry, if any."""
-        for entry in self.hass.config_entries.async_entries(DOMAIN):
+        """Return the API key from the source entry (or any entry), if present."""
+        key = get_source_api_key(self.hass)
+        if key:
+            return key
+        config_entries = getattr(self.hass, "config_entries", None)
+        if config_entries is None:
+            return None
+        for entry in config_entries.async_entries(DOMAIN):
             key = entry.data.get(CONF_API_KEY)
             if key:
                 return str(key)
@@ -356,18 +485,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
 
     async def _validate_api_key(self, api_key: str) -> dict[str, str]:
         """Return an errors dict if the key is invalid, empty dict if OK."""
-        session = async_get_clientsession(self.hass)
-        client = PTVRealtimeClient(api_key, session)
-        try:
-            await client.test_connection()
-        except aiohttp.ClientResponseError as exc:
-            if exc.status == 401:
-                return {"base": "invalid_auth"}
-            _LOGGER.warning("PTV API returned HTTP %s during validation", exc.status)
-            return {"base": "cannot_connect"}
-        except aiohttp.ClientError:
-            return {"base": "cannot_connect"}
-        return {}
+        return await _validate_api_key(self.hass, api_key)
 
     # ------------------------------------------------------------------
     # Step 2 — Mode
@@ -400,6 +518,40 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     # Step 3a — ZIP download progress screen
     # ------------------------------------------------------------------
 
+    def _flow_bundles(self) -> list[str]:
+        """Return the bundle folders this flow run must import.
+
+        Source-hub creation imports the union of EVERY mode's bundles (import-all
+        policy v1); feature flows import only their mode's bundles.
+        """
+        if self._source_mode:
+            return all_mode_bundles()
+        mode = self._config.get(CONF_MODE, "")
+        return MODE_BUNDLE_MAP.get(mode, [])
+
+    async def async_step_create_source(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Create the source (hub) config entry after the import-all refresh.
+
+        Re-checks the single-hub rule under the source-creation lock and uses the
+        stable unique id so a concurrent duplicate creation fails the flow (F2).
+        """
+        async with source_lock():
+            existing = await self.async_set_unique_id(SOURCE_UNIQUE_ID)
+            if existing is not None:
+                return self.async_abort(reason="already_configured")
+            name = self._config.get(CONF_DISPLAY_NAME, DEFAULT_SOURCE_NAME)
+            api_key = self._config.get(CONF_API_KEY, "")
+            return self.async_create_entry(
+                title=name,
+                data={
+                    CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE,
+                    CONF_DISPLAY_NAME: name,
+                    CONF_API_KEY: api_key,
+                },
+            )
+
     async def async_step_downloading(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -412,8 +564,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         """
         zip_path = _zip_path(self.hass.config.config_dir)
         db_path = _db_path(self.hass.config.config_dir)
-        mode = self._config.get(CONF_MODE, "")
-        bundles = MODE_BUNDLE_MAP.get(mode, [])
+        bundles = self._flow_bundles()
 
         # On the very first call (before the wait task exists), check whether
         # we can skip ahead entirely.  We must NOT do this on subsequent calls
@@ -491,8 +642,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     ) -> ConfigFlowResult:
         """Show a spinner while the selected mode's bundle is being imported."""
         db_path = _db_path(self.hass.config.config_dir)
-        mode = self._config.get(CONF_MODE, "")
-        bundles = MODE_BUNDLE_MAP.get(mode, [])
+        bundles = self._flow_bundles()
 
         # On the very first call only: check if already done or start polling.
         # Must NOT re-check on subsequent calls while the spinner is active.
@@ -1087,6 +1237,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             if watch_name:
                 self._config[CONF_WATCH_NAME] = watch_name
                 self._config[CONF_ENTRY_TYPE] = ENTRY_TYPE_WATCH
+                # Associate with the single source hub (feature → hub ownership).
+                self._config[CONF_SOURCE_ENTRY_ID] = self._get_source_entry_id()
                 return self.async_create_entry(
                     title=watch_name,
                     data=self._config,
@@ -1257,6 +1409,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
                 CONF_BOARD_NAME: board_name,
                 CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
+                CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
             },
             options={
                 CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
@@ -1466,6 +1619,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                 CONF_ENTRY_TYPE: ENTRY_TYPE_BOARD,
                 CONF_BOARD_NAME: self._import_board_name,
                 CONF_API_KEY: self._get_existing_api_key() or "",
+                CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
             },
             options={
                 CONF_DEPARTURE_COUNT: BOARD_DEFAULT_DEPARTURE_COUNT,
@@ -1713,6 +1867,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
             entry_data: dict[str, Any] = {
                 CONF_ENTRY_TYPE: ENTRY_TYPE_ROUTE_TRACKER,
                 CONF_API_KEY: self._config.get(CONF_API_KEY, ""),
+                CONF_SOURCE_ENTRY_ID: self._get_source_entry_id(),
                 CONF_MODE: self._config.get(CONF_MODE, ""),
                 CONF_ROUTE_ID: self._config.get(CONF_ROUTE_ID, ""),
                 CONF_ROUTE_SHORT_NAME: self._config.get(CONF_ROUTE_SHORT_NAME, ""),
@@ -1764,6 +1919,8 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
     @staticmethod
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         """Return the options flow for this entry."""
+        if config_entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_SOURCE:
+            return PTVSourceOptionsFlow()
         return PTVOptionsFlow()
 
 
@@ -2474,3 +2631,246 @@ class PTVOptionsFlow(OptionsFlow):  # type: ignore[misc]
                 vol.Required(CONF_WATCH_NAME, default=current_name): selector.TextSelector(),
             }),
         )
+
+
+class PTVSourceOptionsFlow(OptionsFlow):  # type: ignore[misc]
+    """Options flow for the source (hub) config entry.
+
+    Owns the hub's credential and schedule lifecycle:
+      * ``source_reconfigure`` — add/replace/remove the credential (choice
+        "Scheduled-only" removes the key), rebuilding the realtime client +
+        resetting feed cache and reloading dependents;
+      * ``source_remove`` — deletion cascade: list dependents, confirm, remove
+        them, then remove the hub;
+      * ``source_refresh`` — force a schedule refresh + show bundle horizon
+        summary.
+    """
+
+    def _hub_id(self) -> str:
+        return self.config_entry.entry_id
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Hub menu: reconfigure / force refresh / remove."""
+        return await self.async_step_source_menu(user_input)
+
+    async def async_step_source_menu(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Render the hub menu (distinct step so translations don't collide)."""
+        return self.async_show_menu(
+            step_id="source_menu",
+            menu_options=[
+                "add_monitor",
+                "source_reconfigure",
+                "source_refresh",
+                "source_remove",
+            ],
+        )
+
+    async def async_step_add_monitor(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Explain how to add a monitor (no invisible backend flow, F6).
+
+        Creating a second flow from inside an options flow is not a visible
+        frontend navigation, so instead of silently opening one we show a
+        persistent instruction: the user adds features via Settings → Devices &
+        Services → Add Integration, where the flow preselects this source.
+        """
+        if user_input is not None:
+            return self.async_create_entry(data=dict(self.config_entry.options))
+        return self.async_show_form(
+            step_id="add_monitor",
+            data_schema=vol.Schema({
+                vol.Required("done", default=True): selector.BooleanSelector(),
+            }),
+            description_placeholders={
+                "source_name": self.config_entry.title,
+            },
+        )
+
+    # -- credential reconfigure ----------------------------------------
+
+    async def async_step_source_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Add / replace / remove the hub credential.
+
+        "Scheduled-only" removes the key (feature entries fall back to
+        scheduled-only); "realtime" validates and stores the new key.  A change
+        invalidates the realtime cache (T13 state reset) and reloads dependents.
+        """
+        errors: dict[str, str] = {}
+        current_key = self.config_entry.data.get(CONF_API_KEY, "")
+        current_choice = SOURCE_CHOICE_REALTIME if current_key else SOURCE_CHOICE_SCHEDULED
+
+        if user_input is not None:
+            choice = user_input.get(CONF_ENABLE_REALTIME, current_choice)
+            if choice == SOURCE_CHOICE_SCHEDULED:
+                new_key = ""
+            else:
+                new_key = (user_input.get(CONF_API_KEY) or "").strip()
+                if not new_key:
+                    errors[CONF_API_KEY] = "api_key_required"
+                else:
+                    errors = await _validate_api_key(self.hass, new_key)
+
+            if not errors:
+                await self._apply_credential_change(new_key)
+                return self.async_create_entry(data=dict(self.config_entry.options))
+
+        schema_fields: dict[Any, Any] = {
+            vol.Required(
+                CONF_ENABLE_REALTIME, default=current_choice
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(
+                            value=SOURCE_CHOICE_REALTIME, label="Enable realtime"
+                        ),
+                        selector.SelectOptionDict(
+                            value=SOURCE_CHOICE_SCHEDULED,
+                            label="Scheduled-only (remove key)",
+                        ),
+                    ],
+                    mode=selector.SelectSelectorMode.LIST,
+                )
+            ),
+        }
+        if current_choice == SOURCE_CHOICE_REALTIME or (
+            user_input is not None
+            and user_input.get(CONF_ENABLE_REALTIME) == SOURCE_CHOICE_REALTIME
+        ):
+            schema_fields[vol.Optional(CONF_API_KEY, default=current_key)] = (
+                selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                )
+            )
+
+        return self.async_show_form(
+            step_id="source_reconfigure",
+            data_schema=vol.Schema(schema_fields),
+            errors=errors,
+        )
+
+    async def _apply_credential_change(self, new_key: str) -> None:
+        """Persist the new credential, reset feed state, reload dependents."""
+        from .realtime.client import invalidate_cache
+
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={**self.config_entry.data, CONF_API_KEY: new_key},
+        )
+        # T13 client-state reset: a credential change invalidates the module feed
+        # cache + per-feed health state, so the next poll rebuilds from scratch.
+        invalidate_cache()
+        # Rebuild dependents' realtime clients against the new credential.
+        await async_reload_dependents(self.hass, self._hub_id())
+
+    # -- force refresh + bundle state ---------------------------------
+
+    async def async_step_source_refresh(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Force a schedule refresh (via the manager) and surface the outcome.
+
+        Routes through the manager's ``refresh_source`` so readiness + retry
+        orchestration match automatic refreshes; the confirm checkbox gates the
+        refresh, and the outcome (READY / failed) is surfaced — never a silent
+        success.
+        """
+        errors: dict[str, str] = {}
+        outcome = ""
+        if user_input is not None:
+            if user_input.get("confirm_refresh", False):
+                ok = await self._refresh_source_via_manager()
+                if ok:
+                    outcome = "Schedule is ready."
+                else:
+                    errors["base"] = "schedule_refresh_failed"
+            else:
+                # Unchecked → done without refreshing.
+                return self.async_create_entry(data=dict(self.config_entry.options))
+
+        summary = await self._bundle_summary()
+        # After a successful refresh the checkbox defaults OFF, so the next
+        # submit finalises instead of re-running the refresh (F3).
+        default_confirm = outcome == ""
+        return self.async_show_form(
+            step_id="source_refresh",
+            data_schema=vol.Schema({
+                vol.Required("confirm_refresh", default=default_confirm): selector.BooleanSelector(),
+            }),
+            errors=errors,
+            description_placeholders={
+                "bundle_state": summary,
+                "refresh_outcome": outcome,
+            },
+        )
+
+    async def _refresh_source_via_manager(self) -> bool:
+        """Drive the hub refresh through the ScheduleManager (readiness + retry)."""
+        manager = _get_or_create_schedule_manager(self.hass)
+        manager.register_source(self._hub_id())
+        return await manager.refresh_source()
+
+    async def _bundle_summary(self) -> str:
+        """Return a human-readable per-bundle horizon summary (best-effort)."""
+        db_path = _db_path(self.hass.config.config_dir)
+        try:
+            bundles = await self.hass.async_add_executor_job(
+                _bundles_summary, db_path, all_mode_bundles()
+            )
+        except Exception:  # noqa: BLE001
+            return "- unavailable"
+        return "\n".join(
+            f"- bundle {folder}: {state}" for folder, state in bundles
+        ) or "- none"
+
+    # -- deletion cascade ----------------------------------------------
+
+    async def async_step_source_remove(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm removal of the hub, listing (and then removing) dependents."""
+        dependents = find_dependents(self.hass, self._hub_id())
+
+        if user_input is not None:
+            if user_input.get("confirm", False) is not True:
+                return self.async_create_entry(data=dict(self.config_entry.options))
+            # Cascade: remove dependents first, then the hub itself.
+            removed = await async_remove_dependents(self.hass, self._hub_id())
+            _LOGGER.info(
+                "Removing source hub '%s' — cascaded %d dependents",
+                self.config_entry.title,
+                len(removed),
+            )
+            await self.hass.config_entries.async_remove(self._hub_id())
+            return self.async_abort(reason="reconfigure_successful")
+
+        labels = "\n".join(f"- {e.title}" for e in dependents) or "- none"
+        return self.async_show_form(
+            step_id="source_remove",
+            data_schema=vol.Schema({
+                vol.Required("confirm", default=False): selector.BooleanSelector(),
+            }),
+            description_placeholders={"dependents": labels},
+        )
+
+
+def _bundles_summary(db_path: Path, bundles: list[str]) -> list[tuple[str, str]]:
+    """Return ``(folder, state)`` for each bundle (ready/missing/stale/expired).
+
+    Pure helper so the light-env tests can exercise the horizon classification
+    without a real DB.
+    """
+    result: list[tuple[str, str]] = []
+    for folder in bundles:
+        try:
+            state = schedule_state(db_path, [folder])
+        except Exception:  # noqa: BLE001
+            state = "missing"
+        result.append((folder, state))
+    return result

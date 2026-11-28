@@ -228,7 +228,42 @@ ENTRY_TYPE_WATCH = "watch"
 ENTRY_TYPE_VEHICLE_TRACKER = "vehicle_tracker"
 ENTRY_TYPE_ROUTE_TRACKER = "route_tracker"
 ENTRY_TYPE_BOARD = "board"
+ENTRY_TYPE_SOURCE = "source"  # the single "hub" entry owning credential + schedule
 CONF_PARENT_ENTRY_ID = "parent_entry_id"  # for vehicle tracker entries
+
+# Source (hub) entry data keys — the ownership/readiness contract (T18.1).
+#
+# ``source_entry_id`` associates a feature entry (watch/board/journey/route
+# tracker) with the single live source entry.  The credential itself lives ONLY
+# on the source entry (``api_key`` present = realtime enabled; absent =
+# scheduled-only).  ``display_name`` is the human label (default below).
+CONF_SOURCE_ENTRY_ID = "source_entry_id"
+CONF_DISPLAY_NAME = "display_name"
+CONF_ENABLE_REALTIME = "enable_realtime"   # hub creation choice (not persisted)
+SOURCE_CHOICE_REALTIME = "realtime"
+SOURCE_CHOICE_SCHEDULED = "scheduled"
+DEFAULT_SOURCE_NAME = "Transport Victoria"
+
+# Stable unique id for the single source (hub) entry.  HA's unique-id machinery
+# makes a second source creation race-safe: a duplicate unique id fails the
+# flow rather than creating a second hub.
+SOURCE_UNIQUE_ID = "transport_victoria_source"
+
+# Readiness state machine states (exposed via
+# ``hass.data[DOMAIN][hub_id]["readiness"]``).  CONFIGURED = settings saved;
+# READY = a usable generation exists; features require READY before creating
+# entities, but may be created while !READY and simply wait (unavailable).
+READINESS_CONFIGURED = "configured"
+READINESS_DOWNLOADING = "downloading"
+READINESS_IMPORTING = "importing"
+READINESS_READY = "ready"
+READINESS_STALE = "stale"
+READINESS_SCHEDULE_FAILED = "schedule_failed"
+
+# Watch departure ``realtime_state`` values (Departure.realtime_state).
+REALTIME_STATE_SCHEDULED = "scheduled"
+REALTIME_STATE_LIVE = "live"
+REALTIME_STATE_STALE = "stale"
 
 # Route tracker config keys
 CONF_ROUTE_ID = "route_id"                     # primary route being tracked

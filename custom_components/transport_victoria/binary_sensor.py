@@ -44,8 +44,22 @@ from .const import (
 )
 from .coordinator import PTVDataUpdateCoordinator
 from .models import Alert, CoordinatorData
+from .source import source_is_scheduled_only
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _scheduled_only(entity: object) -> bool:
+    """Return True when the entity's source hub is in scheduled-only mode.
+
+    Defensive: the light-env entity tests construct entities directly without a
+    real ``hass`` handle; a missing/stub hass yields "no source hub", which is
+    not scheduled-only (so those tests keep their existing availability).
+    """
+    hass = getattr(entity, "hass", None)
+    if hass is None:
+        return False
+    return source_is_scheduled_only(hass)
 
 
 async def async_setup_entry(
@@ -112,7 +126,14 @@ class BoardDisruptionBinarySensor(
 
     @property
     def available(self) -> bool:
-        """Unavailable when the coordinator failed OR an alert feed failed."""
+        """Unavailable when the coordinator failed OR an alert feed failed.
+
+        Also unavailable (never a false OFF) in scheduled-only mode: without a
+        credential there is no service-alert feed, so "no disruption" cannot be
+        certified.
+        """
+        if _scheduled_only(self):
+            return False
         if not self.coordinator.last_update_success:
             return False
         data = self._data
@@ -182,6 +203,17 @@ class PTVDisruptionBinarySensor(
     def is_on(self) -> bool:
         data: CoordinatorData | None = self.coordinator.data
         return bool(data and data.alerts)
+
+    @property
+    def available(self) -> bool:
+        """Unavailable (never a false OFF) in scheduled-only mode.
+
+        Without a credential there is no service-alert feed, so "no disruption"
+        cannot be certified — the sensor reports unavailable rather than OFF.
+        """
+        if _scheduled_only(self):
+            return False
+        return super().available
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

@@ -297,6 +297,7 @@ class PTVDepartureSensor(CoordinatorEntity[PTVDataUpdateCoordinator], SensorEnti
             "delay_seconds": dep.delay_seconds,
             "delay_minutes": (dep.delay_seconds or 0) // 60,
             "is_cancelled": dep.is_cancelled,
+            "realtime_state": dep.realtime_state,
             "headsign": dep.headsign,
             "route_name": dep.route_short_name or dep.route_long_name,
             "route_short_name": dep.route_short_name,

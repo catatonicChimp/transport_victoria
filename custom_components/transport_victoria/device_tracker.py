@@ -49,7 +49,6 @@ from homeassistant.util import dt as dt_util
 from .board import PinData
 from .board_aggregation import route_type_to_mode
 from .const import (
-    CONF_API_KEY,
     CONF_ENTRY_TYPE,
     CONF_MAX_VEHICLES,
     CONF_MODE,
@@ -85,6 +84,7 @@ from .realtime.vehicle_positions import (
     parse_vehicle_positions,
     parse_vehicle_positions_by_vehicle,
 )
+from .source import effective_realtime_enabled, get_source_api_key, source_disabled
 from .vehicle_fleet import (
     FleetVehicle,
     FleetUpdate,
@@ -131,6 +131,12 @@ async def async_setup_entry(
 
     # Watch / board → dynamic fleet tracking (opt-in).
     if not entry.options.get(CONF_TRACK_VEHICLES, False):
+        return
+
+    # Fleet tracking requires a realtime credential on the source hub — without
+    # one (scheduled-only) the fleet coordinators are NOT created (never an
+    # empty-KeyID request).
+    if not effective_realtime_enabled(hass, entry):
         return
 
     coordinator = FleetTrackerCoordinator(hass, entry, _db_path_for(hass))
@@ -250,12 +256,15 @@ class FleetTrackerCoordinator(DataUpdateCoordinator[dict[str, FleetVehicle]]):  
 
     async def _async_setup(self) -> None:
         """Initialise the realtime client (once HA's session is available)."""
-        api_key = self._entry.data.get(CONF_API_KEY, "")
+        api_key = get_source_api_key(self.hass) or ""
         session = async_get_clientsession(self.hass)
         self._client = PTVRealtimeClient(api_key, session)
 
     async def _async_update_data(self) -> dict[str, FleetVehicle]:
         """Fetch vehicle positions and reconcile the fleet (executor-offloaded)."""
+        if source_disabled(self.hass):
+            raise UpdateFailed("Source hub is disabled")
+
         if not self._modes:
             # Tram-only (no vehicle-positions feed) → no fleet.
             return dict(self._tracked)
@@ -570,16 +579,27 @@ class RouteVehicleCoordinator(DataUpdateCoordinator[list[VehiclePosition]]):  # 
         )
 
     async def _async_setup(self) -> None:
-        """Initialise the realtime client (no separate rate limiter — see T13)."""
-        api_key: str = self._entry.data.get(CONF_API_KEY, "")
+        """Initialise the realtime client (once HA's session is available).
+
+        Built only when a credential exists on the source hub; scheduled-only
+        route trackers leave the client None and report no vehicles.
+        """
+        api_key = get_source_api_key(self.hass)
+        if not api_key:
+            self._client = None
+            return
         session = async_get_clientsession(self.hass)
         self._client = PTVRealtimeClient(api_key, session)
 
     async def _async_update_data(self) -> list[VehiclePosition]:
         """Fetch and filter vehicle positions for the configured route."""
+        if source_disabled(self.hass):
+            raise UpdateFailed("Source hub is disabled")
+
         client = self._client
         if client is None:
-            raise UpdateFailed("Route tracker client not initialised")
+            # Scheduled-only: no credential → no vehicles, no empty-KeyID calls.
+            return []
 
         mode: str = self._entry.data.get(CONF_MODE, "metro")
         route_id: str = self._entry.data.get(CONF_ROUTE_ID, "")

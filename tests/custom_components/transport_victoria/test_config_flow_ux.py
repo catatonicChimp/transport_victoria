@@ -57,6 +57,7 @@ from custom_components.transport_victoria.const import (
     CONF_WATCH_NAME,
     DOMAIN,
     ENTRY_TYPE_BOARD,
+    ENTRY_TYPE_SOURCE,
     ENTRY_TYPE_WATCH,
     SUBENTRY_TYPE_PIN,
 )
@@ -112,12 +113,11 @@ async def test_existing_api_key_helper(monkeypatch):
     assert flow._get_existing_api_key() == "secret-key"
 
 
-async def test_key_reuse_when_another_entry_exists(monkeypatch):
-    """A second entry reuses the stored key and skips the key step."""
-    monkeypatch.setattr(cf, "async_trigger_gtfs_refresh", lambda hass, *a, **k: None)
+async def test_source_exists_routes_to_feature_menu(monkeypatch):
+    """With a source hub present, adding the integration adds a feature (menu)."""
     flow = cf.PTVConfigFlow()
     flow.hass = _fake_hass_with_entries(
-        [SimpleNamespace(data={CONF_API_KEY: "secret-key"})]
+        [SimpleNamespace(data={CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE, CONF_API_KEY: "secret-key"})]
     )
     advanced = {}
 
@@ -130,7 +130,20 @@ async def test_key_reuse_when_another_entry_exists(monkeypatch):
     result = await flow.async_step_user(None)
 
     assert advanced["called"] is True
-    assert flow._config[CONF_API_KEY] == "secret-key"
+
+
+async def test_no_source_shows_hub_creation_form(monkeypatch):
+    """With no source hub, the flow collects name + realtime choice (no key yet)."""
+    flow = cf.PTVConfigFlow()
+    flow.hass = _fake_hass_with_entries([])
+
+    shown = {}
+    flow.async_show_form = lambda **kwargs: shown.update(kwargs) or {"type": "form"}
+
+    result = await flow.async_step_user(None)
+
+    assert result["type"] == "form"
+    assert shown["step_id"] == "user"
 
 
 # ---------------------------------------------------------------------------

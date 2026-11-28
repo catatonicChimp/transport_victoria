@@ -18,13 +18,18 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     BOARD_DEFAULT_DEPARTURE_COUNT,
+    CONF_API_KEY,
     CONF_DEPARTURE_COUNT,
+    CONF_DISPLAY_NAME,
     CONF_ENTRY_TYPE,
     CONF_MODE,
+    CONF_SOURCE_ENTRY_ID,
     DEFAULT_DEPARTURE_COUNT,
+    DEFAULT_SOURCE_NAME,
     DOMAIN,
     ENTRY_TYPE_BOARD,
     ENTRY_TYPE_ROUTE_TRACKER,
+    ENTRY_TYPE_SOURCE,
     ENTRY_TYPE_VEHICLE_TRACKER,
     GTFS_REFRESH_CHECK_INTERVAL,
     GTFS_REFRESH_MARGIN_DAYS,
@@ -32,11 +37,26 @@ from .const import (
     GTFS_SCHEDULE_URL,
     MODE_BUNDLE_MAP,
     PICTOGRAM_URL_BASE,
+    READINESS_CONFIGURED,
+    READINESS_DOWNLOADING,
+    READINESS_IMPORTING,
+    READINESS_READY,
+    READINESS_SCHEDULE_FAILED,
+    SOURCE_UNIQUE_ID,
 )
 from .board import PinData, board_bundles, validate_pin
 from .board_coordinator import BoardCoordinator
 from .coordinator import PTVDataUpdateCoordinator
 from .device_tracker import RouteVehicleCoordinator
+from .source import (
+    all_mode_bundles,
+    async_reload_dependents,
+    async_remove_dependents,
+    find_dependents,
+    get_source_entry,
+    is_source_entry,
+    source_lock,
+)
 from .gtfs.downloader import (
     check_for_remote_changes,
     download_zip,
@@ -77,6 +97,12 @@ _DATA_DIR_NAME = "transport_victoria_data"
 
 # Key under hass.data[DOMAIN] for the shared schedule manager
 _SCHEDULE_MANAGER_KEY = "schedule_manager"
+
+# Re-entrancy guard for the ownership migration: the migration creates the
+# source entry via a config flow, which (in some environments) triggers a nested
+# ``async_setup`` that re-runs the migration.  A non-reentrant asyncio.Lock would
+# deadlock there; this flag lets the nested call skip while the outer owns it.
+_MIGRATION_RUNNING = False
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +189,7 @@ async def async_trigger_gtfs_refresh(
     bundle_folders: list[str] | None = None,
     *,
     skip_download_if_exists: bool = False,
+    on_phase: Callable[[str], None] | None = None,
 ) -> bool:
     """Refresh the GTFS schedule: download (if needed) + import a new generation.
 
@@ -203,7 +230,9 @@ async def async_trigger_gtfs_refresh(
         return True
 
     guard = _guard_for_db(db_path)
-    return await _refresh_or_join(hass, db_path, zip_path, guard, bundle_folders, skip_download_if_exists)
+    return await _refresh_or_join(
+        hass, db_path, zip_path, guard, bundle_folders, skip_download_if_exists, on_phase
+    )
 
 
 async def _refresh_or_join(
@@ -213,6 +242,7 @@ async def _refresh_or_join(
     guard: _RefreshGuard,
     bundle_folders: list[str],
     skip_download_if_exists: bool,
+    on_phase: Callable[[str], None] | None = None,
 ) -> bool:
     """Start a refresh, or join an in-flight one if it covers our requirements.
 
@@ -244,7 +274,7 @@ async def _refresh_or_join(
         # No in-flight task: start one for the current (possibly enlarged) set.
         guard.bundles = requested
         task = asyncio.create_task(
-            _refresh_critical(hass, db_path, zip_path, guard, list(requested), skip_download_if_exists)
+            _refresh_critical(hass, db_path, zip_path, guard, list(requested), skip_download_if_exists, on_phase)
         )
         guard.task = task
         task.add_done_callback(lambda t: _guard_task_done(guard, t))
@@ -259,11 +289,12 @@ async def _refresh_critical(
     guard: _RefreshGuard,
     bundle_folders: list[str],
     skip_download_if_exists: bool,
+    on_phase: Callable[[str], None] | None = None,
 ) -> bool:
     """Hold the per-DB lock across the whole download→import→publish sequence."""
     async with guard.lock:
         return await _refresh_impl(
-            hass, db_path, zip_path, bundle_folders, skip_download_if_exists
+            hass, db_path, zip_path, bundle_folders, skip_download_if_exists, on_phase
         )
 
 
@@ -273,8 +304,13 @@ async def _refresh_impl(
     zip_path: Path,
     bundle_folders: list[str],
     skip_download_if_exists: bool,
+    on_phase: Callable[[str], None] | None = None,
 ) -> bool:
     """Download (if needed) and import a fresh generation. Returns success."""
+    def _phase(state: str) -> None:
+        if on_phase is not None:
+            on_phase(state)
+
     today = _service_today(hass)
 
     # Rebuild necessity from DB state alone (independent of download checks).
@@ -313,6 +349,7 @@ async def _refresh_impl(
     download_urls = [schedule_url]
     if schedule_url != GTFS_SCHEDULE_URL:
         download_urls.append(GTFS_SCHEDULE_URL)
+    _phase(READINESS_DOWNLOADING)
     for attempt, download_url in enumerate(download_urls, start=1):
         try:
             _, sha256, etag, content_length = await download_zip(
@@ -340,6 +377,7 @@ async def _refresh_impl(
         return True
 
     _LOGGER.info("Importing GTFS bundles %s (SHA-256: %s)", bundle_folders, sha256)
+    _phase(READINESS_IMPORTING)
 
     def _run_import() -> None:
         import_bundles_to_generation(
@@ -416,7 +454,10 @@ def _bundles_for_all_entries(hass: HomeAssistant) -> list[str]:
         # Vehicle/route tracker entries don't have a mode/bundle to import
         if entry_type in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER):
             continue
-        if entry_type == ENTRY_TYPE_BOARD:
+        if entry_type == ENTRY_TYPE_SOURCE:
+            # The hub imports the union of every mode (import-all policy v1).
+            folders = all_mode_bundles()
+        elif entry_type == ENTRY_TYPE_BOARD:
             folders = _board_bundles_for_entry(entry)
         else:
             mode = entry.data.get(CONF_MODE, "")
@@ -432,6 +473,12 @@ def _board_bundles_for_entry(entry: ConfigEntry) -> list[str]:
     """Return the union bundle folders for a board entry's pins."""
     pins = (PinData.from_dict(sub.data) for sub in entry.subentries.values())
     return sorted(board_bundles(pins))
+
+
+def _covers_source_requirement(bundle_folders: list[str]) -> bool:
+    """Return True when ``bundle_folders`` covers the hub's import-all union."""
+    required = frozenset(all_mode_bundles())
+    return required <= frozenset(bundle_folders)
 
 
 class ScheduleManager:
@@ -470,6 +517,10 @@ class ScheduleManager:
         # Loaded consumer entry_ids (idempotent — a setup retry re-registers the
         # same entry_id without double-counting).
         self._consumers: set[str] = set()
+        # Source (hub) entry id — the owner of the schedule lifecycle.  When set,
+        # the hub's import-all refresh + readiness + retry are driven by this
+        # manager (not an untracked driver).
+        self._source_entry_id: str | None = None
         self._stopping = False
 
     @property
@@ -504,6 +555,40 @@ class ScheduleManager:
             await self.shutdown()
 
     # ------------------------------------------------------------------
+    # Source (hub) ownership
+    # ------------------------------------------------------------------
+
+    def register_source(self, entry_id: str) -> None:
+        """Register the source hub as the owner of the schedule lifecycle."""
+        self._source_entry_id = entry_id
+
+    def unregister_source(self) -> None:
+        """Detach the source hub (no further readiness writes or retries)."""
+        self._source_entry_id = None
+
+    async def refresh_source(self) -> bool:
+        """Drive the hub's import-all refresh, emitting readiness phases + retry.
+
+        Delegates the guarded refresh to :meth:`refresh` (which normalizes
+        exceptions into failure outcomes and centralizes readiness/retry) with a
+        phase callback so DOWNLOADING/IMPORTING are emitted at the real work
+        boundaries.
+        """
+        if self._source_entry_id is None:
+            return True
+        bundles = all_mode_bundles()
+        return await self.refresh(bundles, on_phase=self._on_source_phase)
+
+    def _on_source_phase(self, phase: str) -> None:
+        """Record a refresh phase (DOWNLOADING/IMPORTING) against the hub."""
+        if self._source_entry_id is not None:
+            self._write_readiness(self._source_entry_id, phase)
+
+    def _write_readiness(self, entry_id: str, state: str) -> None:
+        """Write the hub's readiness (guarded against an absent/unloaded hub)."""
+        _set_readiness(self._hass, entry_id, state)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -535,6 +620,7 @@ class ScheduleManager:
             return
         self._stopping = True
         self.stop_tick()
+        self._source_entry_id = None
         for task in list(self._retry_tasks.values()):
             task.cancel()
         for task in list(self._retry_tasks.values()):
@@ -581,18 +667,53 @@ class ScheduleManager:
         await self.refresh(bundle_folders)
         return True
 
-    async def refresh(self, bundle_folders: list[str]) -> bool:
-        """Refresh the schedule; schedule a retry on failure.
+    async def refresh(
+        self, bundle_folders: list[str], *, on_phase: Callable[[str], None] | None = None
+    ) -> bool:
+        """Refresh the schedule; record the readiness outcome (F2).
 
         Concurrency is handled by the module-scope guard inside
         async_trigger_gtfs_refresh, so concurrent callers share one import.
+        A refresh that covers the hub's all-mode requirement updates readiness:
+        success → READY, failure → SCHEDULE_FAILED.  (The general retry is
+        scheduled on any failure, source or not.)  An existing usable incumbent
+        generation keeps serving departures regardless (readiness is lifecycle,
+        not current-data).
+
+        Exception-safe: an unexpected exception from the guarded refresh body is
+        normalized into a failure outcome (SCHEDULE_FAILED + retry) so the retry
+        chain survives a repeated crash.  ``asyncio.CancelledError`` is re-raised
+        (never converted) to preserve cancellation propagation.
         """
         if self._stopping:
             return False
-        ok = await async_trigger_gtfs_refresh(self._hass, bundle_folders)
+        try:
+            ok = await async_trigger_gtfs_refresh(
+                self._hass, bundle_folders, on_phase=on_phase
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize to a failure outcome
+            _LOGGER.error(
+                "GTFS refresh raised unexpectedly for bundles %s: %s",
+                bundle_folders,
+                exc,
+            )
+            ok = False
         if not ok:
             self._schedule_retry(bundle_folders)
+        self._record_refresh_outcome(bundle_folders, ok)
         return ok
+
+    def _record_refresh_outcome(self, bundle_folders: list[str], ok: bool) -> None:
+        """Update source readiness for a source-covering refresh outcome."""
+        if self._source_entry_id is None:
+            return
+        if not _covers_source_requirement(bundle_folders):
+            return
+        self._write_readiness(
+            self._source_entry_id, READINESS_READY if ok else READINESS_SCHEDULE_FAILED
+        )
 
     def _schedule_retry(self, bundle_folders: list[str]) -> None:
         """Schedule a single retry after the backoff interval (deduplicated)."""
@@ -638,6 +759,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignor
             cache_headers=True,
         ),
     ])
+    # Ownership migration (T18.1): associate pre-existing feature entries with a
+    # source hub, creating one (from the carried-over credential) if needed.
+    await async_migrate_entries_to_source(hass)
     return True
 
 
@@ -664,6 +788,150 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return False
 
 
+def _set_readiness(hass: HomeAssistant, hub_id: str, state: str) -> None:
+    """Write the hub's readiness state into ``hass.data[DOMAIN][hub_id]``.
+
+    Guarded against a deleted/absent hub: a late phase callback or retry that
+    fires after the hub was unloaded/removed must not recreate its runtime
+    state.  If the entry no longer exists or its runtime dict was dropped, the
+    write is a no-op.
+    """
+    config_entries = getattr(hass, "config_entries", None)
+    if config_entries is not None:
+        get_entry = getattr(config_entries, "async_get_entry", None)
+        if get_entry is not None and get_entry(hub_id) is None:
+            return
+    stored = hass.data.get(DOMAIN, {}).get(hub_id)
+    if stored is None:
+        return
+    stored["readiness"] = state
+
+
+async def _async_setup_source(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up the source (hub) config entry.
+
+    The hub owns the credential (already in ``entry.data``) and the schedule
+    lifecycle: it registers with the ScheduleManager as the SOLE schedule
+    consumer and source owner, and the manager drives the import-all refresh
+    (with readiness phases + retry).  Its readiness state is exposed at
+    ``hass.data[DOMAIN][entry.entry_id]["readiness"]``.
+    """
+    await hass.async_add_executor_job(
+        lambda: _data_dir(hass).mkdir(parents=True, exist_ok=True)
+    )
+
+    manager = _get_or_create_schedule_manager(hass)
+    manager.register_consumer(entry.entry_id)
+    manager.register_source(entry.entry_id)
+
+    # Runtime state dict must exist BEFORE the first readiness write (the write
+    # is guarded against an absent dict).
+    hass.data[DOMAIN][entry.entry_id] = {
+        "hub": entry,
+        "readiness": READINESS_CONFIGURED,
+    }
+
+    # Import-all refresh driven by the manager (tracked so unload can cancel it).
+    task = hass.async_create_task(manager.refresh_source())
+    hass.data[DOMAIN][entry.entry_id]["refresh_task"] = task
+
+    # Re-enable cascade (C11): dependents that were left loaded while the hub
+    # was disabled are reloaded so their coordinators rebuild against the
+    # re-enabled hub (no-op on first setup, when no dependents exist yet).
+    await async_reload_dependents(hass, entry.entry_id)
+    return True
+
+
+async def async_migrate_entries_to_source(hass: HomeAssistant) -> ConfigEntry | None:
+    """Reconcile legacy feature entries into the ownership contract (T18.1).
+
+    Idempotent — safe to run on EVERY ``async_setup`` (and after association
+    changes), not just a one-shot migration:
+
+      1. Ensure the source hub exists (create it from any feature's carried-over
+         credential when none exists; serialize with F2's source-creation lock).
+      2. For EVERY feature entry whose ``source_entry_id`` is missing or dangling
+         (points at a removed hub), set it to the live hub id AND strip the
+         feature's local ``api_key`` copy (the hub alone owns credentials), then
+         reload that feature once.
+
+    Returns the source entry, or None when there are no feature entries to
+    reconcile.
+    """
+    global _MIGRATION_RUNNING
+    if _MIGRATION_RUNNING:
+        # Re-entrant call — e.g. our own entry creation triggered a nested
+        # ``async_setup``.  The outer call owns the reconcile; skip (and avoid a
+        # non-reentrant lock deadlock).
+        return get_source_entry(hass)
+    _MIGRATION_RUNNING = True
+    try:
+        async with source_lock():
+            entries = hass.config_entries.async_entries(DOMAIN)
+            hub = get_source_entry(hass)
+
+            # 1. Ensure the hub exists.
+            features = [e for e in entries if not is_source_entry(e)]
+            if hub is None:
+                if not features:
+                    return None
+                carried_key = next(
+                    (str(e.data.get(CONF_API_KEY)) for e in features if e.data.get(CONF_API_KEY)),
+                    "",
+                ) or None
+                hub = await _create_source_entry(hass, carried_key or "")
+                if hub is None:
+                    return None
+            hub_id = hub.entry_id
+
+            # 2. Reconcile every feature: associate + strip local credentials.
+            for entry in features:
+                data = dict(entry.data)
+                sid = data.get(CONF_SOURCE_ENTRY_ID)
+                dangling = sid is not None and hass.config_entries.async_get_entry(sid) is None
+                needs_association = sid != hub_id or dangling
+                has_local_key = bool(data.get(CONF_API_KEY))
+                if not needs_association and not has_local_key:
+                    continue
+                data[CONF_SOURCE_ENTRY_ID] = hub_id
+                data.pop(CONF_API_KEY, None)
+                hass.config_entries.async_update_entry(entry, data=data)
+                _LOGGER.info(
+                    "Reconciled feature entry '%s' with source hub %s", entry.title, hub_id
+                )
+                if getattr(entry, "runtime_data", None) is not None:
+                    await hass.config_entries.async_reload(entry.entry_id)
+
+            return hub
+    finally:
+        _MIGRATION_RUNNING = False
+
+
+async def _create_source_entry(hass: HomeAssistant, api_key: str) -> ConfigEntry | None:
+    """Create the source hub entry programmatically (migration path).
+
+    Uses a SOURCE_USER flow with an ``entry_type: "source"`` data marker so the
+    config flow's ``async_step_user`` creates the hub directly.  The stable
+    ``unique_id`` (SOURCE_UNIQUE_ID) makes a concurrent duplicate creation fail
+    the flow instead of producing a second hub.
+    """
+    from homeassistant.config_entries import SOURCE_USER
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+        data={
+            CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE,
+            CONF_DISPLAY_NAME: DEFAULT_SOURCE_NAME,
+            CONF_API_KEY: api_key,
+        },
+    )
+    hub = result.get("result")
+    if hub is None:
+        _LOGGER.error("Source creation failed: flow did not create an entry")
+    return hub
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up PTV from a config entry."""
     _LOGGER.debug("Setting up PTV entry: %s", entry.entry_id)
@@ -675,6 +943,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN].setdefault("db_path", _db_path(hass))
 
     entry_type = entry.data.get(CONF_ENTRY_TYPE, "watch")
+
+    if entry_type == ENTRY_TYPE_SOURCE:
+        return await _async_setup_source(hass, entry)
 
     if entry_type == ENTRY_TYPE_VEHICLE_TRACKER:
         return await _async_setup_legacy_vehicle_tracker(hass, entry)
@@ -689,119 +960,94 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_setup_watch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a departure watch config entry."""
-    # Ensure the data directory exists (blocking I/O → executor).
-    await hass.async_add_executor_job(
-        lambda: _data_dir(hass).mkdir(parents=True, exist_ok=True)
-    )
+    """Set up a departure watch config entry.
 
-    # Start the shared schedule manager and register this entry as a consumer.
-    manager = _get_or_create_schedule_manager(hass)
-    manager.register_consumer(entry.entry_id)
-
-    try:
-        mode = entry.data.get(CONF_MODE, "")
-        bundles = MODE_BUNDLE_MAP.get(mode, [])
-        if bundles:
-            hass.async_create_task(manager.ensure_fresh(bundles))
-
-        # Determine this entry's index for stagger calculation
-        all_entries = hass.config_entries.async_entries(DOMAIN)
-        entry_index = next(
-            (i for i, e in enumerate(all_entries) if e.entry_id == entry.entry_id),
-            0,
-        )
-
-        coordinator = PTVDataUpdateCoordinator(
-            hass,
-            entry,
-            entry_index=entry_index,
-            db_path=_db_path(hass),
-        )
-
-        await coordinator.async_config_entry_first_refresh()
-        entry.runtime_data = coordinator
-
-        cancel_options = entry.add_update_listener(_async_options_updated)
-
-        hass.data[DOMAIN][entry.entry_id] = {
-            "cancel_options": cancel_options,
-            "departure_count": int(
-                entry.options.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT)
-            ),
-        }
-
-        await hass.config_entries.async_forward_entry_setups(entry, _WATCH_PLATFORMS)
-    except BaseException:
-        # Roll back the consumer registration on ANY failure or cancellation
-        # (first refresh, options listener, platform forwarding). CancelledError
-        # is a BaseException on Py3.8+, so this also covers mid-setup
-        # cancellation; we roll back then re-raise. A HA setup retry re-registers
-        # cleanly (the consumer set is idempotent by entry_id).
-        await manager.consumer_unloaded(entry.entry_id)
-        raise
-    return True
-
-
-async def _async_setup_board(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a trip-group board config entry.
-
-    Registers the board as a schedule consumer with the union of its pins'
-    bundle folders, triggers a refresh of that union, revalidates each pin
-    against the current generation (marking — not deleting — pins whose
-    combination became impossible), and creates a :class:`BoardCoordinator`
-    (T10) that exposes the merged board as entities.
+    The source hub owns the schedule lifecycle (import + refresh), so a watch is
+    a *reader* only: it does NOT register as a schedule consumer or trigger its
+    own refresh.  If its mode's bundles are not yet imported, the coordinator's
+    first refresh raises ``ConfigEntryNotReady`` and HA retries setup later.
     """
     # Ensure the data directory exists (blocking I/O → executor).
     await hass.async_add_executor_job(
         lambda: _data_dir(hass).mkdir(parents=True, exist_ok=True)
     )
 
-    manager = _get_or_create_schedule_manager(hass)
-    manager.register_consumer(entry.entry_id)
+    # Determine this entry's index for stagger calculation
+    all_entries = hass.config_entries.async_entries(DOMAIN)
+    entry_index = next(
+        (i for i, e in enumerate(all_entries) if e.entry_id == entry.entry_id),
+        0,
+    )
 
-    try:
-        pins = [PinData.from_dict(sub.data) for sub in entry.subentries.values()]
-        bundles = sorted(board_bundles(pins))
-        if bundles:
-            hass.async_create_task(manager.ensure_fresh(bundles))
+    coordinator = PTVDataUpdateCoordinator(
+        hass,
+        entry,
+        entry_index=entry_index,
+        db_path=_db_path(hass),
+    )
 
-        # Schedule-invalidated pins: validate against the current generation,
-        # log, and record invalid subentry ids (never delete silently).
-        invalid: set[str] = set()
-        db_path = _db_path(hass)
-        for sub in entry.subentries.values():
-            pin = PinData.from_dict(sub.data)
-            result = await hass.async_add_executor_job(validate_pin, db_path, pin)
-            if not result.ok:
-                invalid.add(pin.pin_key)
-                _LOGGER.warning(
-                    "Board '%s' pin '%s' no longer resolves (%s) — marked invalid",
-                    entry.title,
-                    pin.title,
-                    result.reason,
-                )
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
 
-        coordinator = BoardCoordinator(
-            hass, entry, db_path, invalid_pins=invalid
-        )
-        await coordinator.async_config_entry_first_refresh()
-        entry.runtime_data = coordinator
+    cancel_options = entry.add_update_listener(_async_options_updated)
 
-        cancel_options = entry.add_update_listener(_async_options_updated)
+    hass.data[DOMAIN][entry.entry_id] = {
+        "cancel_options": cancel_options,
+        "departure_count": int(
+            entry.options.get(CONF_DEPARTURE_COUNT, DEFAULT_DEPARTURE_COUNT)
+        ),
+    }
 
-        hass.data[DOMAIN][entry.entry_id] = {
-            "cancel_options": cancel_options,
-            "invalid_pins": invalid,
-            "departure_count": int(
-                entry.options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT)
-            ),
-        }
+    await hass.config_entries.async_forward_entry_setups(entry, _WATCH_PLATFORMS)
+    return True
 
-        await hass.config_entries.async_forward_entry_setups(entry, _BOARD_PLATFORMS)
-    except BaseException:
-        await manager.consumer_unloaded(entry.entry_id)
-        raise
+
+async def _async_setup_board(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a trip-group board config entry.
+
+    The source hub owns the schedule lifecycle; the board is a reader only (no
+    consumer registration, no refresh trigger).  Pins are revalidated against the
+    current generation (marking — not deleting — impossible combinations), and a
+    :class:`BoardCoordinator` exposes the merged board as entities.
+    """
+    # Ensure the data directory exists (blocking I/O → executor).
+    await hass.async_add_executor_job(
+        lambda: _data_dir(hass).mkdir(parents=True, exist_ok=True)
+    )
+
+    # Schedule-invalidated pins: validate against the current generation,
+    # log, and record invalid subentry ids (never delete silently).
+    invalid: set[str] = set()
+    db_path = _db_path(hass)
+    for sub in entry.subentries.values():
+        pin = PinData.from_dict(sub.data)
+        result = await hass.async_add_executor_job(validate_pin, db_path, pin)
+        if not result.ok:
+            invalid.add(pin.pin_key)
+            _LOGGER.warning(
+                "Board '%s' pin '%s' no longer resolves (%s) — marked invalid",
+                entry.title,
+                pin.title,
+                result.reason,
+            )
+
+    coordinator = BoardCoordinator(
+        hass, entry, db_path, invalid_pins=invalid
+    )
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+
+    cancel_options = entry.add_update_listener(_async_options_updated)
+
+    hass.data[DOMAIN][entry.entry_id] = {
+        "cancel_options": cancel_options,
+        "invalid_pins": invalid,
+        "departure_count": int(
+            entry.options.get(CONF_DEPARTURE_COUNT, BOARD_DEFAULT_DEPARTURE_COUNT)
+        ),
+    }
+
+    await hass.config_entries.async_forward_entry_setups(entry, _BOARD_PLATFORMS)
     return True
 
 
@@ -850,8 +1096,23 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry_type = entry.data.get(CONF_ENTRY_TYPE, "watch")
     is_tracker = entry_type in (ENTRY_TYPE_VEHICLE_TRACKER, ENTRY_TYPE_ROUTE_TRACKER)
     is_board = entry_type == ENTRY_TYPE_BOARD
+    is_source = entry_type == ENTRY_TYPE_SOURCE
 
-    if is_board:
+    if is_source:
+        # The source entry owns no platforms — cancel its tracked refresh task,
+        # release its schedule consumer + source ownership, and drop its state.
+        state = hass.data[DOMAIN].pop(entry.entry_id, {})
+        task = state.get("refresh_task")
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        manager = hass.data[DOMAIN].get(_SCHEDULE_MANAGER_KEY)
+        if manager is not None:
+            manager.unregister_source()
+            await manager.consumer_unloaded(entry.entry_id)
+        unload_ok = True
+    elif is_board:
         unload_ok = await hass.config_entries.async_unload_platforms(
             entry, _BOARD_PLATFORMS
         )
@@ -859,21 +1120,34 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         platforms = _TRACKER_PLATFORMS if is_tracker else _WATCH_PLATFORMS
         unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
-    if unload_ok:
+    if unload_ok and not is_source:
         entry_data = hass.data[DOMAIN].pop(entry.entry_id, {})
         for key in ("cancel_refresh", "cancel_options"):
             cancel = entry_data.get(key)
             if cancel:
                 cancel()
 
-        # Watch and board entries are loaded schedule consumers — release them
-        # (and shut the manager down when the last one leaves).
-        if not is_tracker:
-            manager = hass.data[DOMAIN].get(_SCHEDULE_MANAGER_KEY)
-            if manager is not None:
-                await manager.consumer_unloaded(entry.entry_id)
-
     if not hass.config_entries.async_entries(DOMAIN):
         hass.data.pop(DOMAIN, None)
 
     return bool(unload_ok)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle removal of a PTV config entry (deletion cascade, C11).
+
+    When the *source* (hub) entry is removed, any dependent feature entries that
+    are still present are removed with it — a hub deletion cascades.  (The
+    source options flow also lists + removes dependents before removing the hub,
+    so this is a safety net for a removal that bypasses that confirm step.)
+    """
+    if not is_source_entry(entry):
+        return
+    hub_id = entry.entry_id
+    dependents = find_dependents(hass, hub_id)
+    if dependents:
+        _LOGGER.info(
+            "Source hub removed — cascading removal of %d dependent entries",
+            len(dependents),
+        )
+        await async_remove_dependents(hass, hub_id)

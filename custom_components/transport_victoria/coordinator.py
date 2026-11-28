@@ -58,6 +58,8 @@ from .const import (
     FEED_SERVICE_ALERTS,
     FEED_TRIP_UPDATES,
     MODE_BUNDLE_MAP,
+    REALTIME_STATE_LIVE,
+    REALTIME_STATE_SCHEDULED,
     ROUTE_TYPE_MAP,
 )
 from .gtfs.repository import (
@@ -73,6 +75,11 @@ from .rate_limiter import AsyncRateLimiter
 from .realtime.client import PTVRealtimeClient
 from .realtime.service_alerts import parse_alerts
 from .realtime.trip_updates import parse_trip_updates
+from .source import (
+    effective_realtime_enabled,
+    get_source_api_key,
+    source_disabled,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +102,9 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
         self._db_path = db_path
         self._watch_config = _watch_config_from_entry(entry)
         self._client: PTVRealtimeClient | None = None
+        # Effective realtime capability (requested AND credential present AND hub
+        # healthy).  False → scheduled-only mode (no client, no empty-KeyID calls).
+        self._realtime_enabled = False
         self._backoff_seconds: int = 0  # 0 = no backoff active
         self._backoff_until: datetime | None = None
         # Diagnostics
@@ -140,8 +150,40 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
             AsyncRateLimiter(capacity=24.0, refill_rate=0.4),
         )
 
-        session = async_get_clientsession(self.hass)
-        self._client = PTVRealtimeClient(self._watch_config.api_key, session)
+        # Build the realtime client ONLY when effective realtime is enabled (a
+        # credential exists on the source hub).  Scheduled-only mode never issues
+        # a request with an empty ``KeyID`` — the client is simply not built.
+        self._sync_realtime_client()
+
+    # ------------------------------------------------------------------
+    # Realtime capability (recomputed live so option toggles apply post-setup)
+    # ------------------------------------------------------------------
+
+    def _sync_realtime_client(self) -> None:
+        """Recompute effective realtime and rebuild/dispose the client on change.
+
+        Cheap + idempotent; recomputed each poll and on options updates so a
+        ``realtime_enabled`` toggle (or a recovery from a disabled hub) takes
+        effect WITHOUT a full entry reload.  Credential changes still reload
+        dependents (which recreate the coordinator), so the key never changes
+        across a coordinator's lifetime.
+
+        Boundary note: this is not a cancellation barrier — a poll already in
+        flight when the option toggles OFF may still complete (and return the
+        realtime data it already fetched) once before the next poll observes the
+        toggle and returns to scheduled-only.  The toggle takes effect on the
+        NEXT poll/update, not mid-request.
+        """
+        enabled = effective_realtime_enabled(self.hass, self._entry)
+        if enabled == self._realtime_enabled:
+            return
+        self._realtime_enabled = enabled
+        if enabled:
+            session = async_get_clientsession(self.hass)
+            api_key = get_source_api_key(self.hass) or ""
+            self._client = PTVRealtimeClient(api_key, session)
+        else:
+            self._client = None
 
     # ------------------------------------------------------------------
     # Options update
@@ -152,11 +194,13 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
         self._watch_config = _watch_config_from_entry(self._entry)
         new_interval = self._resolve_poll_interval(self._entry, 0)
         self.update_interval = new_interval
+        # A realtime toggle must take effect without a reload (F4).
+        self._sync_realtime_client()
         _LOGGER.debug(
             "Options updated for %s: interval=%s, realtime=%s",
             self._watch_config.watch_name,
             new_interval,
-            self._watch_config.realtime_enabled,
+            self._realtime_enabled,
         )
 
     # ------------------------------------------------------------------
@@ -172,6 +216,14 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
             ConfigEntryAuthFailed: On HTTP 401 (invalid/expired API key).
             UpdateFailed: On any other network or parse error.
         """
+        # --- Source-hub disabled guard (C11): dependents go unavailable, not
+        # deleted, while the owning hub is disabled ---
+        if source_disabled(self.hass):
+            raise UpdateFailed("Source hub is disabled")
+
+        # Recompute effective realtime each poll (option toggle / recovery).
+        self._sync_realtime_client()
+
         # --- Stale-schedule guard (evaluated BEFORE any rate-limit early return,
         # so staleness is detected on every poll even during backoff) ---
         # If the local calendar has expired (and the refresh manager hasn't yet
@@ -191,16 +243,15 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
 
         rate_limiter: AsyncRateLimiter = self.hass.data[DOMAIN]["rate_limiter"]
         client = self._client
-
-        if client is None:
-            raise UpdateFailed("Realtime client not initialised")
+        realtime_enabled = self._realtime_enabled
 
         mode = self._watch_config.mode
-        realtime_enabled = self._watch_config.realtime_enabled
 
         # --- Trip updates ---
         trip_delays: dict[str, Any] = {}
         if realtime_enabled:
+            if client is None:
+                raise UpdateFailed("Realtime client not initialised")
             try:
                 await rate_limiter.acquire()
                 trip_feed = await client.fetch_feed(mode, FEED_TRIP_UPDATES)
@@ -318,6 +369,9 @@ class PTVDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):  # type:
                     scheduled_departure=row.scheduled_departure,
                     delay_seconds=stop_delay.delay_seconds if stop_delay else 0,
                     is_cancelled=stop_delay.is_cancelled if stop_delay else False,
+                    realtime_state=(
+                        REALTIME_STATE_LIVE if stop_delay else REALTIME_STATE_SCHEDULED
+                    ),
                     platform=row.platform_code,
                     route_color=row.route_color,
                     service_type=service_types.get(row.trip_id),
@@ -525,7 +579,7 @@ def _watch_config_from_entry(entry: ConfigEntry) -> WatchConfig:
     data = entry.data
     options = entry.options
     return WatchConfig(
-        api_key=data[CONF_API_KEY],
+        api_key=data.get(CONF_API_KEY, ""),
         mode=data[CONF_MODE],
         stop_id=data[CONF_STOP_ID],
         stop_name=data.get(CONF_STOP_NAME, ""),

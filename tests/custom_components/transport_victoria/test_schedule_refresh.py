@@ -32,6 +32,7 @@ from custom_components.transport_victoria.const import (
     CONF_MODE,
     CONF_STOP_ID,
     DOMAIN,
+    ENTRY_TYPE_SOURCE,
     GTFS_SCHEDULE_URL,
     GTFS_SCHEMA_VERSION,
 )
@@ -948,7 +949,7 @@ class TestManagerLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Real _async_setup_watch lifecycle (transactional consumer registration)
+# Real _async_setup_source lifecycle (source owns schedule consumer + refresh)
 # ---------------------------------------------------------------------------
 
 class _SetupConfigEntries:
@@ -965,7 +966,7 @@ class _SetupConfigEntries:
 
 
 class _SetupHass:
-    """A hass double sufficient to run the real `_async_setup_watch`."""
+    """A hass double sufficient to run the real source/watch setup."""
 
     def __init__(self, tmp_path: Path, forward_raises: bool) -> None:
         self.data: dict = {DOMAIN: {}}
@@ -998,65 +999,41 @@ def _setup_entry(entry_id: str = "e1", mode: str = "metro"):
     )
 
 
-class TestRealSetupWatch:
-    async def test_forward_failure_rolls_back_registration(self, tmp_path, monkeypatch):
-        async def _noop_ensure_fresh(self, bundle_folders, today=None):
-            return False
+def _source_entry(entry_id: str = "hub1"):
+    return SimpleNamespace(
+        entry_id=entry_id,
+        data={CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE, CONF_API_KEY: "k"},
+        options={},
+        runtime_data=None,
+        add_update_listener=lambda cb: (lambda: None),
+    )
 
-        async def _noop_first_refresh(self):
-            return None
 
-        monkeypatch.setattr(tv.ScheduleManager, "ensure_fresh", _noop_ensure_fresh)
-        monkeypatch.setattr(
-            tv.PTVDataUpdateCoordinator, "async_config_entry_first_refresh", _noop_first_refresh
-        )
+async def _noop_reload(hass, hub_id):
+    return None
 
-        hass = _SetupHass(tmp_path, forward_raises=True)
-        entry = _setup_entry()
-        with pytest.raises(RuntimeError):
-            await tv._async_setup_watch(hass, entry)
 
-        manager = hass.data[DOMAIN][tv._SCHEDULE_MANAGER_KEY]
-        assert manager._consumers == set()
-        assert manager.stopped is True
+class TestRealSetupSource:
+    async def test_source_setup_registers_consumer_and_source(self, tmp_path, monkeypatch):
+        async def _noop_refresh_source(self):
+            return True
 
-    async def test_cancel_mid_setup_rolls_back_registration(self, tmp_path, monkeypatch):
-        async def _noop_ensure_fresh(self, bundle_folders, today=None):
-            return False
-
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def _slow_first_refresh(self):
-            started.set()
-            await release.wait()
-            return None
-
-        monkeypatch.setattr(tv.ScheduleManager, "ensure_fresh", _noop_ensure_fresh)
-        monkeypatch.setattr(
-            tv.PTVDataUpdateCoordinator, "async_config_entry_first_refresh", _slow_first_refresh
-        )
+        monkeypatch.setattr(tv.ScheduleManager, "refresh_source", _noop_refresh_source)
+        monkeypatch.setattr(tv, "async_reload_dependents", _noop_reload)
 
         hass = _SetupHass(tmp_path, forward_raises=False)
-        entry = _setup_entry()
-        task = asyncio.create_task(tv._async_setup_watch(hass, entry))
-        await started.wait()  # reached the (blocked) first refresh
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        entry = _source_entry()
+        assert await tv._async_setup_source(hass, entry) is True
 
         manager = hass.data[DOMAIN][tv._SCHEDULE_MANAGER_KEY]
-        assert manager._consumers == set()
-        assert manager.stopped is True
+        assert manager._consumers == {"hub1"}
+        assert manager._source_entry_id == "hub1"
+        assert manager.stopped is False
 
-    async def test_successful_setup_then_unload_stops(self, tmp_path, monkeypatch):
-        async def _noop_ensure_fresh(self, bundle_folders, today=None):
-            return False
-
+    async def test_watch_setup_does_not_register_consumer(self, tmp_path, monkeypatch):
         async def _noop_first_refresh(self):
             return None
 
-        monkeypatch.setattr(tv.ScheduleManager, "ensure_fresh", _noop_ensure_fresh)
         monkeypatch.setattr(
             tv.PTVDataUpdateCoordinator, "async_config_entry_first_refresh", _noop_first_refresh
         )
@@ -1065,11 +1042,25 @@ class TestRealSetupWatch:
         entry = _setup_entry()
         assert await tv._async_setup_watch(hass, entry) is True
 
-        manager = hass.data[DOMAIN][tv._SCHEDULE_MANAGER_KEY]
-        assert manager._consumers == {"e1"}
-        assert manager.stopped is False
+        # The watch is a reader only — it must not create or drive the manager.
+        assert tv._SCHEDULE_MANAGER_KEY not in hass.data[DOMAIN]
 
-        # Unload the entry → consumer released → manager stopped.
-        await manager.consumer_unloaded("e1")
+    async def test_source_unload_cancels_task_and_stops(self, tmp_path, monkeypatch):
+        async def _noop_refresh_source(self):
+            return True
+
+        monkeypatch.setattr(tv.ScheduleManager, "refresh_source", _noop_refresh_source)
+        monkeypatch.setattr(tv, "async_reload_dependents", _noop_reload)
+
+        hass = _SetupHass(tmp_path, forward_raises=False)
+        entry = _source_entry()
+        assert await tv._async_setup_source(hass, entry) is True
+
+        manager = hass.data[DOMAIN][tv._SCHEDULE_MANAGER_KEY]
+        assert manager._consumers == {"hub1"}
+
+        # Unload the source → refresh task cancelled, consumer released, stopped.
+        assert await tv.async_unload_entry(hass, entry) is True
         assert manager._consumers == set()
+        assert manager._source_entry_id is None
         assert manager.stopped is True

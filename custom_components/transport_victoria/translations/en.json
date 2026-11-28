@@ -2,8 +2,16 @@
   "config": {
     "step": {
       "user": {
-        "title": "PTV Open Data Subscription Key",
-        "description": "Enter your PTV Open Data **subscription key**.\n\nTo get one:\n1. Register at [opendata.transport.vic.gov.au]({portal_url})\n2. Go to **My Account → Subscription Keys**\n3. Copy the key shown there\n\n⚠️ Do **not** use the token from *Data Platform API Tokens* — that is a different system and will be rejected.",
+        "title": "Transport Victoria",
+        "description": "Set up the Transport Victoria data source.\n\nChoose **Enable realtime** to use live delays/cancellations (requires a subscription key), or **Scheduled times only** to use timetable data with no key.\n\nTo get a key: register at [opendata.transport.vic.gov.au]({portal_url}) → **My Account → Subscription Keys**.",
+        "data": {
+          "display_name": "Name",
+          "enable_realtime": "Realtime"
+        }
+      },
+      "source_key": {
+        "title": "Subscription Key",
+        "description": "Enter your PTV Open Data **subscription key**.\n\n⚠️ Do **not** use the token from *Data Platform API Tokens* — that is a different system and will be rejected.",
         "data": {
           "api_key": "Subscription Key"
         }
@@ -65,7 +73,7 @@
         }
       },
       "entry_type": {
-        "title": "What would you like to add?",
+        "title": "Add something to monitor",
         "data": {
           "entry_type": "Type",
           "board_name": "Board name"
@@ -291,7 +299,49 @@
         "data": {
           "pin_select": "Pin"
         }
+      },
+      "source_menu": {
+        "title": "Transport Victoria Source",
+        "description": "Manage the data source.",
+        "menu_options": {
+          "add_monitor": "Add something to monitor",
+          "source_reconfigure": "Reconfigure credential",
+          "source_refresh": "Force schedule refresh",
+          "source_remove": "Remove source"
+        }
+      },
+      "source_reconfigure": {
+        "title": "Reconfigure Credential",
+        "description": "Add, replace, or remove the subscription key. Choosing **Scheduled-only** removes the key and falls back to timetable data.",
+        "data": {
+          "enable_realtime": "Realtime",
+          "api_key": "Subscription Key"
+        }
+      },
+      "add_monitor": {
+        "title": "Add Something to Monitor",
+        "description": "To add a watch, board, journey, or route tracker, go to **Settings → Devices & Services → Add Integration → Transport Victoria**. The flow preselects this source ({source_name}) and will not re-ask for credentials.",
+        "data": {
+          "done": "OK"
+        }
+      },
+      "source_refresh": {
+        "title": "Force Schedule Refresh",
+        "description": "Re-download and re-import the timetable.\n\n**Bundle state**\n{bundle_state}\n\n{refresh_outcome}",
+        "data": {
+          "confirm_refresh": "Refresh now"
+        }
+      },
+      "source_remove": {
+        "title": "Remove Source",
+        "description": "Removing the source also removes every feature that depends on it.\n\n**Dependents**\n{dependents}",
+        "data": {
+          "confirm": "I understand — remove the source and its features"
+        }
       }
+    },
+    "error": {
+      "schedule_refresh_failed": "The timetable refresh failed. It will be retried automatically; try again later."
     }
   }
 }

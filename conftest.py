@@ -118,8 +118,13 @@ if not _real_homeassistant():  # pragma: no cover - only reached in the light en
     _exc.ConfigEntryNotReady = Exception  # type: ignore[attr-defined]
 
     class _DataUpdateCoordinator:
-        def __init__(self, *a, **kw): pass
-        def __class_getitem__(cls, item): return cls
+        def __init__(self, *a, **kw):
+            # Mirror the real DataUpdateCoordinator: store hass (first positional
+            # arg) so coordinators can read ``self.hass`` in the light env.
+            self.hass = a[0] if a else None
+
+        def __class_getitem__(cls, item):
+            return cls
 
         async def async_config_entry_first_refresh(self):
             return None

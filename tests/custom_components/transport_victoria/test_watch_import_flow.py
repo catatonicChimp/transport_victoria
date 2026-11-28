@@ -58,6 +58,7 @@ from custom_components.transport_victoria.const import (  # noqa: E402
     DOMAIN,
     ENTRY_TYPE_BOARD,
     ENTRY_TYPE_ROUTE_TRACKER,
+    ENTRY_TYPE_SOURCE,
     ENTRY_TYPE_WATCH,
     MODE_BUS,
     SUBENTRY_TYPE_PIN,
@@ -74,6 +75,18 @@ def _enable_custom_integration(enable_custom_integrations):
 @pytest.fixture
 def bus_db_path(tmp_path: Path) -> Path:
     return import_bundle(tmp_path, **fx.bus_spec())
+
+
+@pytest.fixture
+def source_entry(hass):
+    """A single source (hub) entry — required before any feature flow."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_ENTRY_TYPE: ENTRY_TYPE_SOURCE, CONF_API_KEY: "test-key"},
+        title="Transport Victoria",
+    )
+    entry.add_to_hass(hass)
+    return entry
 
 
 async def _noop_refresh(*args, **kwargs):
@@ -103,7 +116,7 @@ async def _start_flow(hass):
 
 
 async def test_import_two_watches_skips_tracker_and_journey(
-    hass, bus_db_path: Path, monkeypatch
+    hass, bus_db_path: Path, monkeypatch, source_entry
 ):
     monkeypatch.setattr(cf, "_db_path", lambda _cfg: bus_db_path)
     monkeypatch.setattr(cf, "async_trigger_gtfs_refresh", _noop_refresh)
@@ -153,12 +166,6 @@ async def test_import_two_watches_skips_tracker_and_journey(
     )
     journey.add_to_hass(hass)
 
-    # Snapshot every source entry's data (must be byte-for-byte unchanged).
-    source_ids = [watch1.entry_id, watch2.entry_id, tracker.entry_id, journey.entry_id]
-    before = {
-        eid: dict(hass.config_entries.async_get_entry(eid).data) for eid in source_ids
-    }
-
     # 1. entry_type → import.
     result = await _start_flow(hass)
     assert result["type"] is FlowResultType.FORM
@@ -204,16 +211,21 @@ async def test_import_two_watches_skips_tracker_and_journey(
     for s in pins:
         assert s.unique_id == s.data["pin_key"]
 
-    # Source entries untouched: data identical, still present, still watches.
-    for eid in source_ids:
-        after = dict(hass.config_entries.async_get_entry(eid).data)
-        assert after == before[eid]
-    assert hass.config_entries.async_get_entry(watch1.entry_id) is not None
-    assert hass.config_entries.async_get_entry(tracker.entry_id) is not None
-    assert hass.config_entries.async_get_entry(journey.entry_id) is not None
+    # Source entries remain: still present, still their original type (the
+    # import never deletes or converts them — ownership reconciliation only
+    # associates them with the hub + strips the copied credential).
+    for eid, expected_type in (
+        (watch1.entry_id, ENTRY_TYPE_WATCH),
+        (watch2.entry_id, ENTRY_TYPE_WATCH),
+        (tracker.entry_id, ENTRY_TYPE_ROUTE_TRACKER),
+        (journey.entry_id, ENTRY_TYPE_WATCH),
+    ):
+        entry = hass.config_entries.async_get_entry(eid)
+        assert entry is not None
+        assert entry.data[CONF_ENTRY_TYPE] == expected_type
 
 
-async def test_import_empty_selection_shows_error(hass, bus_db_path: Path, monkeypatch):
+async def test_import_empty_selection_shows_error(hass, bus_db_path: Path, monkeypatch, source_entry):
     monkeypatch.setattr(cf, "_db_path", lambda _cfg: bus_db_path)
     monkeypatch.setattr(cf, "async_trigger_gtfs_refresh", _noop_refresh)
 
@@ -236,7 +248,7 @@ async def test_import_empty_selection_shows_error(hass, bus_db_path: Path, monke
     assert result["errors"] == {"watch_ids": "select_at_least_one"}
 
 
-async def test_import_all_journeys_aborts(hass, bus_db_path: Path, monkeypatch):
+async def test_import_all_journeys_aborts(hass, bus_db_path: Path, monkeypatch, source_entry):
     """No compatible watches (only journeys) → the flow aborts with a reason."""
     monkeypatch.setattr(cf, "_db_path", lambda _cfg: bus_db_path)
     monkeypatch.setattr(cf, "async_trigger_gtfs_refresh", _noop_refresh)

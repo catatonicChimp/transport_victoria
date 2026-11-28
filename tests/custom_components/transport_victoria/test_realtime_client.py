@@ -428,3 +428,16 @@ class TestScopeUnavailable:
         assert feed is not None
         assert feed_last_success("bus", "service-alerts") is not None
         assert client_module._FEED_STATE[("bus", "service-alerts")].unavailable is False
+
+
+async def test_empty_api_key_raises_without_http_call():
+    """F3 — an empty key must never issue a request (preflight guard)."""
+    session = FakeSession(responses={})
+    client = PTVRealtimeClient("", session, rate_limiter=NoopLimiter())
+
+    with pytest.raises(FeedError) as excinfo:
+        await client.fetch_feed("metro", "trip-updates")
+
+    assert excinfo.value.status == 0
+    assert excinfo.value.unavailable is True
+    assert session.calls == []  # no HTTP request was made

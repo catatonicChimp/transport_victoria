@@ -44,13 +44,13 @@ from .const import (
     BOARD_DEFAULT_DEPARTURE_COUNT,
     BOARD_DIRECTION_CONFIGURED,
     BOARD_DIRECTION_OPPOSITE,
-    CONF_API_KEY,
     CONF_DEPARTURE_COUNT,
     CONF_REALTIME_ENABLED,
     CONF_SUBENTRY_ORDER,
     DEFAULT_BOARD_REALTIME_ENABLED,
 )
 from .realtime.client import PTVRealtimeClient
+from .source import effective_realtime_enabled, get_source_api_key, source_disabled
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -100,10 +100,29 @@ class BoardCoordinator(DataUpdateCoordinator[BoardResult]):  # type: ignore[misc
     # ------------------------------------------------------------------
 
     async def _async_setup(self) -> None:
-        """Initialise the realtime client (once HA's session is available)."""
-        api_key = self._entry.data.get(CONF_API_KEY, "")
-        session = async_get_clientsession(self.hass)
-        self._client = PTVRealtimeClient(api_key, session)
+        """Initialise the realtime client (once HA's session is available).
+
+        The client is built only when effective realtime is enabled (a credential
+        exists on the source hub) — scheduled-only boards never issue an empty
+        ``KeyID`` request.
+        """
+        self._sync_realtime_client()
+
+    def _sync_realtime_client(self) -> None:
+        """Rebuild/dispose the realtime client when effective realtime changes.
+
+        Recomputed each poll so a ``realtime_enabled`` toggle (or a hub recovery)
+        takes effect post-setup without a full entry reload.
+        """
+        enabled = effective_realtime_enabled(self.hass, self._entry)
+        if enabled == (self._client is not None):
+            return
+        if enabled:
+            api_key = get_source_api_key(self.hass) or ""
+            session = async_get_clientsession(self.hass)
+            self._client = PTVRealtimeClient(api_key, session)
+        else:
+            self._client = None
 
     # ------------------------------------------------------------------
     # Runtime direction toggle (select entity)
@@ -164,9 +183,15 @@ class BoardCoordinator(DataUpdateCoordinator[BoardResult]):  # type: ignore[misc
 
     async def _async_update_data(self) -> BoardResult:
         """Poll + aggregate: fetch realtime, then merge pins into a board."""
+        if source_disabled(self.hass):
+            raise RuntimeError("Source hub is disabled")
+
+        # Recompute effective realtime each poll (option toggle / recovery).
+        self._sync_realtime_client()
         client = self._client
-        if client is None:
-            raise RuntimeError("Board realtime client not initialised")
+        # Effective realtime: the board's option AND a credential (client built).
+        # Scheduled-only boards never issue an empty-KeyID request.
+        realtime_enabled = self.realtime_enabled and client is not None
 
         pins = self._ordered_pins()
         if self._direction_mode == BOARD_DIRECTION_OPPOSITE:
@@ -177,7 +202,6 @@ class BoardCoordinator(DataUpdateCoordinator[BoardResult]):  # type: ignore[misc
         now_utc = dt_util.utcnow()
         local_tz = self.local_tz
         local_now = dt_util.now().replace(tzinfo=None)
-        realtime_enabled = self.realtime_enabled
 
         # Phase 1: fetch + parse realtime feeds (I/O on the loop, parse off).
         realtime = await fetch_board_realtime(

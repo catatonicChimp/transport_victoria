@@ -220,9 +220,16 @@ class PTVRealtimeClient:
 
         Raises:
             FeedError: On HTTP errors (including 401/403/404/429), carrying
-                per-feed health metadata.
+                per-feed health metadata.  Also raised (status 0, unavailable)
+                when no API key is configured — scheduled-only mode must never
+                issue a request with an empty ``KeyID``.
             aiohttp.ClientError: On network errors.
         """
+        # Preflight guard (defense in depth): reject an empty/absent API key
+        # BEFORE any request, regardless of call-site races.
+        if not self._api_key:
+            raise FeedError(0, "no API key configured (scheduled-only)", unavailable=True)
+
         url_mode = rt_url_mode(mode)
         cache_key = (url_mode, feed_type)
         now = datetime.now(tz=timezone.utc)
