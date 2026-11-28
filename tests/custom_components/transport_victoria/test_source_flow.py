@@ -77,6 +77,17 @@ def _neutralise_network(monkeypatch):
     monkeypatch.setattr(cf, "_validate_api_key", _noop_validate)
 
 
+
+import pytest
+
+@pytest.fixture
+def source_hub(hass):
+    """Create a source hub entry for testing the options menu."""
+    entry = MockConfigEntry(domain="transport_victoria", title="Transport Victoria", data={"entry_type": "source"})
+    entry.add_to_hass(hass)
+    return entry
+
+
 async def _noop_refresh(*args, **kwargs):
     return True
 
@@ -357,9 +368,9 @@ async def test_reconcile_idempotent(hass):
     assert data_after_second == data_after_first
 
 
-async def test_add_monitor_option_removed_from_source_menu(hass):
+async def test_add_monitor_option_removed_from_source_menu(hass, source_hub):
     """Maintainer decision: features are added via Add Integration, not the options menu."""
-    result = await hass.config_entries.options.async_init("01M8FB8PS7KF0J92ZKPEGVSXTN")
+    result = await hass.config_entries.options.async_init(source_hub.entry_id)
     assert result["type"] == FlowResultType.MENU
     assert set(result["menu_options"]) == {
         "source_reconfigure",
