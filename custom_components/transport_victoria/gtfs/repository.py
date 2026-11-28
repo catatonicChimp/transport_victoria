@@ -332,69 +332,103 @@ def search_stops_by_name(
     route_types: list[int],
     limit: int = 10,
 ) -> list[StopResult]:
-    """Search for stops by name, filtered to stops served by the given route types.
+    """Search for stops by name, ranked, filtered to the given route types.
 
-    Only returns platform-level stops (location_type = 0 or NULL) so we don't
-    surface station buildings as selectable options. Stops with the same name
-    (e.g. multiple platforms of the same station) are collapsed into one result
-    using the lowest stop_id as the representative.
+    Queries the materialized ``stop_search`` table (no join-heavy stop_times
+    scan), ranking candidates: exact name match → whole-string prefix →
+    word-boundary prefix (e.g. "par" hits "Parliament Station") → substring.
+    Returns platform-level stops (one row per collapsed stop-name, lowest
+    stop_id as the representative), each carrying the representative route type.
 
     Args:
         db_path: Path to the SQLite database.
-        query: Partial stop name to search (case-insensitive, prefix match).
+        query: Partial stop name to search (case/punctuation-insensitive).
         route_types: List of GTFS route_type ints to filter by.
         limit: Maximum results to return.
-
-    Returns:
-        List of StopResult sorted by name, deduplicated by name.
     """
     if not route_types:
         return []
+    query = (query or "").strip()
+    if len(query) < 2:
+        return []
+    from .importer import normalize_stop_name
 
-    rt_placeholders = ", ".join("?" * len(route_types))
-    sql = f"""
-        SELECT MIN(s.stop_id) AS stop_id, s.stop_name,
-               MIN(s.stop_lat) AS stop_lat, MIN(s.stop_lon) AS stop_lon,
-               MIN(s.location_type) AS location_type,
-               MIN(s.parent_station) AS parent_station,
-               MIN(r.route_type) AS route_type
-        FROM stops s
-        JOIN stop_times st ON st.stop_id = s.stop_id
-        JOIN trips t ON t.trip_id = st.trip_id
-        JOIN routes r ON r.route_id = t.route_id
-        WHERE s.stop_name LIKE ? ESCAPE '\\'
-          AND (s.location_type = 0 OR s.location_type IS NULL)
-          AND r.route_type IN ({rt_placeholders})
-        GROUP BY lower(s.stop_name)
-        ORDER BY s.stop_name COLLATE NOCASE
-        LIMIT ?
-    """
-
-    like_query = _escape_like(query) + "%"
-    params = [like_query] + route_types + [limit]
+    q_norm = normalize_stop_name(query)
+    if not q_norm:
+        return []
 
     conn = sqlite3.connect(str(_resolve(db_path)))
     try:
+        _ensure_stop_search(conn)
         conn.row_factory = sqlite3.Row
-        results = []
+
+        # Ranked match (exact → prefix → word-boundary → substring); the
+        # route-type filter is applied in Python over the CSV.
+        sql = """
+            SELECT stop_id, stop_name, stop_lat, stop_lon, location_type,
+                   parent_station, route_type, route_types,
+                   CASE
+                       WHEN name_norm = ?        THEN 0
+                       WHEN name_norm LIKE ?      THEN 1
+                       WHEN name_norm LIKE ?      THEN 2
+                       ELSE 3
+                   END AS rank
+            FROM stop_search
+            WHERE name_norm LIKE ?
+            ORDER BY rank, stop_name COLLATE NOCASE
+        """
+        params = [
+            q_norm,
+            q_norm + "%",
+            "% " + q_norm + "%",
+            "%" + q_norm + "%",
+        ]
+        wanted = {str(rt) for rt in route_types}
+        results: list[StopResult] = []
         for row in conn.execute(sql, params):
+            serving = set(row["route_types"].split(","))
+            if not serving.intersection(wanted):
+                continue
             results.append(
                 StopResult(
                     stop_id=row["stop_id"],
                     stop_name=row["stop_name"],
                     stop_lat=row["stop_lat"],
                     stop_lon=row["stop_lon"],
-                    location_type=row["location_type"],
+                    location_type=row["location_type"] or 0,
                     parent_station=row["parent_station"],
                     route_type=row["route_type"],
                 )
             )
+            if len(results) >= limit:
+                break
         return results
     except sqlite3.Error as exc:
         _LOGGER.error("Stop name search failed: %s", exc)
         return []
     finally:
         conn.close()
+
+
+def _ensure_stop_search(conn: sqlite3.Connection) -> None:
+    """Defensively build ``stop_search`` once on a DB that predates the table
+    (or whose schema created it empty, e.g. a fixture DB).
+
+    The importer rebuilds ``stop_search`` on every refresh; this path covers an
+    existing install whose live generation predates this change (so the first
+    search still works, cheaply and idempotently).
+    """
+    from .importer import build_stop_search
+
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stop_search'"
+    ).fetchone()
+    count = 0
+    if exists is not None:
+        count = conn.execute("SELECT COUNT(*) FROM stop_search").fetchone()[0]
+    if exists is None or count == 0:
+        build_stop_search(conn)
+        conn.commit()
 
 
 def search_stops_by_distance(

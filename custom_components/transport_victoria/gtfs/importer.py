@@ -367,6 +367,91 @@ def _import_stop_times(
     return total
 
 
+def normalize_stop_name(name: str) -> str:
+    """Normalize a stop name for ranked search: lowercase, strip punctuation,
+    collapse whitespace.  ``"Parliament Station"`` → ``"parliament station"``."""
+    import re
+
+    norm = re.sub(r"[^a-z0-9]+", " ", (name or "").lower())
+    return re.sub(r"\s+", " ", norm).strip()
+
+
+def build_stop_search(conn: sqlite3.Connection) -> int:
+    """(Re)build the materialized ``stop_search`` table from the live tables.
+
+    One row per collapsed stop-name (lowest ``stop_id`` is the representative —
+    the same collapse ``search_stops_by_name`` applies), with a punctuation-
+    stripped lowercased ``name_norm`` and a sorted CSV of every route type
+    serving the stop.  Self-contained (creates the table + index if absent) and
+    idempotent; called at the end of every import and defensively on first
+    search when the table is missing.
+    """
+    # Create-if-absent (also declared in schema.sql for fresh imports).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stop_search (
+            stop_id        TEXT PRIMARY KEY,
+            stop_name      TEXT NOT NULL,
+            name_norm      TEXT NOT NULL,
+            stop_lat       REAL,
+            stop_lon       REAL,
+            location_type  INTEGER DEFAULT 0,
+            parent_station TEXT,
+            route_type     INTEGER,
+            route_types    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stop_search_name_norm ON stop_search (name_norm)"
+    )
+    conn.execute("DELETE FROM stop_search")
+    sql = """
+        SELECT
+            MIN(s.stop_id)  AS stop_id,
+            s.stop_name     AS stop_name,
+            MIN(s.stop_lat) AS stop_lat,
+            MIN(s.stop_lon) AS stop_lon,
+            MIN(s.location_type) AS location_type,
+            MIN(s.parent_station) AS parent_station,
+            MIN(r.route_type) AS route_type,
+            GROUP_CONCAT(DISTINCT r.route_type) AS route_types
+        FROM stops s
+        JOIN stop_times st ON st.stop_id = s.stop_id
+        JOIN trips t ON t.trip_id = st.trip_id
+        JOIN routes r ON r.route_id = t.route_id
+        WHERE (s.location_type = 0 OR s.location_type IS NULL)
+        GROUP BY lower(s.stop_name)
+    """
+    insert_sql = """
+        INSERT INTO stop_search
+            (stop_id, stop_name, name_norm, stop_lat, stop_lon,
+             location_type, parent_station, route_type, route_types)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    total = 0
+    for row in conn.execute(sql):
+        stop_id, stop_name, stop_lat, stop_lon, loc_type, parent, route_type, raw_types = row
+        # Deterministic sorted CSV of the serving route types.
+        rts = sorted({t for t in (raw_types or "").split(",") if t})
+        conn.execute(
+            insert_sql,
+            (
+                stop_id,
+                stop_name,
+                normalize_stop_name(stop_name),
+                stop_lat,
+                stop_lon,
+                loc_type,
+                parent,
+                route_type,
+                ",".join(rts),
+            ),
+        )
+        total += 1
+    return total
+
+
 def validate_gtfs_zip(zip_path: Path) -> None:
     """Validate the outer GTFS ZIP before import. Raises ValueError if invalid.
 
@@ -614,6 +699,11 @@ def _build_and_publish_generation(
                         "(bundle_folder, horizon_date) VALUES (?, ?)",
                         ("", flat_horizon.strftime("%Y%m%d")),
                     )
+
+        # Materialize the ranked stop-search index from the freshly imported
+        # tables (stops/stop_times/trips/routes are all present by now).
+        _search_rows = build_stop_search(conn)
+        _LOGGER.info("stop_search built: %d rows", _search_rows)
 
         # Record which bundles are now imported, plus download metadata.
         # imported_at is the SERVICE-LOCAL date so age comparisons line up with

@@ -81,6 +81,76 @@ class TestSearchStopsByName:
 
 
 # ---------------------------------------------------------------------------
+# Ranked stop-search over the materialized stop_search table
+# ---------------------------------------------------------------------------
+
+
+class TestStopSearchRanking:
+    @pytest.fixture
+    def ranking_db(self, tmp_path: Path) -> Path:
+        from tests import gtfs_fixtures as fx
+        from tests.gtfs_builder import import_bundle
+
+        routes = [{
+            "route_id": "R_METRO", "route_short_name": "Metro",
+            "route_long_name": "Metro Line", "route_type": 400,
+        }]
+        stops = [
+            fx._stop("S_PARLIAMENT", "Parliament", -37.80, 144.97),
+            fx._stop("S_PARL_STATION", "Parliament Station", -37.81, 144.97),
+            fx._stop("S_NORTH_MELB", "North Melbourne", -37.82, 144.96),
+            fx._stop("S_FLINDERS", "Flinders Street", -37.83, 144.95),
+        ]
+        trips = [fx._trip("T1", "R_METRO", "SVC", "City", 0)]
+        stop_times = [
+            fx._st("T1", "S_PARLIAMENT", 1, "08:00:00"),
+            fx._st("T1", "S_PARL_STATION", 2, "08:05:00"),
+            fx._st("T1", "S_NORTH_MELB", 3, "08:10:00"),
+            fx._st("T1", "S_FLINDERS", 4, "08:15:00"),
+        ]
+        return import_bundle(
+            tmp_path, folder="2", routes=routes, trips=trips, stops=stops,
+            stop_times=stop_times, calendar=[fx._calendar("SVC")],
+        )
+
+    def test_exact_beats_prefix(self, ranking_db: Path):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(ranking_db, "parliament", METRO_ROUTE_TYPES, limit=10)
+        ]
+        assert names[0] == "Parliament"        # exact match wins
+        assert "Parliament Station" in names    # prefix follows
+
+    def test_prefix_matches(self, ranking_db: Path):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(ranking_db, "parl", METRO_ROUTE_TYPES, limit=10)
+        ]
+        assert set(names) == {"Parliament", "Parliament Station"}
+
+    def test_word_boundary_match(self, ranking_db: Path):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(ranking_db, "station", METRO_ROUTE_TYPES, limit=10)
+        ]
+        assert names == ["Parliament Station"]
+
+    def test_substring_match(self, ranking_db: Path):
+        names = [
+            r.stop_name
+            for r in search_stops_by_name(ranking_db, "inders", METRO_ROUTE_TYPES, limit=10)
+        ]
+        assert names == ["Flinders Street"]
+
+    def test_short_query_returns_empty(self, ranking_db: Path):
+        assert search_stops_by_name(ranking_db, "p", METRO_ROUTE_TYPES) == []
+
+    def test_route_type_filter(self, ranking_db: Path):
+        # A route type the fixture does not serve → no results.
+        assert search_stops_by_name(ranking_db, "parliament", [0]) == []
+
+
+# ---------------------------------------------------------------------------
 # search_stops_by_distance
 # ---------------------------------------------------------------------------
 

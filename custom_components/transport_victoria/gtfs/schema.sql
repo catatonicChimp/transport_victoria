@@ -95,6 +95,29 @@ CREATE INDEX IF NOT EXISTS idx_stop_times_trip
     ON stop_times (trip_id);
 
 -- ---------------------------------------------------------------
+-- stop_search.txt  (materialized name-search index — T18.x)
+--
+-- One row per collapsed stop-name (the lowest stop_id is the representative,
+-- the same platform-collapse the name search applies), with a punctuation-
+-- stripped lowercased ``name_norm`` for ranked matching and a CSV of the route
+-- types serving the stop.  Rebuilt from stops/stop_times/trips/routes at the
+-- end of every import (and defensively on first search if missing).
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS stop_search (
+    stop_id        TEXT PRIMARY KEY,
+    stop_name      TEXT NOT NULL,
+    name_norm      TEXT NOT NULL,
+    stop_lat       REAL,
+    stop_lon       REAL,
+    location_type  INTEGER DEFAULT 0,
+    parent_station TEXT,
+    route_type     INTEGER,       -- representative (MIN) route type for labels
+    route_types    TEXT NOT NULL  -- sorted CSV of every serving route type
+);
+
+CREATE INDEX IF NOT EXISTS idx_stop_search_name_norm ON stop_search (name_norm);
+
+-- ---------------------------------------------------------------
 -- calendar.txt
 -- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS calendar (

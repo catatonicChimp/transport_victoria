@@ -149,6 +149,31 @@ class TestImportBundlesToGeneration:
         assert row[0] > 0
         assert store.pointer_path(db_path).exists()
 
+    def test_stop_search_built_at_import(self, tmp_path: Path):
+        zip_path = _make_gtfs_zip(tmp_path)
+        db_path = tmp_path / "gtfs.db"
+        import_bundles_to_generation(db_path, zip_path, "abc", ["2"])
+        conn = _open_generation(db_path)
+        row = conn.execute(
+            "SELECT stop_name, name_norm, route_type, route_types FROM stop_search"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == "Test Station"
+        assert row[1] == "test station"  # normalized
+        assert row[2] == 400             # representative route type
+        assert row[3] == "400"           # CSV
+
+    def test_stop_search_rebuilt_on_reimport(self, tmp_path: Path):
+        zip_path = _make_gtfs_zip(tmp_path)
+        db_path = tmp_path / "gtfs.db"
+        import_bundles_to_generation(db_path, zip_path, "sha1", ["2"])
+        import_bundles_to_generation(db_path, zip_path, "sha2", ["2"])
+        conn = _open_generation(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stop_search").fetchone()[0]
+        conn.close()
+        assert count == 1  # rebuilt (not duplicated) in the new generation
+
     def test_legacy_wrapper_order(self, tmp_path: Path):
         zip_path = _make_gtfs_zip(tmp_path)
         db_path = tmp_path / "gtfs.db"
