@@ -1346,14 +1346,12 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         """
         if user_input is not None:
             entry_type = user_input.get("entry_type", ENTRY_TYPE_WATCH)
+            self._config[CONF_ENTRY_TYPE] = entry_type
             if entry_type == ENTRY_TYPE_ROUTE_TRACKER:
                 return await self.async_step_route_tracker_mode()
-            if entry_type == ENTRY_TYPE_BOARD:
-                return await self._create_board_entry(
-                    user_input.get(CONF_BOARD_NAME, "")
-                )
-            if entry_type == _IMPORT_OPTION:
-                return await self.async_step_import()
+            if entry_type in (ENTRY_TYPE_BOARD, _IMPORT_OPTION):
+                # Board (and import) need a board name before anything else.
+                return await self.async_step_monitor_name()
             # Default: departure watch — continue with mode selection
             return await self.async_step_mode()
 
@@ -1363,7 +1361,7 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
         )
 
     def _entry_type_schema(self) -> vol.Schema:
-        """Build the "what to add" form (type selector + board name)."""
+        """Build the "what do you want to monitor?" form (type only)."""
         return vol.Schema({
             vol.Required("entry_type", default=ENTRY_TYPE_WATCH): selector.SelectSelector(
                 selector.SelectSelectorConfig(
@@ -1378,17 +1376,52 @@ class PTVConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg, misc]
                         ),
                         selector.SelectOptionDict(
                             value=ENTRY_TYPE_BOARD,
-                            label="Trip-Group Board (multiple lines at a stop)",
+                            label="Departure Board (multiple lines/stops)",
                         ),
                         selector.SelectOptionDict(
                             value=_IMPORT_OPTION,
-                            label="Trip-Group Board — import from existing watches",
+                            label="Import existing watches into a Departure Board",
                         ),
                     ],
                     mode=selector.SelectSelectorMode.LIST,
                 )
-            ),
-            vol.Optional(CONF_BOARD_NAME, default="Departure Board"): selector.TextSelector(),
+            )
+        })
+
+    async def async_step_monitor_name(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Board name step — only shown for Departure Board / import types.
+
+        TripView-style flows do not need this screen.
+        """
+        is_import = self._config.get(CONF_ENTRY_TYPE) == _IMPORT_OPTION
+        if user_input is not None:
+            board_name = user_input.get(CONF_BOARD_NAME, "").strip()
+            if not board_name:
+                return self.async_show_form(
+                    step_id="monitor_name",
+                    errors={CONF_BOARD_NAME: "required"},
+                    data_schema=self._monitor_name_schema(),
+                )
+            if is_import:
+                self._import_board_name = board_name
+                return await self.async_step_import()
+            return await self._create_board_entry(board_name)
+
+        return self.async_show_form(
+            step_id="monitor_name",
+            data_schema=self._monitor_name_schema(),
+            description_placeholders={
+                "monitor_type": (
+                    "imported Departure Board" if is_import else "Departure Board"
+                )
+            },
+        )
+
+    def _monitor_name_schema(self) -> vol.Schema:
+        return vol.Schema({
+            vol.Required(CONF_BOARD_NAME, default="Departure Board"): selector.TextSelector(),
         })
 
     async def _create_board_entry(self, board_name: str) -> ConfigFlowResult:

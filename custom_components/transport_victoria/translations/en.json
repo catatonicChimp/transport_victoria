@@ -73,7 +73,7 @@
         }
       },
       "entry_type": {
-        "title": "Add something to monitor",
+        "title": "What do you want to monitor?",
         "data": {
           "entry_type": "Type",
           "board_name": "Board name"
@@ -158,6 +158,13 @@
         "description": "The new board **{board_name}** will be created with one line per selected watch.\n\n**Imported**\n{imported}\n\n**Skipped (stays as-is)**\n{skipped}\n\n**Needs attention (stale references)**\n{stale}\n\nYour existing watches are not modified. Roll back by deleting the new board.",
         "data": {
           "confirm": "Create the board"
+        }
+      },
+      "monitor_name": {
+        "title": "Name your Departure Board",
+        "description": "Choose a name for this board. You can add lines to it next.",
+        "data": {
+          "board_name": "Board name"
         }
       }
     },

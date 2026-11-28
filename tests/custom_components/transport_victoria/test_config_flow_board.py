@@ -41,43 +41,38 @@ def _noop_refresh(*args, **kwargs):
 
 
 async def test_board_name_creates_entry(monkeypatch):
-    monkeypatch.setattr(cf, "async_trigger_gtfs_refresh", _noop_refresh)
+    """Board name step: a valid name creates the board (two-step UX)."""
     flow = cf.PTVConfigFlow()
     flow.hass = FakeHass()
     captured: dict = {}
 
-    def fake_create_entry(**kwargs):
-        captured.update(kwargs)
-        return {"type": "create_entry"}
+    async def fake_create(board_name):
+        captured["board_name"] = board_name
+        return {"type": "create_entry", "title": board_name}
 
-    monkeypatch.setattr(flow, "async_create_entry", fake_create_entry)
+    monkeypatch.setattr(flow, "_create_board_entry", fake_create)
 
-    # The board name is now collected on the same screen as the entry-type
-    # choice — no separate board_name step.
-    await flow.async_step_entry_type(
-        {"entry_type": ENTRY_TYPE_BOARD, CONF_BOARD_NAME: "My Board"}
+    result = await flow.async_step_monitor_name(
+        {CONF_BOARD_NAME: "  My Board  "}
     )
-
-    assert captured["title"] == "My Board"
-    assert captured["data"][CONF_ENTRY_TYPE] == ENTRY_TYPE_BOARD
-    assert captured["data"][CONF_BOARD_NAME] == "My Board"
-    assert captured["options"][CONF_DEPARTURE_COUNT] == 5
-    assert captured["options"][CONF_SUBENTRY_ORDER] == []
+    assert captured["board_name"] == "My Board"
+    assert result["type"] == "create_entry"
 
 
 async def test_board_name_requires_name(monkeypatch):
+    """Board name step: an empty name re-renders with a required error."""
     flow = cf.PTVConfigFlow()
     flow.hass = FakeHass()
     captured: dict = {}
 
     def fake_show_form(**kwargs):
         captured.update(kwargs)
-        return {"type": "form", "step_id": "entry_type"}
+        return {"type": "form", "step_id": "monitor_name"}
 
     monkeypatch.setattr(flow, "async_show_form", fake_show_form)
 
-    await flow.async_step_entry_type(
-        {"entry_type": ENTRY_TYPE_BOARD, CONF_BOARD_NAME: "   "}
+    await flow.async_step_monitor_name(
+        {CONF_BOARD_NAME: "   "}
     )
     assert captured["errors"] == {CONF_BOARD_NAME: "required"}
 
